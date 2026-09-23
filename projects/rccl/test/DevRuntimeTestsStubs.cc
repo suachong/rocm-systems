@@ -129,6 +129,7 @@ ncclResult_t ncclMgmtTaskEnqueue(struct ncclAsyncJob*, ncclResult_t (*)(struct n
 // ---------------------------------------------------------------------------
 ncclResult_t ncclSymkInitOnce(struct ncclComm*) { return ncclSuccess; }
 bool ncclRmaProxyEnabled(struct ncclComm*) { return false; }
+int64_t ncclParamRMADisable() { return 0; }
 ncclResult_t ncclRmaCeInit(struct ncclComm*) { return ncclSuccess; }
 
 // ---------------------------------------------------------------------------
