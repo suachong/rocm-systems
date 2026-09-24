@@ -11,6 +11,8 @@ Full documentation for ROCm Compute Profiler is available at [https://rocm.docs.
 
 ### Removed
 
+* Removed the experimental `--gui` and `--tui` analyze modes, the `--random-port` option, and their five dependencies (`dash`, `dash-bootstrap-components`, `dash-svg`, `textual`, `textual_plotext`). Use `rocprof-compute analyze` (CLI, the default) for terminal analysis, or `--output-format db` / `--output-format csv` for graphical analysis via ROCm Optiq or spreadsheet workflows. The `plotly` and `rich` packages, previously pulled in transitively, are now pinned explicitly.
+
 ### Optimized
 
 ### Resolved issues
