@@ -398,25 +398,6 @@ template <class T> class hipPerfMemFill {
   }
 
 #ifdef __HIP_PLATFORM_AMD__
-  bool testExtDeviceMemoryHostFill(size_t size, unsigned int flags) {
-    double GBytes = static_cast<double>(size) / NUM_1GB;
-
-    T* A = nullptr;
-    HIP_CHECK(hipExtMallocWithFlags(reinterpret_cast<void**>(&A), size, flags));
-    if (!A) {
-      std::cout << "failed hipExtMallocWithFlags() with size =" << size << " flags=" << std::hex
-                << flags << std::endl;
-      return false;
-    }
-
-    double sec = 0;
-    hostFill(size, A, coef_, &sec);  // Cpu can access this mem
-    HIP_CHECK(hipFree(A));
-
-    log_host("ExtDevice: host   fill", GBytes, sec);
-    return true;
-  }
-
   bool testExtDeviceMemoryKernelFill(size_t size, unsigned int flags) {
     double GBytes = static_cast<double>(size) / NUM_1GB;
 
@@ -441,13 +422,7 @@ template <class T> class hipPerfMemFill {
   }
 
   bool testExtDeviceMemory() {
-    std::cout << "Test fine grained device memory host filling" << std::endl;
-    for (int i = 0; i < NUM_SIZE; i++) {
-      if (!testExtDeviceMemoryHostFill(totalSizes_[i], hipDeviceMallocFinegrained)) {
-        return false;
-      }
-    }
-
+    // We cannot access device memory from the host, so we only test the device fill here.
     std::cout << "Test fine grained device memory kernel filling" << std::endl;
     for (int i = 0; i < NUM_SIZE; i++) {
       if (!testExtDeviceMemoryKernelFill(totalSizes_[i], hipDeviceMallocFinegrained)) {
