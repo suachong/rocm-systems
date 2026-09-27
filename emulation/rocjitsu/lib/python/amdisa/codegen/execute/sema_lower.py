@@ -9,6 +9,8 @@ C++ code implementing the instruction's behavior in the simulator.
 
 from __future__ import annotations
 
+from amdisa.codegen.execute.floating_policy import FLUSH_NEAREST_F32_OPS
+
 from dataclasses import dataclass, field, replace
 from enum import Enum, auto
 
@@ -131,6 +133,7 @@ class LoweringContext:
     mode_sensitive_f16_dst: bool = True
     mode_arithmetic: bool = True
     dx9_zero_fma: bool = False
+    flush_nearest_f32: bool = False
     arithmetic_flush_output: str | None = None
     integer_saturation_dtype: str | None = None
 
@@ -210,6 +213,7 @@ def lower_sema_block(block: SemaBlock, ctx: LoweringContext | None = None) -> st
         'V_FMA_DX9_ZERO_F32',
         'V_FMAC_DX9_ZERO_F32',
     )
+    ctx.flush_nearest_f32 = block.instruction_name in FLUSH_NEAREST_F32_OPS
     body_lines = _lower_stmt(block.body, ctx)
 
     if ctx.exec_model == ExecModel.VECTOR:
@@ -1953,6 +1957,42 @@ def _lower_call(node: SemaNode, ctx: LoweringContext) -> str:
             return f'static_cast<uint32_t>(util::f32_to_f16_mode({fp8_decode_fn}(static_cast<uint8_t>({arg})), wf.fp16_ovfl()))'
         return f'static_cast<uint32_t>(util::f32_to_f16_mode({bf8_decode_fn}(static_cast<uint8_t>({arg})), wf.fp16_ovfl()))'
 
+    # Promotion loses the F16 denormal class, so SQRT/RSQ need the half input policy.
+    if len(args) == 1 and callee == 'sqrt' and node.ty in (SemaType.F16, SemaType.F32):
+        half_policy = 'wf.fp_denorm_mode_f16_f64(), ' if node.ty == SemaType.F16 else ''
+        suffix = 'f16' if node.ty == SemaType.F16 else 'f32'
+        return (
+            f'amdgpu::transcendental::sqrt_{suffix}({args[0]}, {half_policy}'
+            'amdgpu::fp_mode::quiets_nan(wf.cu().arch(), wf.ieee_mode()))'
+        )
+    if len(args) == 1 and callee == 'rsq' and node.ty == SemaType.F16:
+        return (
+            f'amdgpu::transcendental::rsq_f16({args[0]}, '
+            'wf.fp_denorm_mode_f16_f64())'
+        )
+    if len(args) == 1 and callee in ('sin', 'cos') and node.ty == SemaType.F32:
+        return (
+            f'amdgpu::transcendental::{callee}_f32({args[0]}, '
+            'wf.fp_denorm_mode_f32(), '
+            'amdgpu::fp_mode::quiets_nan(wf.cu().arch(), wf.ieee_mode()))'
+        )
+    if (
+        len(args) == 1
+        and callee in ('log', 'log2', 'exp', 'exp2')
+        and node.ty in (SemaType.F16, SemaType.F32)
+    ):
+        function = 'log' if callee.startswith('log') else 'exp'
+        if node.ty == SemaType.F16:
+            logarithm = 'true' if function == 'log' else 'false'
+            return (
+                f'amdgpu::transcendental::log_exp_f16<{logarithm}>({args[0]}, '
+                'wf.fp_denorm_mode_f16_f64(), wf.fp16_ovfl(), '
+                'amdgpu::fp_mode::quiets_nan(wf.cu().arch(), wf.ieee_mode()))'
+            )
+        return (
+            f'amdgpu::transcendental::{function}_f32({args[0]}, '
+            'amdgpu::fp_mode::quiets_nan(wf.cu().arch(), wf.ieee_mode()))'
+        )
     if len(args) == 1 and callee in _INLINE_UNARY_OPS:
         return _INLINE_UNARY_OPS[callee].format(args[0])
     if len(args) == 2 and callee in _INLINE_BINARY_OPS:
@@ -2070,9 +2110,9 @@ def _lower_apply_omod(node: SemaNode, ctx: LoweringContext) -> str:
             'wf.fp_denorm_mode_f16_f64(), wf.ieee_mode(), inst_.omod)'
         )
     else:
-        # DX9 FMA disables output denormals independently of MODE, so those
-        # bits cannot suppress its output modifiers.
-        force_output_flush = ctx.dx9_zero_fma
+        # DX9 FMA and LOG/EXP disable output denormals independently of MODE,
+        # so those bits cannot suppress their output modifiers.
+        force_output_flush = ctx.dx9_zero_fma or ctx.flush_nearest_f32
         denorm_expr = '0' if force_output_flush else 'wf.fp_denorm_mode_f32()'
         omod_expr = (
             'amdgpu::fp_mode::effective_omod(wf.cu().arch(), '
@@ -2113,6 +2153,10 @@ def _lower_apply_omod(node: SemaNode, ctx: LoweringContext) -> str:
             f'[&]() {{ {environment}float v = {rhs};'
             f' return amdgpu::fp_mode::apply_omod_f32(v, {omod_expr}); }}()'
         )
+    if node.ty == SemaType.F16 and any(
+        _contains_call(node.children[1], op) for op in ('log', 'log2', 'exp', 'exp2')
+    ):
+        return f'amdgpu::fp_mode::apply_omod_f16({rhs}, {omod_expr}, wf.fp16_ovfl())'
     return (
         f'[&]() {{ {environment}{fp_type} v = {rhs};'
         f' const uint32_t effective_omod = {omod_expr};'
