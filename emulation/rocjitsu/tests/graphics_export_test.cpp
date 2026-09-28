@@ -7078,6 +7078,25 @@ TEST_P(GraphicsExportTest, ColorAttachmentsWriteFullTexelsAndPreserveMaskedChann
        .blend = 0x61000604u,
        .initial = {0x583028fcu, 0x583028fcu, 0x583028fcu, 0xd9b9d285u}},
 
+      // Physical FP16 products align to 23 bits before truncating the sum.
+      {.data_format = 12,
+       .export_format = 4,
+       .bytes = 8,
+       .mask = 3,
+       .exported = {0x00c300c3u, 0x002800c3u},
+       .expected = {0x44fc44fcu, 0x3a6644fcu},
+       .blend = 0x40000501,
+       .initial = {0x44fc44fcu, 0x3a6644fcu}},
+      // A destination bypass also retains FP16 negative zero.
+      {.data_format = 12,
+       .export_format = 4,
+       .bytes = 8,
+       .mask = 3,
+       .exported = {0x3fa23fa2u, 0x00003fa2u},
+       .expected = {0x6f106f10u, 0x80006f10u},
+       .blend = 0x40000504,
+       .blend_opt = 0x01100154u,
+       .initial = {0x6f106f10u, 0x80006f10u}},
       // Physical FP16/FP32 blend captures include product precision and RTZ output.
       {.data_format = 12,
        .export_format = 4,

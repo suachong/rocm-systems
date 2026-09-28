@@ -405,14 +405,14 @@ inline bool blend_saturate_uses_source(float source, float destination) {
 }
 
 // Blending aligns product terms using their input exponents, retaining
-// multiplication carries: 35 bits for FP32 and 23 for UNORM8. The built-in ONE
+// multiplication carries: 35 bits for FP32 and 23 for FP16/UNORM. The built-in ONE
 // factor has exponent -1; a shader alpha of 1.0 has exponent 0. Discarded bits
 // remain sticky for FP32 rounding, even when the products have opposite signs.
 // FP32 input subnormals must already be flushed to signed zero.
 // Inverse factors take the original factor value, before subtracting from one.
 inline double blend_products(float a, float af, BlendFactorMode a_mode, float b, float bf,
                              BlendFactorMode b_mode, bool negate_a, bool negate_b,
-                             bool unorm = false) {
+                             bool reduced_precision = false) {
   const auto ignored = [](float factor, BlendFactorMode mode) {
     return (mode == BlendFactorMode::Direct && std::bit_cast<uint32_t>(factor) == 0) ||
            (mode == BlendFactorMode::Inverse && factor == 1);
@@ -474,7 +474,7 @@ inline double blend_products(float a, float af, BlendFactorMode a_mode, float b,
   int e = -1000;
   for (unsigned i = 0; i < count; ++i)
     e = std::max(e, terms[i].exponent);
-  const double unit = e == -1000 ? 1 : std::ldexp(1.0, e - (unorm ? 22 : 34));
+  const double unit = e == -1000 ? 1 : std::ldexp(1.0, e - (reduced_precision ? 22 : 34));
   double sum = 0;
   bool sticky = false;
   for (unsigned i = 0; i < count; ++i) {
@@ -482,9 +482,9 @@ inline double blend_products(float a, float af, BlendFactorMode a_mode, float b,
     sum = i == 0 ? q : sum + q;
     sticky |= q != terms[i].value;
   }
-  // UNORM quantizes the aligned sum directly to the attachment's byte value.
-  // Its discarded product bits do not affect that final rounding.
-  if (unorm)
+  // FP16 and UNORM quantize the aligned sum directly to the attachment.
+  // Their discarded product bits do not affect that final rounding.
+  if (reduced_precision)
     return sum;
   // Round the significand before flushing underflow; host conversion would
   // first reduce subnormal precision and can incorrectly round up to normal.

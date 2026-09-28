@@ -243,7 +243,7 @@ BlendCopy fixed_blend_copy(uint32_t control, uint32_t write_mask,
 template <typename T>
 T blend_component(uint32_t control, uint32_t component, const std::array<T, 4> &source,
                   const std::array<T, 4> &destination, const std::array<T, 4> &constant,
-                  bool fp32 = false, bool unorm = false) {
+                  bool fp32 = false, bool reduced_precision = false) {
   const uint32_t operation = (control >> 5) & 7;
   if (operation == kBlendMin)
     return fp32 ? raster::blend_minmax(source[component], destination[component], false)
@@ -261,7 +261,7 @@ T blend_component(uint32_t control, uint32_t component, const std::array<T, 4> &
       return raster::BlendFactorMode::Inverse;
     return raster::BlendFactorMode::Direct;
   };
-  if (fp32 || unorm) {
+  if (fp32 || reduced_precision) {
     const auto resolve = [&](uint32_t factor) {
       if (factor != kBlendSrcAlphaSaturate)
         return factor;
@@ -279,7 +279,7 @@ T blend_component(uint32_t control, uint32_t component, const std::array<T, 4> &
                               destination, constant);
     return raster::blend_products(source[component], sf, sm, destination[component], df, dm,
                                   operation == kBlendReverseSubtract, operation == kBlendSubtract,
-                                  unorm);
+                                  reduced_precision);
   }
   const T source_term =
       source[component] * blend_factor(src, component, source, destination, constant);
@@ -2482,6 +2482,8 @@ void GraphicsDraw::write_output_fragment(const Memory &memory, const FragmentWav
       // A destination bypass retains the whole pixel. A written group that
       // needs arithmetic also prevents the other group from bypassing.
       const bool preserve_destination = preserves_group(false) && preserves_group(true);
+      if (preserve_destination)
+        continue;
       bool copy_source = false;
       if (fp32_blend) {
         auto copy = fixed_blend_copy(blend, write_mask, constant);
@@ -2493,7 +2495,7 @@ void GraphicsDraw::write_output_fragment(const Memory &memory, const FragmentWav
           copy = BlendCopy::None;
         // Test bypass before input flushing or widening, preserving the raw
         // destination bits even for subnormals and signaling NaNs.
-        if (preserve_destination || copy == BlendCopy::Destination)
+        if (copy == BlendCopy::Destination)
           continue;
         copy_source = copy == BlendCopy::Source;
         if (!copy_source)
@@ -2504,8 +2506,6 @@ void GraphicsDraw::write_output_fragment(const Memory &memory, const FragmentWav
           }
       }
       if (unorm_blend) {
-        if (preserve_destination)
-          continue;
         const auto copy_group = [&](bool alpha, const std::array<float, 4> &flags, uint32_t mask,
                                     BlendCopy from = BlendCopy::Source) {
           return !(color.write_mask & mask & (alpha ? 8u : 7u)) ||
@@ -2537,8 +2537,9 @@ void GraphicsDraw::write_output_fragment(const Memory &memory, const FragmentWav
       if (!copy_source) {
         for (uint32_t c = 0; c < 4; ++c) {
           const uint32_t control = c == 3 && (blend & kBlendSeparateAlpha) ? blend >> 16 : blend;
-          const double blended = blend_component(control, c, widen(source), widen(destination),
-                                                 widen(constant), fp32_blend, unorm_blend);
+          const double blended =
+              blend_component(control, c, widen(source), widen(destination), widen(constant),
+                              fp32_blend, unorm_blend || fp16_blend);
           if (unorm_blend) {
             // Keep blend precision through quantization. Rounding to FP32
             // first can cross a UNORM midpoint, even with FP16 exports.
