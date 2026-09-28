@@ -542,6 +542,7 @@ GraphicsDraw::GraphicsDraw(const Pm4QueueState &state, rj_code_arch_t arch, uint
     for (const auto &[dst, src] : {std::pair{0x1b, 0x203},
                                    {0x1c, 0x200},
                                    {0x190, 0x1b6},
+                                   {0x194, 0x1c4},
                                    {0x195, 0x1c5},
                                    {0x197, 0x1b3},
                                    {0x198, 0x1b4},
@@ -557,7 +558,8 @@ GraphicsDraw::GraphicsDraw(const Pm4QueueState &state, rj_code_arch_t arch, uint
     context_[0x19] = (ctx[3] >> 16) & 1; // DISABLE_VIEWPORT_CLAMP
     for (uint32_t i = 0; i < 32; ++i)
       context_[0x199 + i] = ctx[0x191 + i];
-    sh_[0x31] = ((ctx[0x1b1] >> 1) & 31) | ((ctx[0x1b6] & 63) << 11);
+    sh_[0x31] =
+        ((ctx[0x1b1] >> 1) & 31) | (((ctx[0x1b1] >> 8) & 31) << 5) | ((ctx[0x1b6] & 63) << 11);
     sh_[0x84] = state.sh_registers[0x88];
     sh_[0x85] = state.sh_registers[0x89];
     context_[5] = (ctx[7] & 0x3fff) | (((ctx[7] >> 16) & 0x3fff) << 16);
@@ -631,7 +633,7 @@ bool GraphicsDraw::enable_vertex_batching(const GpuVmAccess &memory, uint32_t li
     return false;
   // Attribute stores round threads to eight; swizzling interleaves blocks of
   // 32 vertices. Reserve the whole wave, including trailing and padding lanes.
-  const uint32_t slot_bytes = wave * ((sh_[0x31] & 31) + 1) * 16;
+  const uint32_t slot_bytes = wave * attribute_stride();
   limit = std::min({limit, 32u, attribute_ring_bytes_ / slot_bytes});
   const uint64_t groups_per_instance = primitive_type_ == kTriangleStrip
                                            ? (uint64_t{total_vertices_} - 3) / (wave - 2) + 1
@@ -970,9 +972,16 @@ void GraphicsDraw::export_mask(Wavefront &wave, uint64_t mask) {
 void GraphicsDraw::export_lane(Wavefront &wave, uint32_t lane, uint32_t target, uint32_t mask,
                                const std::array<uint32_t, 4> &values) {
   if (fragment_stage_) {
-    if (target == 8 && !(mask & ~1u)) {
-      if (mask)
-        fragment_for_dispatch(wave.wg_coord()[0]).lanes[lane].z = std::bit_cast<float>(values[0]);
+    if (target == 8 && !(mask & ~3u) &&
+        (!(mask & 2) || (context_[0x194] == 2 && !(context_[0x1b] & 4)))) {
+      auto &fragment = fragment_for_dispatch(wave.wg_coord()[0]).lanes[lane];
+      if (mask & 1)
+        fragment.z = std::bit_cast<float>(values[0]);
+      // SPI_SHADER_32_GR carries depth in X and the stencil test value in Y.
+      if (mask & 2) {
+        fragment.stencil_reference = values[1];
+        fragment.stencil_exported = true;
+      }
       return;
     }
     if (target >= colors_.size()) {
@@ -1465,7 +1474,7 @@ bool GraphicsDraw::try_gather_attributes(const GpuVmAccess &memory, const Vertex
       group.attribute_offset > UINT64_MAX - attribute_ring_base_)
     return false;
   const uint64_t base = attribute_ring_base_ + group.attribute_offset;
-  const uint32_t stride = ((sh_[0x31] & 31) + 1) * 16;
+  const uint32_t stride = attribute_stride();
   std::array<VmRamWordRead, 32 * 12> reads;
   size_t count = 0;
   uint64_t begin = UINT64_MAX, end = 0;
@@ -1544,7 +1553,7 @@ void GraphicsDraw::rasterize(const GpuVmAccess &memory, const VertexGroup &group
   const uint32_t attributes = (sh_[0x31] >> 11) & 63;
   if (attributes > 32 || (sh_[0x31] >> 17))
     throw std::runtime_error("unsupported graphics parameter count");
-  const uint32_t ring_stride = ((sh_[0x31] & 31) + 1) * 16;
+  const uint32_t ring_stride = attribute_stride();
   const float sx = std::bit_cast<float>(context_[0x10f]);
   const float ox = std::bit_cast<float>(context_[0x110]);
   const float sy = std::bit_cast<float>(context_[0x111]);
@@ -1958,6 +1967,8 @@ void GraphicsDraw::rasterize(const GpuVmAccess &memory, const VertexGroup &group
           f.x = x + (q & 1);
           f.y = y + (q >> 1);
           f.covered = mask & (1u << q);
+          f.stencil_reference = 0;
+          f.stencil_exported = false;
           const double dx = x + 0.5 - screen[0].x, dy = y + 0.5 - screen[0].y;
           const auto evaluate = [&](const raster::Plane &plane) {
 #if defined(__clang__) && defined(__x86_64__)
@@ -2295,7 +2306,9 @@ void GraphicsDraw::write_output_fragment(const Memory &memory, const FragmentWav
     return;
   const bool back = !batch.front && (depth_control_ & (1u << 7));
   const uint32_t face_shift = back ? 8 : 0;
-  const uint8_t reference = context_[0x22] >> face_shift;
+  const uint8_t reference = f.stencil_exported && (context_[0x1b] & 2)
+                                ? f.stencil_reference
+                                : context_[0x22] >> face_shift;
   uint8_t previous_stencil = 0;
   std::optional<uint64_t> stencil_address;
   bool stencil_pass = true, depth_pass = true;

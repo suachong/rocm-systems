@@ -58,6 +58,8 @@ public:
         bits.push_back(fragment.x);
         bits.push_back(fragment.y);
         bits.push_back(fragment.covered);
+        bits.push_back(fragment.stencil_reference);
+        bits.push_back(fragment.stencil_exported);
         for (float value :
              {fragment.i, fragment.j, fragment.z, fragment.linear_i, fragment.linear_j,
               fragment.pull_model[0], fragment.pull_model[1], fragment.pull_model[2]})
@@ -98,8 +100,17 @@ public:
     draw.fragments_.resize(waves);
     const float poison = std::bit_cast<float>(0x7f801234u);
     for (auto &batch : draw.fragments_)
-      batch.lanes.fill(
-          {-17, 29, poison, poison, poison, poison, poison, {poison, poison, poison}, true});
+      batch.lanes.fill({-17,
+                        29,
+                        poison,
+                        poison,
+                        poison,
+                        poison,
+                        poison,
+                        {poison, poison, poison},
+                        true,
+                        0xab,
+                        true});
     draw.fragments_.clear();
   }
 
@@ -3986,6 +3997,49 @@ TEST_P(GraphicsExportTest, MergedVertexGroupCountsIncludeTrailingVertices) {
   }
 }
 
+TEST_P(GraphicsExportTest, VertexParametersIncludePrimitiveExportsInRingStride) {
+  const bool gfx12 = GetParam() == ROCJITSU_CODE_ARCH_RDNA4;
+  auto backing = std::make_shared<GraphicsBatchMemory>();
+  amdgpu::GpuVm vm;
+  const auto handle = vm.register_address_space(0, backing, backing);
+  const auto access = vm.snapshot(handle);
+  ASSERT_TRUE(access);
+  auto state = batch_state(64);
+  state.uconfig_registers[0x242] = 4;
+  // Two vertex parameters and one primitive parameter; the PS reads vertex parameter one.
+  if (gfx12) {
+    state.sh_registers[0x31] = 1 | (1u << 5) | (1u << 11);
+  } else {
+    state.context_registers[0x1b1] = (1u << 1) | (1u << 8);
+    state.context_registers[0x1b6] |= 1;
+  }
+  state.context_registers[gfx12 ? 0x199 : 0x191] = 1;
+  auto draw = std::make_shared<amdgpu::GraphicsDraw>(state, GetParam(), 63);
+  batch_wave(64, 0);
+  draw->initialize(*wave_, 0, 0);
+  for (uint32_t lane = 0; lane < 63; ++lane)
+    draw->export_lane(*wave_, lane, 12, 15, {0, 0, 0, 0x3f800000});
+  for (uint32_t primitive = 0; primitive < 21; ++primitive)
+    draw->export_lane(*wave_, primitive, 20, 1, {1u << 31, 0, 0, 0});
+  export_rectangle_vertices(*draw, 20);
+  const std::array<float, 4> values{0.25f, 0.5f, 0.75f, 1.0f};
+  for (uint32_t vertex = 60; vertex < 63; ++vertex) {
+    // Second 32-vertex block, parameter one, with all three slots in the block stride.
+    const uint64_t address = 0x10000 + 32 * 48 + 32 * 16 + (vertex - 32) * 16;
+    ASSERT_EQ(access->write(address, std::as_bytes(std::span{values})),
+              amdgpu::VmAccessOutcome::Complete);
+  }
+  ASSERT_TRUE(draw->advance(*access));
+  batch_wave(32, 0);
+  initialize_fragment(draw);
+  for (uint32_t component = 0; component < 4; ++component) {
+    EXPECT_EQ(lds_.read32(wave_->lds_base() + component * 12),
+              std::bit_cast<uint32_t>(values[component]));
+    EXPECT_EQ(lds_.read32(wave_->lds_base() + component * 12 + 4), 0u);
+    EXPECT_EQ(lds_.read32(wave_->lds_base() + component * 12 + 8), 0u);
+  }
+}
+
 TEST_P(GraphicsExportTest, AttributeWordGatherMatchesSelectedBitsAndHostEnvironment) {
 #if defined(__GLIBC__) && defined(__x86_64__)
   const bool gfx12 = GetParam() == ROCJITSU_CODE_ARCH_RDNA4;
@@ -4014,14 +4068,18 @@ TEST_P(GraphicsExportTest, AttributeWordGatherMatchesSelectedBitsAndHostEnvironm
   const int saved_errno = errno;
   RestoreFenvAndErrno restore{saved, saved_errno};
   for (uint32_t attributes : {1u, 2u, 32u}) {
-    for (uint32_t stride : {16u, 512u}) {
+    for (uint32_t stride : {16u, 48u, 512u}) {
+      const uint32_t primitive_attributes = stride == 48 ? 1 : 0;
+      const uint32_t vertex_attributes = stride / 16 - primitive_attributes;
       for (uint32_t offset : {0u, 32768u}) {
         auto state = batch_state(64);
         state.uconfig_registers[0x242] = 6; // A full 64-vertex triangle-strip group.
         if (gfx12) {
-          state.sh_registers[0x31] = (attributes << 11) | (stride / 16 - 1);
+          state.sh_registers[0x31] =
+              (attributes << 11) | (primitive_attributes << 5) | (vertex_attributes - 1);
         } else {
-          state.context_registers[0x1b1] = (stride / 16 - 1) << 1;
+          state.context_registers[0x1b1] =
+              ((vertex_attributes - 1) << 1) | (primitive_attributes << 8);
           state.context_registers[0x1b6] = (1u << 15) | attributes;
         }
         const uint32_t controls[] = {0, 0x400 | 31, 0x420 | 31, 0x320, 31};
@@ -4574,7 +4632,8 @@ TEST_P(GraphicsExportTest, VertexBatchPreservesIndicesInstancesStripsAndPaddedRi
   ASSERT_TRUE(access);
   for (uint32_t wave_size : {32u, 64u})
     for (uint32_t primitive : {4u, 6u, 17u})
-      for (uint32_t stride : {1u, 31u}) {
+      for (uint32_t stride : {1u, 2u, 31u}) {
+        const uint32_t primitive_attributes = stride == 2 ? 1 : 0;
         SCOPED_TRACE(testing::Message() << wave_size << ',' << primitive << ',' << stride);
         auto state = batch_state(wave_size);
         state.num_instances = 3;
@@ -4582,9 +4641,10 @@ TEST_P(GraphicsExportTest, VertexBatchPreservesIndicesInstancesStripsAndPaddedRi
         state.context_registers[0x204] = 1u << 22; // No rasterization.
         // Maximum stride limits Wave64 to two groups; a smaller stride admits 32.
         if (gfx12)
-          state.sh_registers[0x31] = stride;
+          state.sh_registers[0x31] = (stride - primitive_attributes) | (primitive_attributes << 5);
         else
-          state.context_registers[0x1b1] = stride << 1;
+          state.context_registers[0x1b1] =
+              ((stride - primitive_attributes) << 1) | (primitive_attributes << 8);
         const uint32_t slot_bytes = wave_size * (stride + 1) * 16;
         std::vector<uint32_t> indices(769);
         for (uint32_t i = 0; i < indices.size(); ++i)
@@ -9193,6 +9253,12 @@ TEST_P(GraphicsExportTest, StencilComparisonsOperationsAndMasksRespectDepthAndFa
           } else {
             ctx[back ? 0x10d : 0x10c] = 0xc3f00f36;
           }
+          const bool shader_stencil = operation == 3;
+          if (shader_stencil) {
+            ctx[gfx12 ? 0x1b : 0x203] |= 2; // STENCIL_TEST_VAL_EXPORT_ENABLE.
+            ctx[gfx12 ? 0x194 : 0x1c4] = 2; // SPI_SHADER_32_GR.
+            ctx[gfx12 ? 0x22 : back ? 0x10d : 0x10c] ^= 0xf9u << (gfx12 && back ? 8 : 0);
+          }
           ctx[gfx12 ? 0x207 : 0x205] = back ? 4 : 0;
           ctx[0x10f] = ctx[0x110] = ctx[0x111] = ctx[0x112] = std::bit_cast<uint32_t>(2.0f);
           ctx[0x113] = std::bit_cast<uint32_t>(1.0f);
@@ -9206,6 +9272,12 @@ TEST_P(GraphicsExportTest, StencilComparisonsOperationsAndMasksRespectDepthAndFa
           auto draw = std::make_shared<amdgpu::GraphicsDraw>(state, GetParam(), 3);
           export_rectangle_vertices(*draw);
           ASSERT_TRUE(draw->advance(*access_));
+          if (shader_stencil) {
+            initialize_fragment(draw);
+            for (uint32_t lane = 0; lane < wave_->wf_size(); ++lane)
+              draw->export_lane(*wave_, lane, 8, 2, {0, 0x12345636, 0, 0});
+            ASSERT_FALSE(wave_->instruction_execution_failed());
+          }
           EXPECT_FALSE(draw->advance(*access_));
           for (uint32_t y = 0; y < 4; ++y)
             for (uint32_t x = 0; x < 4; ++x) {

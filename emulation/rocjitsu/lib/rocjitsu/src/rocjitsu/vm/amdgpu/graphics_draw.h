@@ -88,6 +88,8 @@ private:
     float linear_i, linear_j;
     std::array<float, 3> pull_model;
     bool covered;
+    uint8_t stencil_reference;
+    bool stencil_exported;
   };
   class FragmentWave {
   public:
@@ -171,6 +173,10 @@ private:
   template <typename Memory>
   void write_output_fragment(const Memory &memory, const FragmentWave &batch, uint32_t lane);
   uint32_t primitive_count(const VertexGroup &group) const;
+  uint32_t attribute_stride() const {
+    // Per-primitive parameters occupy ring space even when the PS only reads vertex inputs.
+    return ((sh_[0x31] & 31) + 1 + ((sh_[0x31] >> 5) & 31)) * 16;
+  }
   void select_vertex_groups();
   std::optional<DispatchEntry> next_vertex_group();
 };
