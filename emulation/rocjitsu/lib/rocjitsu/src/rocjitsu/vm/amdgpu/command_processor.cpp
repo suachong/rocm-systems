@@ -3254,6 +3254,7 @@ void CommandProcessor::fetch_pm4(Pm4SubmitQueue &queue, Pm4DispatchState &qs, si
         dispatch_graphics_pm4(queue, qs, std::move(*dp));
         return;
       }
+      state.occlusion_samples += state.draw->occlusion_samples();
       state.draw.reset();
     }
     // Bound one event's packet work, including IB chains.
@@ -3743,6 +3744,30 @@ void CommandProcessor::fetch_pm4(Pm4SubmitQueue &queue, Pm4DispatchState &qs, si
             throw std::runtime_error("PM4 streamout query write failed");
           break;
         }
+        if (submission.graphics_engine && event == 57) {
+          // PIXEL_PIPE_STAT_DUMP writes enabled occlusion counter instances.
+          require(3);
+          if (words[0] != (57u | (1u << 8)) || (words[1] & 7) ||
+              state.unsupported_pixel_counter_mode || !state.pixel_counter_instances)
+            throw std::runtime_error("unsupported PM4 occlusion query event");
+          flush_gpu_caches();
+          const uint64_t mask = state.pixel_counter_instances;
+          if (address(1) > UINT64_MAX - 16 * std::bit_width(mask))
+            throw std::runtime_error("PM4 occlusion query address overflow");
+          for (int instance = 0; instance < std::bit_width(mask); ++instance) {
+            if (!(mask & (uint64_t{1} << instance)))
+              continue;
+            // The rasterizer has one logical sample counter. Publish its sum
+            // in the first enabled instance and valid zeroes in the others.
+            const uint64_t value =
+                (uint64_t{1} << 63) |
+                (instance == std::countr_zero(mask) ? state.occlusion_samples : 0);
+            if (access->write(address(1) + 16 * instance, std::as_bytes(std::span{&value, 1})) !=
+                VmAccessOutcome::Complete)
+              throw std::runtime_error("PM4 occlusion query write failed");
+          }
+          break;
+        }
         if (submission.graphics_engine && event == 56) {
           // PIXEL_PIPE_STAT_CONTROL configures graphics counters, not a memory write.
           require(3);
@@ -3750,6 +3775,7 @@ void CommandProcessor::fetch_pm4(Pm4SubmitQueue &queue, Pm4DispatchState &qs, si
           // Instance-enable bits do not mean an occlusion query is active.
           state.unsupported_pixel_counter_mode =
               words[0] != (56u | (1u << 8)) || (words[1] & 0x7ffu) != (2u << 9);
+          state.pixel_counter_instances = (uint64_t{words[2]} << 21) | (words[1] >> 11);
           break;
         }
         require(1);

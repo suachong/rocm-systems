@@ -6,6 +6,7 @@
 #include "rocjitsu/isa/arch/amdgpu/shared/fp_mode.h"
 #include "rocjitsu/isa/arch/amdgpu/shared/hwfloat/unorm.h"
 #include "rocjitsu/vm/amdgpu/compute_unit.h"
+#include "rocjitsu/vm/amdgpu/image_bc.h"
 #include "rocjitsu/vm/amdgpu/image_filter.h"
 #include "rocjitsu/vm/amdgpu/lds.h"
 #include "rocjitsu/vm/amdgpu/mem_state.h"
@@ -113,7 +114,7 @@ double round_even(double value) {
 }
 
 uint32_t encode_filtered_unorm(uint64_t rounded_unorm, uint32_t unorm_width) {
-  // Normalize by repeating eight- or ten-bit fields, then round the 34
+  // Normalize by repeating seven-, eight- or ten-bit fields, then round the 34
   // fractional bits to FP32 with midpoints rounded up. This is the existing
   // texture normalization, not ordinary division by the UNORM maximum.
   const uint64_t numerator = rounded_unorm << (34 - 13 - unorm_width);
@@ -553,10 +554,33 @@ void complete_buffer_format_load(Wavefront &wf, ComputeUnitCore &cu, const Vecto
       const bool valid = d.lane_mask & (uint64_t{1} << lane);
       const bool border =
           d.image_sample && !(d.image_sample->taps[tap].lane_mask & (uint64_t{1} << lane));
-      const auto bytes = valid && !border
-                             ? std::span(d.response_data)
-                                   .subspan((tap * d.wf_size + lane) * d.elem_size, d.elem_size)
-                             : std::span<const uint8_t>{};
+      auto bytes = valid && !border
+                       ? std::span(d.response_data)
+                             .subspan((tap * d.wf_size + lane) * d.elem_size, d.elem_size)
+                       : std::span<const uint8_t>{};
+      std::array<uint8_t, 8> decoded_texel{};
+      if (d.image_bc_format && !bytes.empty()) {
+        const uint32_t coordinate =
+            d.image_sample ? d.image_sample->taps[tap].coordinates[lane] : 0;
+        const uint32_t index =
+            d.image_sample ? (coordinate & 3) + ((coordinate >> 14) & 12) : d.image_bc_texels[lane];
+        if (d.image_bc_format <= 114) {
+          const auto rgba = decode_image_bc(d.image_bc_format, index, bytes);
+          std::copy(rgba.begin(), rgba.end(), decoded_texel.begin());
+        } else {
+          const bool signed_format = !(d.image_bc_format & 1);
+          const uint32_t channels = d.image_bc_format <= 116 ? 1 : 2;
+          for (uint32_t c = 0; c < channels; ++c) {
+            const int32_t value =
+                decode_image_bc_scalar(bytes.subspan(c * 8, 8), index, signed_format);
+            const uint32_t bits =
+                encode_filtered_unorm(uint32_t(std::abs(value)) << 7, signed_format ? 7 : 8) |
+                (value < 0 ? 0x80000000u : 0);
+            std::memcpy(decoded_texel.data() + c * 4, &bits, 4);
+          }
+        }
+        bytes = std::span(decoded_texel).first(format.byte_size());
+      }
       std::array<uint32_t, 4> values{};
       if (d.image_sample && d.image_sample->gather && !valid)
         return values;

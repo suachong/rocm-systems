@@ -31,6 +31,7 @@ public:
   ssize_t (*read)(int, void *, size_t) = nullptr;
   ssize_t (*write)(int, const void *, size_t) = nullptr;
   int (*ioctl)(int, unsigned long, ...) = nullptr;
+  long (*syscall)(long, ...) = nullptr;
   void *(*mmap)(void *, size_t, int, int, int, off_t) = nullptr;
   int (*munmap)(void *, size_t) = nullptr;
   int (*mprotect)(void *, size_t, int) = nullptr;

@@ -1939,6 +1939,7 @@ rj_add_interposer_test_suite(
 )
 
 set(_rj_interposer_pm4_tests
+    SparseReplacementPreservesResidentTail
     SubmissionFenceQueryPollsAndWaitsForCompletion
     SubmissionFenceSequencesAreLocalToContextAndEngine
     SubmissionFenceQueryRejectsInvalidIdentityAndReportsFailure
@@ -1949,6 +1950,7 @@ set(_rj_interposer_pm4_tests
     ContextMaskedUpdatesAndTranslationPrefetchPreserveOtherState
     DispatchInterleaveShadowIsQualifiedForGfx12
     ComputeTranslationPrefetchIgnoresPfpSelector
+    OcclusionQuerySamplesOnlyEnabledInstances
     StreamoutQuerySamplesAllFourMemoryCounterPairs
     StreamoutQueryEventMarksZeroCounterSamplesValid
     InterleavedDispatchExecutesDirectAndIndirectShaders
@@ -2041,6 +2043,7 @@ rj_add_interposer_test_suite(
 
 rj_add_interposer_test_suite(
     InterposerGemTest
+    SparseReservationsPreserveRangesAndFileOwnership
     GemNamespaceIsPrivateButSharedByDuplicates
     IndependentDrmFilesRejectOverlappingMappings
     ReusedDmabufFdMintsDistinctHandles
@@ -2064,6 +2067,7 @@ set(_rj_interposer_syncobj_tests
     DestroyRejectsInvalidInput
     TimelineWaitBlocksUntilSignalOrDeadline
     TimelineWaitReturnsEintrForSignal
+    TimelineWaitAllowsThreadExitFromSignal
     ConcurrentVmUpdatesShareTimeline
     OutOfOrderTimelinePointPreservesWatermark
 )

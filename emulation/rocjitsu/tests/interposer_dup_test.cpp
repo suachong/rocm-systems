@@ -42,6 +42,7 @@ RJ_DIAGNOSTIC_POP
 #include <dlfcn.h>
 #include <fcntl.h>
 #include <fstream>
+#include <linux/futex.h>
 #include <linux/sync_file.h>
 #include <poll.h>
 #include <spawn.h>
@@ -1358,6 +1359,28 @@ TEST_F(InterposerPm4Test, ComputeTranslationPrefetchIgnoresPfpSelector) {
   ASSERT_EQ(submit(std::size(packet), false, &sequence), 0);
   EXPECT_EQ(wait_output(monotonic_deadline_after(std::chrono::seconds(2))), 0);
   EXPECT_EQ(memory_[1536], 0x12345678u);
+}
+
+TEST_F(InterposerPm4Test, OcclusionQuerySamplesOnlyEnabledInstances) {
+  const uint64_t destination = kAddress + 6144;
+  const uint32_t packets[]{
+      0xc0024600, 56 | (1u << 8), (5u << 11) | (2u << 9),    0,
+      0xc0024600, 57 | (1u << 8), uint32_t(destination),     uint32_t(destination >> 32),
+      0xc0024600, 57 | (1u << 8), uint32_t(destination + 8), uint32_t(destination >> 32)};
+  std::fill_n(memory_ + 1536, 14, 0xdeadbeef);
+  std::memcpy(memory_, packets, sizeof(packets));
+  uint64_t sequence = 0;
+  ASSERT_EQ(submit(std::size(packets), false, &sequence, AMDGPU_HW_IP_GFX), 0);
+  ASSERT_EQ(wait_output(monotonic_deadline_after(std::chrono::seconds(5))), 0);
+  for (uint32_t instance : {0u, 2u}) {
+    EXPECT_EQ(memory_[1536 + 4 * instance], 0u);
+    EXPECT_EQ(memory_[1537 + 4 * instance], 0x80000000u);
+    EXPECT_EQ(memory_[1538 + 4 * instance], 0u);
+    EXPECT_EQ(memory_[1539 + 4 * instance], 0x80000000u);
+  }
+  EXPECT_EQ(memory_[1540], 0xdeadbeefu);
+  EXPECT_EQ(memory_[1541], 0xdeadbeefu);
+  EXPECT_EQ(memory_[1548], 0xdeadbeefu);
 }
 
 TEST_F(InterposerPm4Test, StreamoutQuerySamplesAllFourMemoryCounterPairs) {
@@ -3240,6 +3263,71 @@ TEST(InterposerSyncobjTest, TimelineWaitReturnsEintrForSignal) {
   EXPECT_EQ(close(kfd), 0);
 }
 
+TEST(InterposerSyncobjTest, TimelineWaitAllowsThreadExitFromSignal) {
+  int drm = open_drm_render();
+  ASSERT_GE(drm, 0);
+  drm_syncobj_create create{};
+  ASSERT_EQ(ioctl(drm, DRM_IOCTL_SYNCOBJ_CREATE, &create), 0);
+  uint64_t point = 1;
+  drm_syncobj_timeline_wait wait{};
+  wait.handles = reinterpret_cast<uintptr_t>(&create.handle);
+  wait.points = reinterpret_cast<uintptr_t>(&point);
+  wait.count_handles = 1;
+  wait.flags = DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL | DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT;
+  wait.timeout_nsec = monotonic_deadline_after(std::chrono::seconds(5));
+
+  // Model Wine terminating a thread while a C driver is blocked in ioctl. Avoid
+  // inheriting the C++ libc header's noexcept declaration in the caller, too.
+  auto call = reinterpret_cast<int (*)(int, unsigned long, ...)>(dlsym(RTLD_DEFAULT, "ioctl"));
+  ASSERT_NE(call, nullptr);
+  struct sigaction action {
+  }, old_action{};
+  action.sa_handler = +[](int) { pthread_exit(nullptr); };
+  sigemptyset(&action.sa_mask);
+  ASSERT_EQ(sigaction(SIGUSR1, &action, &old_action), 0);
+  std::atomic<pid_t> tid{0};
+  bool unwound = false, returned = false;
+  std::thread waiter([&] {
+    struct Cleanup {
+      bool &unwound;
+      ~Cleanup() { unwound = true; }
+    } cleanup{unwound};
+    tid.store(syscall(SYS_gettid), std::memory_order_release);
+    (void)call(drm, DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT, &wait);
+    returned = true;
+  });
+  // Wait for the actual futex sleep so a signal during setup cannot make this
+  // pass without exercising forced unwinding through the interposer.
+  bool blocked = false;
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+  while (std::chrono::steady_clock::now() < deadline) {
+    if (pid_t id = tid.load(std::memory_order_acquire)) {
+      std::ifstream state("/proc/self/task/" + std::to_string(id) + "/syscall");
+      long number;
+      unsigned long address, operation;
+      if (state >> number >> std::hex >> address >> operation && number == SYS_futex &&
+          operation == FUTEX_WAIT_BITSET_PRIVATE) {
+        blocked = true;
+        break;
+      }
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  if (blocked) {
+    EXPECT_EQ(pthread_kill(waiter.native_handle(), SIGUSR1), 0);
+  }
+  waiter.join();
+  EXPECT_TRUE(blocked);
+  EXPECT_TRUE(unwound);
+  EXPECT_FALSE(returned);
+  EXPECT_EQ(sigaction(SIGUSR1, &old_action, nullptr), 0);
+  drm_syncobj_destroy destroy{};
+  destroy.handle = create.handle;
+  EXPECT_EQ(ioctl(drm, DRM_IOCTL_SYNCOBJ_DESTROY, &destroy), 0);
+  // Closing the file also checks that unwinding released its ioctl reservation.
+  EXPECT_EQ(close(drm), 0);
+}
+
 namespace {
 
 void check_fresh_fork_backends(bool concurrent_mappings) {
@@ -4184,6 +4272,116 @@ TEST(InterposerGemTest, GemNamespaceIsPrivateButSharedByDuplicates) {
   EXPECT_EQ(close(kfd), 0);
 }
 
+TEST(InterposerGemTest, SparseReservationsPreserveRangesAndFileOwnership) {
+  const int drm = open_drm_render();
+  ASSERT_GE(drm, 0);
+  const int alias = dup(drm);
+  const int foreign = open_drm_render();
+  ASSERT_GE(alias, 0);
+  ASSERT_GE(foreign, 0);
+  constexpr uint64_t base = 0x2000000000ull;
+  const auto request = DRM_AMDGPU_GEM_VA_request();
+  drm_amdgpu_gem_va sparse{};
+  sparse.operation = AMDGPU_VA_OP_MAP;
+  sparse.flags = AMDGPU_VM_PAGE_PRT;
+  sparse.va_address = base;
+  sparse.map_size = 1ull << 36; // A VA reservation must not allocate resident storage.
+  ASSERT_EQ(ioctl(drm, request, &sparse), 0);
+  EXPECT_EQ(ioctl(alias, request, &sparse), -1);
+  EXPECT_EQ(errno, EINVAL);
+  sparse.operation = AMDGPU_VA_OP_REPLACE;
+  EXPECT_EQ(ioctl(foreign, request, &sparse), -1);
+  EXPECT_EQ(errno, EINVAL);
+
+  // Clear a page in the middle; neither remaining tail becomes available.
+  drm_amdgpu_gem_va clear{};
+  clear.operation = AMDGPU_VA_OP_CLEAR;
+  clear.va_address = base + 4096;
+  clear.map_size = 1;
+  EXPECT_EQ(ioctl(alias, request, &clear), -1);
+  EXPECT_EQ(errno, EINVAL);
+  clear.va_address += 1;
+  clear.map_size = 4096;
+  EXPECT_EQ(ioctl(alias, request, &clear), -1);
+  EXPECT_EQ(errno, EINVAL);
+  // Rejected updates must preserve the original reservation as one exact range.
+  sparse.operation = AMDGPU_VA_OP_UNMAP;
+  ASSERT_EQ(ioctl(alias, request, &sparse), 0);
+  sparse.operation = AMDGPU_VA_OP_MAP;
+  ASSERT_EQ(ioctl(alias, request, &sparse), 0);
+  clear.va_address = base + 4096;
+  ASSERT_EQ(ioctl(alias, request, &clear), 0);
+  sparse.operation = AMDGPU_VA_OP_MAP;
+  sparse.map_size = 4096;
+  for (uint64_t offset : {0ull, 8192ull}) {
+    sparse.va_address = base + offset;
+    EXPECT_EQ(ioctl(drm, request, &sparse), -1);
+    EXPECT_EQ(errno, EINVAL);
+  }
+  sparse.va_address = base + 4096;
+  ASSERT_EQ(ioctl(drm, request, &sparse), 0);
+  sparse.operation = AMDGPU_VA_OP_UNMAP;
+  ASSERT_EQ(ioctl(alias, request, &sparse), 0);
+  sparse.operation = AMDGPU_VA_OP_MAP;
+  sparse.map_size = 0;
+  EXPECT_EQ(ioctl(drm, request, &sparse), -1);
+  EXPECT_EQ(errno, EINVAL);
+  sparse.map_size = 4096;
+  sparse.va_address = UINT64_MAX - 4095;
+  EXPECT_EQ(ioctl(drm, request, &sparse), -1);
+  EXPECT_EQ(errno, EINVAL);
+
+  // Reservations survive duplicate close, but not the last close of their file.
+  ASSERT_EQ(close(drm), 0);
+  sparse.va_address = base;
+  EXPECT_EQ(ioctl(foreign, request, &sparse), -1);
+  ASSERT_EQ(close(alias), 0);
+  ASSERT_EQ(ioctl(foreign, request, &sparse), 0);
+  EXPECT_EQ(close(foreign), 0);
+}
+
+TEST_F(InterposerPm4Test, SparseReplacementPreservesResidentTail) {
+  constexpr uint64_t base = kAddress + 0x100000;
+  const auto request = DRM_AMDGPU_GEM_VA_request();
+  drm_amdgpu_gem_va update{};
+  update.operation = AMDGPU_VA_OP_MAP;
+  update.flags = AMDGPU_VM_PAGE_PRT;
+  update.va_address = base;
+  update.map_size = 4 * 4096;
+  ASSERT_EQ(ioctl(drm_, request, &update), 0);
+  update.operation = AMDGPU_VA_OP_REPLACE;
+  update.flags = AMDGPU_VM_PAGE_READABLE | AMDGPU_VM_PAGE_WRITEABLE;
+  update.handle = bo_;
+  update.map_size = 1;
+  EXPECT_EQ(ioctl(drm_, request, &update), -1);
+  EXPECT_EQ(errno, EINVAL);
+  update.map_size = 4096;
+  update.offset_in_bo = 1;
+  EXPECT_EQ(ioctl(drm_, request, &update), -1);
+  EXPECT_EQ(errno, EINVAL);
+  update.offset_in_bo = 0;
+  update.map_size = 8192;
+  ASSERT_EQ(ioctl(drm_, request, &update), 0);
+  update.flags = AMDGPU_VM_PAGE_PRT;
+  update.handle = 0;
+  update.map_size = 4096;
+  ASSERT_EQ(ioctl(drm_, request, &update), 0);
+
+  // Unbinding the first page must preserve the second page's BO offset and PTE.
+  constexpr uint64_t address = base + 6144;
+  const uint32_t packet[] = {0xc0033700, 5u << 8, uint32_t(address), uint32_t(address >> 32),
+                             0x12345678};
+  std::memcpy(memory_, packet, sizeof(packet));
+  uint64_t sequence = 0;
+  ASSERT_EQ(submit(std::size(packet), false, &sequence), 0);
+  ASSERT_EQ(wait_output(monotonic_deadline_after(std::chrono::seconds(5))), 0);
+  EXPECT_EQ(memory_[1536], 0x12345678u);
+  update.operation = AMDGPU_VA_OP_CLEAR;
+  update.flags = 0;
+  update.map_size = 4 * 4096;
+  EXPECT_EQ(ioctl(drm_, request, &update), 0);
+}
+
 TEST(InterposerGemTest, IndependentDrmFilesRejectOverlappingMappings) {
   int kfd = open_kfd();
   ASSERT_GE(kfd, 0);
@@ -4449,9 +4647,9 @@ TEST(InterposerGemTest, MapSucceedsAfterExportFdClosed) {
 }
 
 // AMDGPU_VA_OP_REPLACE at a VA that overlaps an existing mapping of a DIFFERENT size
-// must evict the old mapping (by its own extent), not silently install overlapping
-// PTEs. After a REPLACE, the old owner's stale range must be gone: its handle's UNMAP
-// of the original range must fail, and no double-unmap can occur.
+// must split the old mapping, not silently install overlapping PTEs. After a REPLACE, the old
+// owner's stale range must be gone: its handle's UNMAP of the original range must fail, and no
+// double-unmap can occur.
 TEST(InterposerGemTest, ReplaceEvictsOverlappingDifferentSizeRange) {
   int kfd = open_kfd();
   ASSERT_GE(kfd, 0);
@@ -4502,6 +4700,11 @@ TEST(InterposerGemTest, ReplaceEvictsOverlappingDifferentSizeRange) {
   unmap_a.map_size = kBigBo;
   EXPECT_EQ(ioctl(drm, gem_va, &unmap_a), -1)
       << "A's overlapping range must have been evicted by B's REPLACE";
+
+  // Only the replaced prefix is gone; the rest of A stays mapped.
+  unmap_a.va_address = va + kSmallBo;
+  unmap_a.map_size = kBigBo - kSmallBo;
+  EXPECT_EQ(ioctl(drm, gem_va, &unmap_a), 0);
 
   // B's new range is live and its UNMAP succeeds exactly once.
   drm_amdgpu_gem_va unmap_b{};

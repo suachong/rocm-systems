@@ -170,6 +170,7 @@ struct Pm4QueueState {
   // Counter events are engine state, separate from the context register bank.
   bool performance_counters_active = false;
   bool unsupported_pixel_counter_mode = false;
+  uint64_t pixel_counter_instances = 0, occlusion_samples = 0;
   std::shared_ptr<GraphicsDraw> draw;
   std::shared_ptr<GsRegisters> gs_registers = std::make_shared<GsRegisters>();
   std::array<uint32_t, 0x400> sh_registers{};

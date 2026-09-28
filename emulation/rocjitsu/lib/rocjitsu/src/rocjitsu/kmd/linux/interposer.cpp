@@ -119,8 +119,11 @@ static_assert(std::atomic<uint32_t>::is_always_lock_free,
 
 /// @brief Sleep while @p word still equals @p expected, until @p deadline or a signal.
 long futex_wait_until(std::atomic<uint32_t> &word, uint32_t expected, const timespec *deadline) {
-  return syscall(SYS_futex, &word, FUTEX_WAIT_BITSET_PRIVATE, expected, deadline, nullptr,
-                 FUTEX_BITSET_MATCH_ANY);
+  // Wine may call pthread_exit from a signal handler during this wait. Use the
+  // resolved pointer to avoid libc's noexcept declaration of syscall, which
+  // would terminate forced unwinding instead of releasing the waiter's state.
+  return rocjitsu::libc_passthrough().syscall(SYS_futex, &word, FUTEX_WAIT_BITSET_PRIVATE, expected,
+                                              deadline, nullptr, FUTEX_BITSET_MATCH_ANY);
 }
 
 /// @brief Wake every waiter sleeping on @p word.
@@ -2858,31 +2861,23 @@ public:
     return handle;
   }
 
-  /// @brief Install (or replace) a GEM_VA range in the GPU page table for @p handle.
-  /// @details Runs entirely under fd_mutex_ and performs BOTH the bookkeeping AND
-  /// the page-table install (drv->gem_va_map) and output timeline signal atomically,
-  /// so a concurrent GEM_CLOSE
-  /// (untrack_gem, also under fd_mutex_) can never interleave between recording the
-  /// range and installing the PTEs — which would otherwise leave PTEs pointing into
-  /// a munmapped cpu_ptr with no entry left to tear them down. It lazily mmaps the
-  /// dmabuf fd's backing pages the first time (the fd is still open at GEM_VA time),
-  /// bounds-checks the request against the BO size, records the range, installs
-  /// the PTEs, and publishes the output timeline point. The lock order
-  /// fd_mutex_ -> driver page-table lock matches
-  /// teardown_gem_entry_locked, so there is no inversion.
-  /// @param replace When true (AMDGPU_VA_OP_REPLACE), reject overlap with another
-  ///   DRM file before evicting an existing range in the calling DRM-file namespace.
-  ///   The namespaces share one simulated GPU page table, so neither operation may
-  ///   overwrite another file's PTEs. When false (AMDGPU_VA_OP_MAP), any overlapping
-  ///   pre-existing range is a conflict.
-  /// @param publish_timeline Whether this update publishes its output timeline.
+  /// @brief Install or replace a resident mapping or sparse VA reservation.
+  /// @details Serializes range bookkeeping, PTE updates and output timeline signals
+  /// under fd_mutex_, so GEM_CLOSE cannot remove backing during an update. Resident
+  /// mappings validate BO bounds and lazily mmap the retained dmabuf. The lock order
+  /// fd_mutex_ -> driver page-table lock matches teardown_gem_entry_locked.
+  /// @param replace Preserve existing tails outside the updated range. Reject
+  /// overlap with other DRM files; without replacement, reject any overlap.
+  /// @param publish_timeline Whether to publish the output timeline point.
   ///   AMDGPU_VM_DELAY_UPDATE suppresses publication, matching the kernel contract.
-  /// @returns Zero when the range was installed, `-ENOENT` for an unknown handle in
-  ///   this DRM-file namespace, or another negative errno for invalid requests.
+  /// @param prt Ignore the GEM handle and reserve VA in this DRM file without
+  /// allocating backing or installing PTEs.
+  /// @returns Zero on success, -ENOENT for an unknown resident handle, or another
+  /// negative errno for an invalid request.
   [[nodiscard]] int gem_map(const DrmFileToken &file, uint32_t handle, uint64_t va_address,
                             uint64_t offset_in_bo, uint64_t map_size, bool replace,
                             bool publish_timeline = true, uint32_t timeline_handle = 0,
-                            uint64_t timeline_point = 0) {
+                            uint64_t timeline_point = 0, bool prt = false) {
     std::unique_lock lock(fd_mutex_);
     if (!file)
       return -EBADF;
@@ -2893,15 +2888,15 @@ public:
     if (!drv)
       return -ENODEV;
     auto it = gem_entries_.find(handle);
-    if (it == gem_entries_.end() || it->second.handle_closed || it->second.drm_file_id != file->id)
+    if (!prt && (it == gem_entries_.end() || it->second.handle_closed ||
+                 it->second.drm_file_id != file->id))
       return -ENOENT;
-    GemEntry &gem = it->second;
-    // Bound the request within the BO without letting offset_in_bo + map_size
-    // overflow (both are caller-controlled __u64 from the UAPI struct): a wrap
-    // would defeat a naive sum-vs-size check and install PTEs pointing outside
-    // the mmap. Reject a zero-size BO, a zero-size map, and any range past the end.
-    if (gem.size == 0 || map_size == 0 || offset_in_bo > gem.size ||
-        map_size > gem.size - offset_in_bo)
+    if (map_size == 0 || va_address > UINT64_MAX - map_size || offset_in_bo > UINT64_MAX - map_size)
+      return -EINVAL;
+    if ((va_address | offset_in_bo | map_size) & 4095)
+      return -EINVAL;
+    GemEntry &gem = prt ? prt_entries_[file->id] : it->second;
+    if (!prt && (gem.size == 0 || offset_in_bo > gem.size || map_size > gem.size - offset_in_bo))
       return -EINVAL;
     const GemMapping range{va_address, map_size};
     // Handle the target VA range's current occupant. Independent DRM files have
@@ -2919,13 +2914,10 @@ public:
                          va_address);
       return -EINVAL;
     }
-    if (replace) {
-      if (!evict_range_locked(drv, file->id, range, /*allow_missing=*/true))
-        return -EINVAL;
-    } else if (range_is_mapped_locked(range)) {
+    if (!replace && range_is_mapped_locked(range)) {
       return -EINVAL;
     }
-    if (!gem.cpu_ptr) {
+    if (!prt && !gem.cpu_ptr) {
       void *p = gem.dmabuf_fd->use([&](int fd) {
         return real().mmap(nullptr, gem.size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
       });
@@ -2933,6 +2925,8 @@ public:
         return -EINVAL;
       gem.cpu_ptr = p;
     }
+    if (replace && !evict_range_locked(drv, file->id, range, /*allow_missing=*/true))
+      return -EINVAL;
     // Record which SimulatedKfd's page table receives these PTEs so GEM_CLOSE (or a
     // DRM-file-close reap) unmaps through the driver that installed them, never a
     // replacement one. Set the owner on the first mapping and keep it: all ranges of
@@ -2944,13 +2938,13 @@ public:
       gem.owner = drv;
     else
       assert(gem.owner == drv && "GEM ranges of one BO must share one owning driver");
-    void *host = static_cast<uint8_t *>(gem.cpu_ptr) + offset_in_bo;
+    void *host = prt ? nullptr : static_cast<uint8_t *>(gem.cpu_ptr) + offset_in_bo;
     // Install the PTEs while still holding fd_mutex_ so the range record and the
     // page-table state stay consistent against a concurrent teardown. gem_va_map
     // only returns false if the local process vanished mid-call; treat that as a
     // failed map (do not record the range) so GEM_VA reports the error rather than a
     // phantom success.
-    if (!drv->gem_va_map(va_address, host, map_size, gem.alloc_flags, gem.sealed_ram))
+    if (!prt && !drv->gem_va_map(va_address, host, map_size, gem.alloc_flags, gem.sealed_ram))
       return -EINVAL;
     gem.installed_vas.push_back(range);
     if (publish_timeline)
@@ -2961,17 +2955,16 @@ public:
     return 0;
   }
 
-  /// @brief Remove a GEM_VA range from the GPU page table for @p handle (UNMAP).
-  /// @details Performs the page-table unmap AND the bookkeeping erase atomically
-  /// under fd_mutex_ (same rationale as gem_map). Validates that @p handle actually
-  /// owns the exact {va_address, map_size} range before mutating the page table, so
-  /// an UNMAP with a wrong handle or range cannot tear down PTEs the handle does not
-  /// own and cannot report success for a no-op.
-  /// @returns Zero when the range was unmapped, `-ENOENT` for an unknown handle in
-  ///   this DRM-file namespace, or another negative errno for invalid requests.
+  /// @brief Remove an exact resident mapping or sparse VA reservation.
+  /// @details Checks range ownership and updates bookkeeping and resident PTEs
+  /// under fd_mutex_, using the same lock order as gem_map.
+  /// @param prt Ignore the GEM handle and remove this DRM file's sparse reservation.
+  /// @returns Zero on success, -ENOENT for an unknown handle or reservation owner,
+  /// or another negative errno for an invalid request.
   [[nodiscard]] int gem_unmap(const DrmFileToken &file, uint32_t handle, uint64_t va_address,
                               uint64_t map_size, bool publish_timeline = true,
-                              uint32_t timeline_handle = 0, uint64_t timeline_point = 0) {
+                              uint32_t timeline_handle = 0, uint64_t timeline_point = 0,
+                              bool prt = false) {
     std::unique_lock lock(fd_mutex_);
     if (!file)
       return -EBADF;
@@ -2982,13 +2975,16 @@ public:
     if (!drv)
       return -ENODEV;
     auto it = gem_entries_.find(handle);
-    if (it == gem_entries_.end() || it->second.handle_closed || it->second.drm_file_id != file->id)
+    auto prt_it = prt_entries_.find(file->id);
+    if (prt ? prt_it == prt_entries_.end()
+            : it == gem_entries_.end() || it->second.handle_closed ||
+                  it->second.drm_file_id != file->id)
       return -ENOENT;
-    GemEntry &gem = it->second;
+    GemEntry &gem = prt ? prt_it->second : it->second;
     const GemMapping range{va_address, map_size};
     if (std::ranges::find(gem.installed_vas, range) == gem.installed_vas.end())
       return -EINVAL; // This handle does not own the exact range — do not touch PTEs.
-    if (!drv->gem_va_unmap(va_address, map_size))
+    if (!prt && !drv->gem_va_unmap(va_address, map_size))
       return -EINVAL;
     std::erase(gem.installed_vas, range);
     if (publish_timeline)
@@ -3014,6 +3010,8 @@ public:
     std::unique_lock lock(fd_mutex_);
     if (!file)
       return -EBADF;
+    if (map_size == 0 || va_address > UINT64_MAX - map_size || ((va_address | map_size) & 4095))
+      return -EINVAL;
     auto timeline = lookup_syncobj_locked(file, timeline_handle);
     if (timeline_handle != 0 && !timeline)
       return -ENOENT;
@@ -3031,13 +3029,14 @@ public:
     return 0;
   }
 
-  /// @brief Reap every GEM handle owned by a closing DRM file (at its close()).
+  /// @brief Reap GEM handles and sparse reservations owned by a closing DRM file.
   /// @details A well-behaved caller GEM_CLOSEs each handle, but a crash or leak can
   /// leave handles live; the DRM file close is their backstop, mirroring the kernel
   /// dropping a drm_file's GEM objects. Tears each entry's PTEs + host mmap down
   /// under fd_mutex_ before erasing, so no state escapes the lock.
   void reap_gem_for_drm_file(uint64_t drm_file_id) {
     std::lock_guard lock(fd_mutex_);
+    prt_entries_.erase(drm_file_id);
     for (auto it = gem_entries_.begin(); it != gem_entries_.end();) {
       if (it->second.drm_file_id == drm_file_id)
         it->second.handle_closed = true;
@@ -3420,6 +3419,9 @@ private:
   /// closes (reap_gem_for_drm_file). Because handles are not recycled with fd numbers,
   /// a reused dmabuf fd can never collide with a still-live BO.
   std::unordered_map<uint32_t, GemEntry> gem_entries_;
+  // Sparse VA reservations have no GEM handle or resident backing. Keep their
+  // intervals per DRM file; allocating storage proportional to VA size defeats PRT.
+  std::unordered_map<uint64_t, GemEntry> prt_entries_;
   /// @brief GEM mmap cursor, outside the KFD doorbell/queue offset namespace.
   uint64_t next_gem_mmap_offset_ = kGemMmapOffsetBase;
   /// @brief Next stable GEM handle to mint. Starts at 1 so 0 means "no handle".
@@ -3459,48 +3461,45 @@ private:
     gem.dmabuf_fd.reset();
   }
 
-  /// @brief Evict every recorded range that OVERLAPS @p range in one DRM file.
-  /// @details Caller holds fd_mutex_ and passes the live simulated @p drv and stable
-  /// DRM-file identity. Used by GEM_VA REPLACE (evict prior mappings before installing
-  /// the new one) and CLEAR (handle-agnostic teardown). Matching is by interval
-  /// intersection, not exact equality: a REPLACE at a VA previously mapped with a
-  /// DIFFERENT size (or a sub/super-range) must still evict the old mapping, otherwise
-  /// its stale bookkeeping would later double-unmap or leak the new PTEs. Each
-  /// overlapping range is unmapped by its OWN {va_address, map_size} extent (not @p
-  /// range's) so the page-table removal matches what was installed, then dropped from
-  /// its entry's bookkeeping. The host mmap is left intact — the owning handle still
-  /// exists and other ranges may reference it; it is munmapped only at GEM_CLOSE /
-  /// reap.
-  /// @param allow_missing When true, no overlap is a success (a MAP onto a free VA has
-  ///   nothing to evict); when false (REPLACE/CLEAR), no overlap is a failure so the
-  ///   ioctl reports EINVAL.
-  /// @retval true nothing overlapped (allow_missing) or all overlaps were evicted.
-  /// @retval false nothing overlapped (only when !allow_missing) or an unmap failed.
-  /// @note Not rolled back on a mid-loop unmap failure: already-evicted ranges stay
-  ///   evicted. This is safe because gem_va_unmap() only fails when the local process
-  ///   has already vanished (SimulatedKfd::gem_va_unmap), i.e. its page table is being
-  ///   torn down anyway, so a partially-evicted state is never observed by a live GPU.
+  /// @brief Remove only the intersection with a VA update, preserving both tails.
+  /// @details PRT intervals carry no resident PTEs. Buffer intervals retain their
+  /// existing host translations outside the update, including the original BO offset.
+  /// Caller holds fd_mutex_. Return false if no range overlaps unless allow_missing,
+  /// or if a resident unmap fails. Completed removals are not rolled back on failure.
   [[nodiscard]] bool evict_range_locked(SimulatedKfd *drv, uint64_t drm_file_id,
                                         const GemMapping &range, bool allow_missing) {
     bool evicted_any = false;
-    for (auto &[handle, gem] : gem_entries_) {
-      if (gem.drm_file_id != drm_file_id)
-        continue;
-      for (auto vit = gem.installed_vas.begin(); vit != gem.installed_vas.end();) {
-        if (!vit->overlaps(range)) {
-          ++vit;
+    auto evict = [&](std::vector<GemMapping> &ranges, bool resident) {
+      for (size_t i = 0; i < ranges.size();) {
+        const auto old = ranges[i];
+        if (!old.overlaps(range)) {
+          ++i;
           continue;
         }
-        if (!drv->gem_va_unmap(vit->va_address, vit->map_size))
-          return false; // process gone; page table already being destroyed (see @note)
-        vit = gem.installed_vas.erase(vit);
+        const uint64_t begin = std::max(old.va_address, range.va_address);
+        const uint64_t end =
+            std::min(old.va_address + old.map_size, range.va_address + range.map_size);
+        if (resident && !drv->gem_va_unmap(begin, end - begin))
+          return false;
+        ranges.erase(ranges.begin() + i);
+        if (old.va_address < begin)
+          ranges.push_back({old.va_address, begin - old.va_address});
+        if (end < old.va_address + old.map_size)
+          ranges.push_back({end, old.va_address + old.map_size - end});
         evicted_any = true;
       }
-    }
+      return true;
+    };
+    for (auto &[handle, gem] : gem_entries_)
+      if (gem.drm_file_id == drm_file_id && !evict(gem.installed_vas, true))
+        return false;
+    auto prt = prt_entries_.find(drm_file_id);
+    if (prt != prt_entries_.end() && !evict(prt->second.installed_vas, false))
+      return false;
     return evicted_any || allow_missing;
   }
 
-  /// @brief Whether any GEM entry owns a range OVERLAPPING @p range in the shared
+  /// @brief Whether any GEM mapping or sparse reservation overlaps @p range in the shared
   /// simulated GPU page table. Caller holds fd_mutex_. Used by plain MAP to reject
   /// a map that would collide with an existing range's PTEs, regardless of which
   /// DRM file owns it.
@@ -3510,10 +3509,14 @@ private:
         if (existing.overlaps(range))
           return true;
     }
+    for (const auto &[file_id, gem] : prt_entries_)
+      for (const auto &existing : gem.installed_vas)
+        if (existing.overlaps(range))
+          return true;
     return false;
   }
 
-  /// @brief Whether a GEM entry owned by a DRM file other than @p drm_file_id
+  /// @brief Whether a GEM mapping or sparse reservation owned by a file other than @p drm_file_id
   /// overlaps @p range in the shared simulated GPU page table. Caller holds
   /// fd_mutex_. Used by REPLACE to reject a foreign collision before evicting any
   /// mapping owned by the caller.
@@ -3526,6 +3529,11 @@ private:
         if (existing.overlaps(range))
           return true;
     }
+    for (const auto &[file_id, gem] : prt_entries_)
+      if (file_id != drm_file_id)
+        for (const auto &existing : gem.installed_vas)
+          if (existing.overlaps(range))
+            return true;
     return false;
   }
 
@@ -4201,7 +4209,10 @@ __attribute__((destructor)) void rj_interposer_shutdown() {
   InterposerContext::ctx.request_local_vm_shutdown();
 }
 
-RJ_INTERPOSER_EXPORT int ioctl(int fd, unsigned long request, ...) {
+// Use the public symbol without inheriting libc's noexcept declaration: a signal
+// handler may terminate a thread blocked in a simulated ioctl via pthread_exit.
+RJ_INTERPOSER_EXPORT int rj_ioctl(int fd, unsigned long request, ...) asm("ioctl");
+RJ_INTERPOSER_EXPORT int rj_ioctl(int fd, unsigned long request, ...) {
   assert(InterposerContext::real().ready());
   va_list ap;
   va_start(ap, request);
@@ -4583,11 +4594,9 @@ RJ_INTERPOSER_EXPORT int ioctl(int fd, unsigned long request, ...) {
       return kfd_ioctl_ret(InterposerContext::ctx.untrack_gem(drm_file, gc->handle));
     }
     if (type == kDrmIoctlType && nr == kDrmIoctlNrGemVa && arg) {
-      // GEM_VA installs (or tears down) a GPU virtual mapping for a prime-
-      // imported buffer. HSA's vmem path (hsa_amd_vmem_map) lowers to this via
-      // amdgpu_bo_va_op; IREE's ring allocator triple-maps one BO at adjacent
-      // VAs. We map by GEM handle, lazily mmap the backing pages, and
-      // install/remove them in the GPU page table.
+      // GEM_VA updates resident mappings or handle-less sparse VA reservations.
+      // Resident mappings lazily mmap the imported BO and update GPU PTEs; sparse
+      // reservations only record intervals in the calling DRM-file namespace.
       drm_amdgpu_gem_va request_va{};
       std::memcpy(&request_va, arg, std::min<size_t>(_IOC_SIZE(request), sizeof(request_va)));
       auto *va = &request_va;
@@ -4607,6 +4616,9 @@ RJ_INTERPOSER_EXPORT int ioctl(int fd, unsigned long request, ...) {
         return -1;
       }
       const bool publish_timeline = (va->flags & AMDGPU_VM_DELAY_UPDATE) == 0;
+      const bool prt = (va->flags & AMDGPU_VM_PAGE_PRT) != 0;
+      if (prt && (va->flags & ~(AMDGPU_VM_PAGE_PRT | AMDGPU_VM_DELAY_UPDATE)))
+        return kfd_ioctl_ret(-EINVAL);
       int result = 0;
       switch (va->operation) {
       case AMDGPU_VA_OP_MAP:
@@ -4617,13 +4629,13 @@ RJ_INTERPOSER_EXPORT int ioctl(int fd, unsigned long request, ...) {
         result = InterposerContext::ctx.gem_map(
             drm_file, va->handle, va->va_address, va->offset_in_bo, va->map_size,
             /*replace=*/va->operation == AMDGPU_VA_OP_REPLACE, publish_timeline,
-            va->vm_timeline_syncobj_out, va->vm_timeline_point);
+            va->vm_timeline_syncobj_out, va->vm_timeline_point, prt);
         break;
       case AMDGPU_VA_OP_UNMAP:
         // UNMAP requires the supplied handle to own the exact range.
         result = InterposerContext::ctx.gem_unmap(
             drm_file, va->handle, va->va_address, va->map_size, publish_timeline,
-            va->vm_timeline_syncobj_out, va->vm_timeline_point);
+            va->vm_timeline_syncobj_out, va->vm_timeline_point, prt);
         break;
       case AMDGPU_VA_OP_CLEAR:
         // CLEAR is handle-agnostic within the calling DRM-file namespace.

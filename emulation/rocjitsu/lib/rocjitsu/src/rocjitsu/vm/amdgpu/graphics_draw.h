@@ -7,6 +7,7 @@
 #include "rocjitsu/code/rj_code.h"
 #include "rocjitsu/vm/amdgpu/dispatch_entry.h"
 #include "rocjitsu/vm/amdgpu/graphics_stage.h"
+#include "rocjitsu/vm/amdgpu/image_volume.h"
 #include "rocjitsu/vm/amdgpu/pm4.h"
 
 #include <array>
@@ -30,6 +31,7 @@ public:
   bool enable_vertex_batching(const GpuVmAccess &memory, uint32_t limit = 32);
   DispatchEntry vertex_dispatch() const;
   void initialize(Wavefront &wave, uint32_t workgroup, uint32_t wave_index) override;
+  bool allocate_exports(Wavefront &wave, uint32_t vertices, uint32_t primitives) override;
   void export_mask(Wavefront &wave, uint64_t mask) override;
   void export_lane(Wavefront &wave, uint32_t lane, uint32_t target, uint32_t mask,
                    const std::array<uint32_t, 4> &values) override;
@@ -39,6 +41,7 @@ public:
                                        uint32_t threads = 1, bool allow_ram_read_batching = false,
                                        bool allow_early_depth = false);
   bool fragment_stage() const { return fragment_stage_; }
+  uint64_t occlusion_samples() const { return occlusion_samples_; }
   std::shared_ptr<GsRegisters> gs_registers() const override {
     return fragment_stage_ ? nullptr : gs_registers_;
   }
@@ -50,6 +53,10 @@ private:
   uint32_t total_vertices_, first_vertex_ = 0;
   uint32_t instance_count_, instance_ = 0;
   uint32_t primitive_type_;
+  bool count_occlusion_ = false;
+  uint64_t occlusion_samples_ = 0;
+  bool geometry_shader_ = false;
+  uint32_t geometry_vertices_ = 0;
   std::vector<uint32_t> indices_;
   std::array<uint32_t, 0x400> sh_;
   std::array<uint32_t, 0x2000> context_;
@@ -61,6 +68,7 @@ private:
   std::shared_ptr<GsRegisters> gs_registers_;
   struct VertexGroup {
     uint32_t count = 0, first_vertex = 0, instance = 0, attribute_offset = 0;
+    uint32_t output_vertices = 0, output_primitives = 0;
     std::array<std::array<uint32_t, 4>, 64> positions{};
     std::array<uint32_t, 64> position_masks{};
     std::array<uint32_t, 64> layer_viewport{};
@@ -120,6 +128,8 @@ private:
     uint32_t write_mask = 0, blend = 0;
     std::array<uint32_t, 4> component_indices{0, 1, 2, 3};
     std::array<uint32_t, 4> component_widths{};
+    uint32_t selectors = 0xfac, channel_mask = 15;
+    std::optional<ImageVolumeMipLayout> volume;
     bool srgb = false, pipe_aligned = false;
     std::optional<uint64_t> metadata;
   };

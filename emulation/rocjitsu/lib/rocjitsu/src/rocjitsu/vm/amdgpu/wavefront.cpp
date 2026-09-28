@@ -143,6 +143,10 @@ void Wavefront::prepare_gs_register(VectorMemState &state, uint32_t offset, uint
   }
 }
 
+bool Wavefront::allocate_graphics_exports(uint32_t vertices, uint32_t primitives) {
+  return graphics_stage_ && graphics_stage_->allocate_exports(*this, vertices, primitives);
+}
+
 void Wavefront::export_graphics(uint32_t target, uint32_t mask,
                                 const std::array<uint32_t, 4> &sources, bool row) {
   if (status_raw() & (1u << 18))

@@ -19,6 +19,7 @@
 #include "rocjitsu/vm/amdgpu/graphics_draw.h"
 #include "rocjitsu/vm/amdgpu/graphics_stage.h"
 #include "rocjitsu/vm/amdgpu/image_address.h"
+#include "rocjitsu/vm/amdgpu/image_bc.h"
 #include "rocjitsu/vm/amdgpu/image_filter.h"
 #include "rocjitsu/vm/amdgpu/image_metadata.h"
 #include "rocjitsu/vm/amdgpu/l1_vector_cache.h"
@@ -790,7 +791,7 @@ TEST_P(GraphicsExportTest, EarlyDepthStateAndUnknownBackingDeclineBeforeReads) {
     else if (mode == 2)
       state.unsupported_pixel_counter_mode = true;
     else if (mode == 3)
-      state.context_registers[gfx12 ? 0x18 : 1] = 1u << 8;
+      state.context_registers[gfx12 ? 0x18 : 1] = 0x11000106;
     else if (mode == 4)
       state.context_registers[0x2f8] = 1u << 20;
     else if (mode == 5)
@@ -2877,7 +2878,7 @@ TEST_P(GraphicsExportTest, FragmentInitializationKeepsFallbackAndHostState) {
   for (uint32_t wave_size : {32u, 64u}) {
     amdgpu::GraphicsDraw draw(batch_state(wave_size), GetParam(), 3);
     amdgpu::GraphicsDrawTestAccess::seed_fragment_inputs(draw, wave_size);
-    for (uint32_t mask : {0u, 0x7fu, 0xaf7fu}) {
+    for (uint32_t mask : {0u, 0x7fu, 0xef7fu}) {
       amdgpu::GraphicsDrawTestAccess::set_fragment_inputs(draw, mask);
       for (int rounding : {FE_TONEAREST, FE_DOWNWARD, FE_UPWARD, FE_TOWARDZERO}) {
         for (uint32_t flush : {0u, 0x40u, 0x8000u, 0x8040u}) {
@@ -3136,6 +3137,9 @@ TEST_P(GraphicsExportTest, RasterCoverageFragmentInputsAndUnsupportedStates) {
                                                 {0.5f + 3.0f / 2048, 0.5f + 5.0f / 2048, 1, 1},
                                                 {1.5f + 5.0f / 2048, 1.5f + 3.0f / 2048, 1, 1}}}},
       {.name = "flat first provoking vertex", .inputs = 0xaf28, .flat = true},
+      {.name = "single-sample coverage input",
+       .inputs = 0xc000,
+       .fragment_inputs = FragmentInputWitness{0x10001, {1}}},
       {.name = "flat last provoking vertex",
        .polygon_mode = 1u << 19,
        .inputs = 0xaf28,
@@ -3897,7 +3901,8 @@ TEST_P(GraphicsExportTest, PrimitiveRestartResetsStripWindingAndDropsIncompleteS
                              : std::vector<uint32_t>{3, 4, 5, 4, 6, 5, 10, 11, 12, 11, 13, 12};
         amdgpu::GraphicsDraw draw(state, GetParam(), input.size(), input);
         draw.initialize(*wave_, 0, 0);
-        EXPECT_EQ(wave_->debug_read_sgpr(3), expected.size() | ((expected.size() / 3) << 8));
+        EXPECT_EQ(wave_->debug_read_sgpr(3),
+                  expected.size() | ((expected.size() / 3) << 8) | (1u << 28));
         for (uint32_t i = 0; i < expected.size(); ++i)
           EXPECT_EQ(wave_->debug_read_vgpr(gfx12 ? 3 : 5, i), expected[i]);
         for (uint32_t i = 0; i < expected.size() / 3; ++i) {
@@ -3915,6 +3920,39 @@ TEST_P(GraphicsExportTest, PrimitiveRestartResetsStripWindingAndDropsIncompleteS
         }
       }
     }
+}
+
+TEST_P(GraphicsExportTest, GeometryLaunchAndAllocationSeparateInputAndOutputCounts) {
+  const bool gfx12 = GetParam() == ROCJITSU_CODE_ARCH_RDNA4;
+  auto state = batch_state(64);
+  state.uconfig_registers[0x242] = 1; // Point input, triangle output.
+  state.uconfig_registers[0x266] = 2;
+  state.context_registers[gfx12 ? 0x2a6 : 0x2d5] |= 1u << 5;
+  state.context_registers[0x2ce] = 4;        // Four possible outputs per input point.
+  state.context_registers[0x204] = 1u << 22; // No rasterization in this launch test.
+  auto draw = std::make_shared<amdgpu::GraphicsDraw>(state, GetParam(), 17);
+  wave_->set_graphics_stage(draw);
+  for (uint32_t group = 0; group < 2; ++group) {
+    draw->initialize(*wave_, 0, 0);
+    const uint32_t count = group ? 1 : 16;
+    EXPECT_EQ(wave_->debug_read_sgpr(2), (count * 4 << 12) | (count << 22));
+    EXPECT_EQ(wave_->debug_read_sgpr(3), count | (count << 8) | (1u << 28));
+    for (uint32_t lane = 0; lane < count; ++lane) {
+      EXPECT_EQ(wave_->debug_read_vgpr(gfx12 ? 3 : 5, lane), group * 16 + lane);
+      EXPECT_EQ(wave_->debug_read_vgpr(gfx12 ? 1 : 2, lane), group * 16 + lane);
+      EXPECT_EQ(wave_->debug_read_vgpr(0, lane),
+                gfx12 ? lane | (lane << 9) | (lane << 18) : lane | (lane << 16));
+    }
+    // Compaction may produce fewer vertices; amplification may produce more.
+    wave_->set_m0(3 | (1u << 12));
+    ASSERT_TRUE(cu_->handle_sendmsg(*wave_, 9));
+    for (uint32_t lane = 0; lane < 3; ++lane)
+      draw->export_lane(*wave_, lane, 12, 15, {0, 0, 0, 0x3f800000});
+    const uint32_t bits = gfx12 ? 9 : 10;
+    draw->export_lane(*wave_, 0, 20, 1, {(1u << bits) | (2u << (2 * bits)), 0, 0, 0});
+    EXPECT_EQ(draw->advance(*access_).has_value(), group == 0);
+  }
+  EXPECT_FALSE(wave_->instruction_execution_failed());
 }
 
 TEST_P(GraphicsExportTest, MergedVertexUserCountExcludesSystemRingPair) {
@@ -4497,6 +4535,8 @@ TEST_P(GraphicsExportTest, VertexBatchGateRejectsAliasesUnknownRingAndOrderedMod
       break;
     case 11:
       state.context_registers[gfx12 ? 0x2a6 : 0x2d5] |= 1u << 5;
+      state.context_registers[0x2ce] = 3;
+      state.uconfig_registers[0x266] = 2;
       break;
     case 12:
       state.context_registers[gfx12 ? 0x1b : 0x203] |= 1u << 12;
@@ -4572,7 +4612,8 @@ TEST_P(GraphicsExportTest, VertexBatchPreservesIndicesInstancesStripsAndPaddedRi
               EXPECT_EQ(offset, batched ? group * slot_bytes / 512 : 0u);
               EXPECT_LE(offset, 0x7fffu);
               EXPECT_LE((offset << 9) + slot_bytes, 65536u);
-              EXPECT_EQ(wave_->debug_read_sgpr(3) >> 16, 0u); // One wave per workgroup.
+              EXPECT_EQ(wave_->debug_read_sgpr(3) >> 16,
+                        1u << 12); // Wave zero, one wave per workgroup.
               const uint32_t count = wave_->debug_read_sgpr(3) & 255;
               const uint32_t primitives = (wave_->debug_read_sgpr(3) >> 8) & 255;
               actual.push_back(count);
@@ -4866,6 +4907,64 @@ TEST_P(GraphicsExportTest, TriangleAndRectangleListsKeepTrailingVerticesWithoutC
     }
 }
 
+TEST_P(GraphicsExportTest, BcScalarLoadsPreserveFractionalInterpolationAndNormalization) {
+  // Physical GFX1100 and GFX1201 captures. The UNORM witness is one ULP
+  // below exact division by 255; BC4/5 retain the six interpolation bits.
+  struct Case {
+    uint32_t format, texel, expected;
+    std::array<uint8_t, 8> block;
+  };
+  for (const auto &test :
+       {Case{115, 4, 0x3da08080, {0x10, 0x15, 0x94, 0x58, 0x50, 0x36, 0xbb, 0x53}},
+        Case{116, 1, 0xbd614285, {0x61, 0xe8, 0x3e, 0x23, 0xc6, 0x4c, 0xef, 0x42}}}) {
+    amdgpu::VectorMemState d(amdgpu::GLOBAL_MEM);
+    d.wf_size = wave_->wf_size();
+    d.exec_mask = d.lane_mask = 1;
+    d.elem_size = 8;
+    d.buffer_components = 4;
+    d.buffer_selectors = 0x924; // Repeat the only decoded channel.
+    d.decoded_buffer_format = amdgpu::decode_buffer_format(22).value();
+    d.image_bc_format = test.format;
+    d.image_bc_texels[0] = test.texel;
+    d.dst_reg_base = wave_->vgpr_alloc().base + 12;
+    d.response_data.resize(d.wf_size * d.elem_size);
+    std::copy(test.block.begin(), test.block.end(), d.response_data.begin());
+    amdgpu::complete_buffer_format_load(*wave_, *cu_, d);
+    for (uint32_t c = 0; c < 4; ++c)
+      EXPECT_EQ(wave_->debug_read_vgpr(12 + c, 0), test.expected);
+  }
+}
+
+TEST(GraphicsImageFormatTest, BcInterpolationMatchesRdna3AndRdna4) {
+  // FNV-1a hashes of all 16 RGBA8 texels, captured independently on both GPUs.
+  // The blocks cover both endpoint orders and every color/alpha selector.
+  constexpr uint32_t blocks[]{0, 1, 2, 7, 43, 97};
+  constexpr uint64_t expected[3][6]{
+      {0xcf6d088a1193a6f5ull, 0x170408a3b8d6febfull, 0x139152c461f567bbull, 0x6aa6d72d563f2508ull,
+       0xf86cd05783cecc85ull, 0x0cb5fe42e8c4286dull},
+      {0x92fe703a06f93aecull, 0xb28c896239fb69d1ull, 0xeba2629498f349e3ull, 0x8402a6a0f72745b2ull,
+       0xd48442e0e2485278ull, 0xc06db0f813d86760ull},
+      {0xd75eabf12b7d6380ull, 0x1c37f758e16d6147ull, 0x077c2e6c2da77a3bull, 0x17a176ec70a0810eull,
+       0xdeacfb6f1812a7abull, 0xfaa78b6f9b3e3b85ull}};
+  std::array<uint8_t, 98 * 256> input;
+  uint32_t seed = 0xdead1234;
+  for (auto &byte : input) {
+    seed ^= seed << 13;
+    seed ^= seed >> 17;
+    seed ^= seed << 5;
+    byte = seed;
+  }
+  for (uint32_t format = 109; format <= 114; ++format)
+    for (uint32_t i = 0; i < std::size(blocks); ++i) {
+      uint64_t hash = 0xcbf29ce484222325ull;
+      const auto block = std::span(input).subspan(blocks[i] * 256, format <= 110 ? 8 : 16);
+      for (uint32_t texel = 0; texel < 16; ++texel)
+        for (uint8_t value : amdgpu::decode_image_bc(format, texel, block))
+          hash = (hash ^ value) * 0x100000001b3ull;
+      EXPECT_EQ(hash, expected[(format - 109) / 2][i]) << format << ',' << blocks[i];
+    }
+}
+
 TEST(GraphicsImageAddressTest, MatchesGfx12CoordinateBitsAndCrossesTileRows) {
   using amdgpu::gfx12_image_offset;
   EXPECT_EQ(gfx12_image_offset(1, 0, 256, 4, 3), 4);
@@ -4998,14 +5097,27 @@ TEST(GraphicsImageAddressTest, MipAddressesMatchAddrLibAtOddSizesAndTailTransiti
     uint64_t expected;
   };
   constexpr Case cases[] = {
-      {false, 0, 4, 129, 33, 8, 2, 4988},          {true, 0, 4, 129, 33, 8, 2, 4988},
-      {false, 2, 8, 200, 180, 8, 2, 29960},        {true, 1, 8, 200, 180, 8, 2, 29960},
-      {false, 22, 2, 200, 180, 8, 2, 9026},        {true, 2, 2, 200, 180, 8, 2, 11074},
-      {false, 24, 1, 200, 180, 8, 3, 49508},       {false, 28, 2, 512, 512, 10, 3, 208382},
-      {false, 27, 4, 200, 180, 8, 1, 121628},      {true, 3, 4, 200, 180, 8, 1, 124188},
-      {false, 27, 4, 200, 180, 8, 2, 52868},       {true, 3, 4, 200, 180, 8, 2, 47492},
-      {false, 31, 16, 4093, 2049, 12, 4, 1011168}, {true, 4, 16, 4093, 2049, 12, 4, 1048544},
-      {false, 30, 4, 512, 512, 10, 9, 1536},       {true, 4, 4, 512, 512, 10, 9, 1536},
+      {false, 0, 4, 129, 33, 8, 2, 4988},
+      {true, 0, 4, 129, 33, 8, 2, 4988},
+      {false, 2, 8, 200, 180, 8, 2, 29960},
+      {true, 1, 8, 200, 180, 8, 2, 29960},
+      {false, 22, 2, 200, 180, 8, 2, 9026},
+      {true, 2, 2, 200, 180, 8, 2, 11074},
+      {false, 24, 1, 200, 180, 8, 3, 49508},
+      {false, 28, 2, 512, 512, 10, 3, 208382},
+      {false, 27, 4, 200, 180, 8, 1, 121628},
+      {true, 3, 4, 200, 180, 8, 1, 124188},
+      {false, 27, 4, 200, 180, 8, 2, 52868},
+      {true, 3, 4, 200, 180, 8, 2, 47492},
+      {false, 31, 16, 4093, 2049, 12, 4, 1011168},
+      {true, 4, 16, 4093, 2049, 12, 4, 1048544},
+      {false, 30, 4, 512, 512, 10, 9, 1536},
+      {true, 4, 4, 512, 512, 10, 9, 1536},
+      // Uncompressed block views retain the compressed image's mip count.
+      {false, 2, 16, 4, 4, 5, 3, 256},
+      {true, 1, 16, 4, 4, 5, 3, 256},
+      {false, 2, 16, 4, 4, 5, 4, 0},
+      {true, 1, 16, 4, 4, 5, 4, 0},
   };
   for (const auto &c : cases) {
     SCOPED_TRACE(testing::Message() << c.gfx12 << "," << c.swizzle << "," << c.level);
@@ -5019,7 +5131,7 @@ TEST(GraphicsImageAddressTest, MipAddressesMatchAddrLibAtOddSizesAndTailTransiti
   }
   for (bool gfx12 : {false, true}) {
     EXPECT_FALSE(amdgpu::image_mip_layout(gfx12, 0, 4, 64, 64, 0, 0));
-    EXPECT_FALSE(amdgpu::image_mip_layout(gfx12, 0, 4, 64, 64, 8, 0));
+    EXPECT_FALSE(amdgpu::image_mip_layout(gfx12, 0, 4, 64, 64, 18, 0));
     EXPECT_FALSE(amdgpu::image_mip_layout(gfx12, 0, 4, 64, 64, 7, 7));
     EXPECT_FALSE(amdgpu::image_mip_layout(gfx12, 0, 4, 0, 64, 1, 0));
     EXPECT_FALSE(amdgpu::image_mip_layout(gfx12, 0, 4, 65537, 64, 1, 0));
@@ -5066,6 +5178,105 @@ TEST(GraphicsImageAddressTest, ArrayLayersUseMipChainStrideAndSliceXor) {
                                        test.bytes, test.swizzle);
     ASSERT_TRUE(address);
     EXPECT_EQ(*address, test.address);
+  }
+}
+
+TEST(GraphicsImageAddressTest, VolumeMipAddressesMatchAddrLib) {
+  // A deep volume can enter the tail before its Z extent fits one tile.
+  const auto deep = amdgpu::image_volume_mip_layout(true, 5, 1, 8, 8, 1024, 4, 0);
+  ASSERT_TRUE(deep);
+  EXPECT_EQ(amdgpu::image_volume_address(true, 0, *deep, 0, 0, 0, 1, 5), 2048u);
+  // Independent AddrLib addresses for 129x71x37 R32, eight mip levels.
+  const uint64_t offsets[2][3][4] = {
+      {{918604, 18896, 4176, 512}, {1040972, 70096, 34896, 2560}, {1761868, 136656, 34896, 2560}},
+      {{921164, 16848, 4176, 512}, {1044044, 70096, 32848, 2560}, {1764940, 135632, 32848, 2560}}};
+  const uint32_t levels[] = {0, 3, 4, 7};
+  for (bool gfx12 : {false, true})
+    for (uint32_t mode = 0; mode < 3; ++mode)
+      for (uint32_t i = 0; i < 4; ++i) {
+        const uint32_t swizzle = gfx12 ? 5 + mode : 21 + 4 * mode;
+        SCOPED_TRACE(testing::Message()
+                     << "gfx12=" << gfx12 << " swizzle=" << swizzle << " level=" << levels[i]);
+        const auto mip =
+            amdgpu::image_volume_mip_layout(gfx12, swizzle, 4, 129, 71, 37, 8, levels[i]);
+        ASSERT_TRUE(mip);
+        const uint32_t x = 666 % mip->plane.width, y = 414 % mip->plane.height,
+                       z = 234 % mip->depth;
+        EXPECT_EQ(amdgpu::image_volume_address(gfx12, 0, *mip, x, y, z, 4, swizzle),
+                  offsets[gfx12][mode][i]);
+        EXPECT_EQ(amdgpu::image_volume_address(gfx12, 0x100000100ull, *mip, x, y, z, 4, swizzle),
+                  0x100000000ull + (offsets[gfx12][mode][i] ^ 0x100));
+        EXPECT_FALSE(amdgpu::image_volume_address(gfx12, 0, *mip, x, y, mip->depth, 4, swizzle));
+      }
+}
+
+TEST_P(GraphicsExportTest, OcclusionCountsCoveredSamplesAfterShaderDiscard) {
+  const bool gfx12 = GetParam() == ROCJITSU_CODE_ARCH_RDNA4;
+  for (bool enabled : {false, true}) {
+    auto state = batch_state(64);
+    state.context_registers[gfx12 ? 0x18 : 1] = enabled ? 0x11000106 : 0;
+    auto draw = std::make_shared<amdgpu::GraphicsDraw>(state, GetParam(), 3);
+    export_rectangle_vertices(*draw);
+    ASSERT_TRUE(draw->advance(*access_));
+    initialize_fragment(draw);
+    draw->export_mask(*wave_, 0x5555555555555555ull);
+    EXPECT_FALSE(draw->advance(*access_));
+    EXPECT_EQ(draw->occlusion_samples(), enabled ? 8u : 0u);
+  }
+}
+
+TEST_P(GraphicsExportTest, NullImagesReturnZeroWithoutMemoryRequests) {
+  for (uint32_t reg = 4; reg < 16; ++reg)
+    wave_->debug_write_sgpr(reg, 0);
+  for (bool sample : {false, true}) {
+    for (bool d16 : {false, true}) {
+      wave_->set_exec(5);
+      for (uint32_t lane = 0; lane < wave_->wf_size(); ++lane)
+        for (uint32_t reg = 0; reg < 4; ++reg)
+          wave_->debug_write_vgpr(reg, lane, 0xdeadbeef);
+      amdgpu::VectorMemState state(amdgpu::GLOBAL_MEM);
+      state.is_load = true;
+      ASSERT_TRUE(amdgpu::prepare_image_transfer(*wave_, state, 8, 0, {}, 1, 7, d16, false,
+                                                 sample ? 4 : ~0u));
+      EXPECT_EQ(state.lane_mask, 0u);
+      amdgpu::complete_buffer_format_load(*wave_, *cu_, state);
+      for (uint32_t lane : {0u, 2u}) {
+        EXPECT_EQ(wave_->debug_read_vgpr(0, lane), 0u);
+        EXPECT_EQ(wave_->debug_read_vgpr(1, lane), d16 ? 0xdead0000u : 0u);
+        EXPECT_EQ(wave_->debug_read_vgpr(2, lane), d16 ? 0xdeadbeefu : 0u);
+      }
+      EXPECT_EQ(wave_->debug_read_vgpr(0, 1), 0xdeadbeefu);
+      state.is_load = false;
+      ASSERT_TRUE(amdgpu::prepare_image_transfer(*wave_, state, 8, 0, {}, 1, 7, d16, false));
+      EXPECT_EQ(state.lane_mask, 0u);
+    }
+  }
+  for (uint8_t mask : {uint8_t{3}, uint8_t{15}}) {
+    wave_->set_exec(1);
+    for (uint32_t reg = 8; reg < 12; ++reg)
+      wave_->debug_write_vgpr(reg, 0, 0xdeadbeef);
+    std::array<uint32_t, 4> words{};
+    if (GetParam() == ROCJITSU_CODE_ARCH_RDNA4) {
+      const auto encoded = rdna4::build_vimage(
+          11, {.dim = 1, .dmask = mask, .vdata = 8, .rsrc = 8, .th = 1, .vaddr0 = 2, .vaddr1 = 6});
+      std::copy(encoded.begin(), encoded.end(), words.begin());
+    } else {
+      const auto encoded = rdna3::build_mimg(
+          11, {.nsa = 1, .dim = 1, .dmask = mask, .glc = 1, .vaddr = 2, .vdata = 8, .srsrc = 2});
+      std::copy(encoded.begin(), encoded.end(), words.begin());
+      words[2] = 6;
+    }
+    auto decoded = decoder_->decode(words.data());
+    ASSERT_FALSE(decoded.failed());
+    auto instruction = std::move(decoded).value();
+    ASSERT_TRUE(cu_->execute_instruction(instruction.get(), *wave_).succeeded());
+    ASSERT_FALSE(wave_->instruction_execution_failed());
+    EXPECT_EQ(instruction->data_as<amdgpu::VectorMemState>()->lane_mask, 0u);
+    amdgpu::GlobalMemPipeline pipeline(&cu_->l1_vector(), &cache_);
+    pipeline.issue(instruction.release(), *wave_);
+    for (uint32_t reg = 0; reg < 4; ++reg)
+      EXPECT_EQ(wave_->debug_read_vgpr(8 + reg, 0),
+                reg < uint32_t(std::popcount(mask) / 2) ? 0 : 0xdeadbeefu);
   }
 }
 
@@ -5942,113 +6153,168 @@ TEST_P(GraphicsExportTest, ImageStoreMasksFillOmittedChannelsAtBothDataWidths) {
     }
 }
 
-TEST_P(GraphicsExportTest, TiledMipTransfersUseViewBoundsAndIndependentBackingOffsets) {
+TEST_P(GraphicsExportTest, VolumeTransfersUseDepthBoundsAndIgnoreSrvBaseArray) {
   const bool gfx12 = GetParam() == ROCJITSU_CODE_ARCH_RDNA4;
-  constexpr uint32_t base = 0x400000;
-  for (bool compressed : {false, true}) {
-    if (gfx12 && compressed)
-      continue;
-    for (bool explicit_mip : {false, true})
-      for (uint32_t level = 0; level < 8; ++level) {
-        SCOPED_TRACE(testing::Message() << "level=" << level << " explicit=" << explicit_mip);
-        const uint32_t width = std::max(1u, 200u >> level), height = std::max(1u, 180u >> level);
-        std::array<uint32_t, 8> descriptor{base >> 8,
-                                           (46u << (gfx12 ? 17 : 20)) | (3u << 30) |
-                                               (7u << (gfx12 ? 12 : 16)),
-                                           49u | (179u << 14),
-                                           (9u << 28) | ((gfx12 ? 3u : 27u) << 20) | 0xfac,
-                                           0,
+  const std::array<uint32_t, 8> descriptor{0x1000,
+                                           (20u << (gfx12 ? 17 : 20)),
+                                           32 | (70u << 14),
+                                           (10u << 28) | ((gfx12 ? 7u : 29u) << 20) | 0x204,
+                                           (19u << 16) | 36,
                                            0,
                                            0,
                                            0};
-        if (gfx12) {
-          descriptor[1] |= level << 25;
-          descriptor[3] |= 7u << 15;
-        } else {
-          descriptor[3] |= (level << 12) | (7u << 16);
-        }
-        constexpr uint64_t metadata = 0x200000;
-        // AddrLib: 200x180 R_X has three DCC blocks; tail levels after mip 2
-        // cannot use metadata. Seed the first byte of every block independently.
-        if (compressed) {
-          descriptor[6] = (1u << 21) | (1u << 19);
-          descriptor[7] = metadata >> 16;
-        }
-        const uint64_t tag = *amdgpu::gfx11_metadata_address(
-            metadata + (2 - std::min(level, 2u)) * 16384, width - 1, height - 1,
-            (200 + (1u << level) - 1) >> level, (180 + (1u << level) - 1) >> level, 4, 27, false);
-        memory_.write8(tag, 2);
-        for (uint32_t r = 0; r < descriptor.size(); ++r)
-          wave_->debug_write_sgpr(8 + r, descriptor[r]);
-        wave_->set_exec(15);
-        for (uint32_t lane = 0; lane < 4; ++lane) {
-          wave_->debug_write_vgpr(2, lane, lane == 1 ? width : lane == 3 ? ~0u : width - 1);
-          wave_->debug_write_vgpr(3, lane, lane == 2 ? height : height - 1);
-          wave_->debug_write_vgpr(4, lane, level);
-        }
-        const uint32_t address = base + kMipLastTexelOffsets[gfx12][level];
-        memory_.write32(address, 0x44332211);
-        amdgpu::GlobalMemPipeline pipeline(&cu_->l1_vector(), &cache_);
-        for (bool store : {false, true}) {
-          // The load has expanded this block. Exercise a store directly into a
-          // different compressed clear, including the first packed-tail mip.
-          if (store && compressed && level <= 2)
-            memory_.write8(tag, 8);
-          const uint32_t first = explicit_mip ? 0 : level;
-          wave_->debug_write_sgpr(gfx12 ? 9 : 11,
-                                  gfx12 ? (descriptor[1] & ~(31u << 25)) | (first << 25)
-                                        : (descriptor[3] & ~(15u << 12)) | (first << 12));
-          const uint8_t opcode = (store ? 6 : 0) + explicit_mip;
-          std::array<uint32_t, 4> words{};
+  for (uint32_t i = 0; i < descriptor.size(); ++i)
+    wave_->debug_write_sgpr(8 + i, descriptor[i]);
+  wave_->set_exec(3);
+  for (bool a16 : {false, true}) {
+    for (uint32_t lane = 0; lane < 2; ++lane) {
+      wave_->debug_write_vgpr(0, lane, 21 | (a16 ? 59u << 16 : 0));
+      wave_->debug_write_vgpr(1, lane, a16 ? (lane ? 37 : 12) : 59);
+      wave_->debug_write_vgpr(2, lane, lane ? 37 : 12);
+      wave_->debug_write_vgpr(4, lane, 0x12345678);
+    }
+    for (bool load : {false, true}) {
+      amdgpu::VectorMemState data(amdgpu::GLOBAL_MEM);
+      data.is_load = load;
+      ASSERT_TRUE(amdgpu::prepare_image_transfer(*wave_, data, 8, 4, {0, 1, 2}, 2, 1, false, false,
+                                                 ~0u, amdgpu::ImageSampleMode::Implicit, a16));
+      EXPECT_EQ(data.lane_mask, 1u);
+      // 256KB 3D AddrLib address for (21,59,12), without mipmaps.
+      EXPECT_EQ(data.per_lane_addr[0], 0x100000u + (gfx12 ? 192076u : 189004u));
+      if (!load) {
+        ASSERT_GE(data.store_data.size(), 4u);
+        uint32_t value;
+        std::memcpy(&value, data.store_data.data(), 4);
+        EXPECT_EQ(value, 0x12345678u);
+      }
+    }
+  }
+}
+
+TEST_P(GraphicsExportTest, TiledMipTransfersUseViewBoundsAndIndependentBackingOffsets) {
+  const bool gfx12 = GetParam() == ROCJITSU_CODE_ARCH_RDNA4;
+  constexpr uint32_t base = 0x400000;
+  for (bool volume : {false, true})
+    for (bool compressed : {false, true}) {
+      if (gfx12 && compressed)
+        continue;
+      for (bool explicit_mip : {false, true})
+        for (uint32_t level = 0; level < 8; ++level) {
+          SCOPED_TRACE(testing::Message() << "level=" << level << " explicit=" << explicit_mip
+                                          << " volume=" << volume);
+          const uint32_t width = std::max(1u, 200u >> level), height = std::max(1u, 180u >> level);
+          const uint32_t layer = volume && level < 7 ? 1 : 0;
+          const auto pixels =
+              amdgpu::image_mip_layout(gfx12, gfx12 ? 3 : 27, 4, 200, 180, 8, level);
+          ASSERT_TRUE(pixels);
+          std::array<uint32_t, 8> descriptor{
+              base >> 8,
+              (46u << (gfx12 ? 17 : 20)) | (3u << 30) | (7u << (gfx12 ? 12 : 16)),
+              49u | (179u << 14),
+              ((volume ? 10u : 9u) << 28) | ((gfx12 ? 3u : 27u) << 20) | 0xfac,
+              0,
+              0,
+              0,
+              0};
+          if (volume)
+            descriptor[4] = 127;
           if (gfx12) {
-            const auto inst = rdna4::build_vimage(opcode, {.dim = 1,
-                                                           .dmask = 15,
-                                                           .vdata = 8,
-                                                           .rsrc = 8,
-                                                           .vaddr0 = 2,
-                                                           .vaddr1 = 3,
-                                                           .vaddr2 = 4});
-            std::copy(inst.begin(), inst.end(), words.begin());
+            descriptor[1] |= level << 25;
+            descriptor[3] |= 7u << 15;
           } else {
-            const auto inst = rdna3::build_mimg(
-                opcode, {.dim = 1, .dmask = 15, .vaddr = 2, .vdata = 8, .srsrc = 2});
-            std::copy(inst.begin(), inst.end(), words.begin());
+            descriptor[3] |= (level << 12) | (7u << 16);
           }
-          auto decoded = decoder_->decode(words.data());
-          ASSERT_FALSE(decoded.failed());
-          auto instruction = std::move(decoded).value();
-          ASSERT_TRUE(cu_->execute_instruction(instruction.get(), *wave_).succeeded());
-          ASSERT_FALSE(wave_->instruction_execution_failed());
-          ASSERT_NE(instruction->data(), nullptr);
-          const auto *transfer = instruction->data_as<amdgpu::VectorMemState>();
-          EXPECT_EQ(transfer->per_lane_addr[0], address);
-          EXPECT_EQ(transfer->lane_mask, 1u);
-          pipeline.issue(instruction.release(), *wave_);
-          if (!store) {
-            for (uint32_t c = 0; c < 4; ++c) {
-              EXPECT_EQ(wave_->debug_read_vgpr(8 + c, 0),
-                        compressed && level <= 2 ? 255u : 0x11u * (c + 1));
-              for (uint32_t lane = 1; lane < 4; ++lane)
-                EXPECT_EQ(wave_->debug_read_vgpr(8 + c, lane), 0u);
-              wave_->debug_write_vgpr(8 + c, 0, 0x80u + c);
+          constexpr uint64_t metadata = 0x200000;
+          // AddrLib: 200x180 R_X has three DCC blocks; tail levels after mip 2
+          // cannot use metadata. Seed the first byte of every block independently.
+          if (compressed) {
+            descriptor[6] = (1u << 21) | (1u << 19);
+            descriptor[7] = metadata >> 16;
+          }
+          const uint64_t tag = *amdgpu::gfx11_metadata_address(
+              (metadata + (2 - std::min(level, 2u)) * 16384 + layer * 49152) ^
+                  (amdgpu::gfx11_image_slice_xor(layer, 4, 27) & 16383),
+              width - 1, height - 1, (200 + (1u << level) - 1) >> level,
+              (180 + (1u << level) - 1) >> level, 4, 27, false);
+          memory_.write8(tag, 2);
+          for (uint32_t r = 0; r < descriptor.size(); ++r)
+            wave_->debug_write_sgpr(8 + r, descriptor[r]);
+          wave_->set_exec(15);
+          for (uint32_t lane = 0; lane < 4; ++lane) {
+            wave_->debug_write_vgpr(2, lane, lane == 1 ? width : lane == 3 ? ~0u : width - 1);
+            wave_->debug_write_vgpr(3, lane, lane == 2 ? height : height - 1);
+            wave_->debug_write_vgpr(4, lane, volume ? layer : level);
+            wave_->debug_write_vgpr(5, lane, level);
+          }
+          const uint64_t address =
+              (base + kMipLastTexelOffsets[gfx12][level] + layer * pixels->slice_size) ^
+              (gfx12 ? 0 : amdgpu::gfx11_image_slice_xor(layer, 4, 27));
+          memory_.write32(address, 0x44332211);
+          amdgpu::GlobalMemPipeline pipeline(&cu_->l1_vector(), &cache_);
+          for (bool store : {false, true}) {
+            // The load has expanded this block. Exercise a store directly into a
+            // different compressed clear, including the first packed-tail mip.
+            if (store && compressed && level <= 2)
+              memory_.write8(tag, 8);
+            const uint32_t first = explicit_mip ? 0 : level;
+            wave_->debug_write_sgpr(gfx12 ? 9 : 11,
+                                    gfx12 ? (descriptor[1] & ~(31u << 25)) | (first << 25)
+                                          : (descriptor[3] & ~(15u << 12)) | (first << 12));
+            const uint8_t opcode = (store ? 6 : 0) + explicit_mip;
+            std::array<uint32_t, 4> words{};
+            if (gfx12) {
+              const auto inst = rdna4::build_vimage(opcode, {.dim = uint8_t(volume ? 2 : 1),
+                                                             .dmask = 15,
+                                                             .vdata = 8,
+                                                             .rsrc = 8,
+                                                             .vaddr0 = 2,
+                                                             .vaddr1 = 3,
+                                                             .vaddr2 = 4,
+                                                             .vaddr3 = 5});
+              std::copy(inst.begin(), inst.end(), words.begin());
+            } else {
+              const auto inst = rdna3::build_mimg(opcode, {.dim = uint8_t(volume ? 2 : 1),
+                                                           .dmask = 15,
+                                                           .vaddr = 2,
+                                                           .vdata = 8,
+                                                           .srsrc = 2});
+              std::copy(inst.begin(), inst.end(), words.begin());
+            }
+            auto decoded = decoder_->decode(words.data());
+            ASSERT_FALSE(decoded.failed());
+            auto instruction = std::move(decoded).value();
+            ASSERT_TRUE(cu_->execute_instruction(instruction.get(), *wave_).succeeded());
+            ASSERT_FALSE(wave_->instruction_execution_failed());
+            ASSERT_NE(instruction->data(), nullptr);
+            const auto *transfer = instruction->data_as<amdgpu::VectorMemState>();
+            EXPECT_EQ(transfer->per_lane_addr[0], address);
+            EXPECT_EQ(transfer->lane_mask, 1u);
+            pipeline.issue(instruction.release(), *wave_);
+            if (!store) {
+              for (uint32_t c = 0; c < 4; ++c) {
+                EXPECT_EQ(wave_->debug_read_vgpr(8 + c, 0),
+                          compressed && level <= 2 ? 255u : 0x11u * (c + 1));
+                for (uint32_t lane = 1; lane < 4; ++lane)
+                  EXPECT_EQ(wave_->debug_read_vgpr(8 + c, lane), 0u);
+                wave_->debug_write_vgpr(8 + c, 0, 0x80u + c);
+              }
             }
           }
+          cu_->l1_vector().flush_all();
+          cache_.flush_all();
+          EXPECT_EQ(memory_.read32(address), 0x83828180u);
+          if (compressed && level <= 2) {
+            const auto mip = amdgpu::image_mip_layout(false, 27, 4, 200, 180, 8, level);
+            ASSERT_TRUE(mip);
+            const auto neighbor = amdgpu::gfx11_image_address(
+                amdgpu::image_layer_base(false, base + mip->offset, mip->slice_size, layer, 4, 27),
+                width - 2 + mip->tail_x, height - 1 + mip->tail_y, mip->pitch, 4, 27);
+            ASSERT_TRUE(neighbor);
+            EXPECT_EQ(memory_.read32(*neighbor), 0xff000000u);
+          }
+          EXPECT_EQ(memory_.read8(tag), compressed && level <= 2 ? 255 : 2);
         }
-        cu_->l1_vector().flush_all();
-        cache_.flush_all();
-        EXPECT_EQ(memory_.read32(address), 0x83828180u);
-        if (compressed && level <= 2) {
-          const auto mip = amdgpu::image_mip_layout(false, 27, 4, 200, 180, 8, level);
-          ASSERT_TRUE(mip);
-          const auto neighbor =
-              amdgpu::gfx11_image_address(base + mip->offset, width - 2 + mip->tail_x,
-                                          height - 1 + mip->tail_y, mip->pitch, 4, 27);
-          ASSERT_TRUE(neighbor);
-          EXPECT_EQ(memory_.read32(*neighbor), 0xff000000u);
-        }
-        EXPECT_EQ(memory_.read8(tag), compressed && level <= 2 ? 255 : 2);
-      }
-  }
+    }
 }
 
 TEST_P(GraphicsExportTest, NormalizedBlendingUsesHardwarePrecisionAndQuadBypass) {
@@ -6503,6 +6769,29 @@ TEST_P(GraphicsExportTest, ColorAttachmentsWriteFullTexelsAndPreserveMaskedChann
     std::array<uint32_t, 4> constant_bits{0xbf400000, 0x3e99999a, 0x3fa00000, 0x3f266666};
   };
   const Case cases[] = {
+      {.data_format = 2,
+       .export_format = 4,
+       .bytes = 2,
+       .components = 1,
+       .mask = 1,
+       .exported = {0x38003400, 0x3c003a00},
+       .expected = {0x3400}},
+      {.data_format = 5,
+       .export_format = 4,
+       .bytes = 4,
+       .components = 2,
+       .mask = 1,
+       .exported = {0x38003400, 0x3c003a00},
+       .expected = {0x38003400}},
+      {.data_format = 4,
+       .export_format = 3,
+       .bytes = 4,
+       .components = 1,
+       .mask = 3,
+       .exported = {0x3f000000, 0x3e800000},
+       .expected = {0x3f600000},
+       .blend = 0x61000504u,
+       .initial = {0x3f800000}},
       {.data_format = 9,
        .number_format = 0,
        .export_format = 4,
@@ -7145,55 +7434,72 @@ TEST_P(GraphicsExportTest, MultipleAttachmentViewsClipLayersIndependently) {
 TEST_P(GraphicsExportTest, ColorAttachmentWritesSelectedMipAndPreservesOtherLevels) {
   const bool gfx12 = GetParam() == ROCJITSU_CODE_ARCH_RDNA4;
   constexpr uint32_t base = 0x400000;
-  for (bool compressed : {false, true}) {
-    if (gfx12 && compressed)
-      continue;
-    for (uint32_t level = 0; level < 8; ++level) {
-      SCOPED_TRACE(level);
-      const uint32_t width = std::max(1u, 200u >> level), height = std::max(1u, 180u >> level);
-      for (uint32_t offset : kMipLastTexelOffsets[gfx12])
-        memory_.write32(base + offset, 0x12345678);
-      auto state = rectangle_state();
-      auto &context = state.context_registers;
-      context[gfx12 ? 0x3b0 : 0x31c] = 10;
-      context[gfx12 ? 0x31e : 0x3b0] = gfx12 ? 179 | (199 << 16) : 179 | (199 << 14) | (7u << 28);
-      context[gfx12 ? 0x31f : 0x3b8] = gfx12 ? (3u << 15) | (7u << 19) : 27u << 14;
-      context[gfx12 ? 0x31a : 0x31b] = gfx12 ? level : level << 26;
-      context[0x318] = base >> 8;
-      context[gfx12 ? 0x214 : 0x8e] = 15;
-      context[gfx12 ? 0x215 : 0x8f] = 15;
-      context[gfx12 ? 0x195 : 0x1c5] = 4;
-      context[gfx12 ? 0x216 : 0x202] = 0xcc0010;
-      context[0x10f] = context[0x110] = std::bit_cast<uint32_t>(width / 2.0f);
-      context[0x111] = context[0x112] = std::bit_cast<uint32_t>(height / 2.0f);
-      context[0x113] = context[gfx12 ? 0x116 : 0xb5] = std::bit_cast<uint32_t>(1.0f);
-      context[0x90] = (width - 1) | ((height - 1) << 16);
-      context[0x91] = (width - gfx12) | ((height - gfx12) << 16);
+  const auto address = [&](uint32_t level, uint32_t slice) {
+    const auto mip = amdgpu::image_mip_layout(gfx12, gfx12 ? 3 : 27, 4, 200, 180, 8, level);
+    return (base + kMipLastTexelOffsets[gfx12][level] + slice * mip->slice_size) ^
+           (gfx12 ? 0 : amdgpu::gfx11_image_slice_xor(slice, 4, 27));
+  };
+  for (bool volume : {false, true})
+    for (bool compressed : {false, true}) {
+      if (gfx12 && compressed)
+        continue;
+      for (uint32_t level = 0; level < 8; ++level) {
+        SCOPED_TRACE(testing::Message() << "level=" << level << " volume=" << volume);
+        const uint32_t slice = volume && level < 7 ? 1 : 0;
+        const uint32_t width = std::max(1u, 200u >> level), height = std::max(1u, 180u >> level);
+        for (uint32_t mip = 0; mip < 8; ++mip)
+          for (uint32_t z = 0; z <= (volume && mip < 7 ? 1u : 0u); ++z)
+            memory_.write32(address(mip, z), 0x12345678);
+        auto state = rectangle_state();
+        auto &context = state.context_registers;
+        context[gfx12 ? 0x3b0 : 0x31c] = 10;
+        context[gfx12 ? 0x31e : 0x3b0] = gfx12 ? 179 | (199 << 16) : 179 | (199 << 14) | (7u << 28);
+        context[gfx12 ? 0x31f : 0x3b8] = gfx12 ? (3u << 15) | (7u << 19) : 27u << 14;
+        context[gfx12 ? 0x31a : 0x31b] = gfx12 ? level : level << 26;
+        if (volume) {
+          context[gfx12 ? 0x31f : 0x3b8] |= (2u << 24) | 127;
+          context[gfx12 ? 0x319 : 0x31b] |= slice | (slice << (gfx12 ? 14 : 13));
+        }
+        context[0x318] = base >> 8;
+        context[gfx12 ? 0x214 : 0x8e] = 15;
+        context[gfx12 ? 0x215 : 0x8f] = 15;
+        context[gfx12 ? 0x195 : 0x1c5] = 4;
+        context[gfx12 ? 0x216 : 0x202] = 0xcc0010;
+        context[0x10f] = context[0x110] = std::bit_cast<uint32_t>(width / 2.0f);
+        context[0x111] = context[0x112] = std::bit_cast<uint32_t>(height / 2.0f);
+        context[0x113] = context[gfx12 ? 0x116 : 0xb5] = std::bit_cast<uint32_t>(1.0f);
+        context[0x90] = (width - 1) | ((height - 1) << 16);
+        context[0x91] = (width - gfx12) | ((height - gfx12) << 16);
 
-      constexpr uint64_t metadata = 0x200000;
-      if (compressed) {
-        context[0x31e] |= 1u << 22;
-        context[0x3b8] |= 1u << 30;
-        context[0x325] = metadata >> 8;
-        for (uint32_t i = 0; i < 49152; ++i)
-          memory_.write8(metadata + i, 0);
+        constexpr uint64_t metadata = 0x200000;
+        if (compressed) {
+          context[0x31e] |= 1u << 22;
+          context[0x3b8] |= 1u << 30;
+          context[0x325] = metadata >> 8;
+          for (uint32_t i = 0; i < (volume ? 98304u : 49152u); ++i)
+            memory_.write8(metadata + i, 0);
+        }
+        auto draw = std::make_shared<amdgpu::GraphicsDraw>(state, GetParam(), 3);
+        export_rectangle_vertices(*draw);
+        ASSERT_TRUE(draw->advance(*access_));
+        initialize_fragment(draw);
+        for (uint32_t lane = 0; lane < wave_->wf_size(); ++lane)
+          draw->export_lane(*wave_, lane, 0, 3, {0x00003c00, 0x3c000000, 0, 0});
+        EXPECT_FALSE(draw->advance(*access_));
+        if (compressed) {
+          for (uint32_t mip = 0; mip < 3; ++mip)
+            for (uint32_t z = 0; z <= uint32_t(volume); ++z) {
+              const uint64_t key = (metadata + (2 - mip) * 16384 + z * 49152) ^
+                                   (amdgpu::gfx11_image_slice_xor(z, 4, 27) & 16383);
+              EXPECT_EQ(memory_.read8(key), mip == level && z == slice ? 255 : 0);
+            }
+        }
+        for (uint32_t mip = 0; mip < 8; ++mip)
+          for (uint32_t z = 0; z <= (volume && mip < 7 ? 1u : 0u); ++z)
+            EXPECT_EQ(memory_.read32(address(mip, z)),
+                      mip == level && z == slice ? 0xff0000ffu : 0x12345678u);
       }
-      auto draw = std::make_shared<amdgpu::GraphicsDraw>(state, GetParam(), 3);
-      export_rectangle_vertices(*draw);
-      ASSERT_TRUE(draw->advance(*access_));
-      initialize_fragment(draw);
-      for (uint32_t lane = 0; lane < wave_->wf_size(); ++lane)
-        draw->export_lane(*wave_, lane, 0, 3, {0x00003c00, 0x3c000000, 0, 0});
-      EXPECT_FALSE(draw->advance(*access_));
-      if (compressed) {
-        for (uint32_t mip = 0; mip < 3; ++mip)
-          EXPECT_EQ(memory_.read8(metadata + (2 - mip) * 16384), mip == level ? 255 : 0);
-      }
-      for (uint32_t mip = 0; mip < 8; ++mip)
-        EXPECT_EQ(memory_.read32(base + kMipLastTexelOffsets[gfx12][mip]),
-                  mip == level ? 0xff0000ffu : 0x12345678u);
     }
-  }
 }
 
 TEST_P(GraphicsExportTest, HardwareSampleClampsCoordinatesAndConvertsSrgb) {
@@ -7266,7 +7572,14 @@ TEST_P(GraphicsExportTest, HardwareSampleFiltersAndAddressesUnorm8) {
   };
   // Filtering results were captured with the same 2x2 texture on physical
   // gfx1100 and gfx1201. Compare raw floats, including the fractional precision.
+  const float nan = std::numeric_limits<float>::quiet_NaN();
+  const float infinity = std::numeric_limits<float>::infinity();
   const Case cases[] = {
+      {"NaN address", 2, true, false, 0, nan, 0.25f, first},
+      {"positive infinite clamp", 2, true, false, 0, infinity, 0.25f, second},
+      {"negative infinite clamp", 2, true, false, 0, -infinity, 0.25f, first},
+      {"infinite repeat", 0, false, false, 0, infinity, 0.25f, first},
+      {"infinite border", 6, false, false, 0, infinity, 0.25f, {0, 0, 0, 0}},
       {"center", 2, true, false, 0, 0.5f, 0.5f, {0x3f000000, 0x3ee16161, 0x3f0a0a0a, 0x3f206060}},
       {"fractional",
        2,
@@ -7913,7 +8226,18 @@ TEST_P(GraphicsExportTest, SampleLodUsesMipViewsDerivativesAndBias) {
   // Physical GFX11/12 mip weights, including a norm carry into the logarithm.
   const std::array rotated_gradient{0x1.f6cp-3f, -0x1.1ap-3f, -0x1.d48p-3f, 0x1.338p-4f};
   const std::array orthogonal_gradient{0.125f, 0.00250244140625f, -0.00250244140625f, 0.125f};
+  const float nan = std::numeric_limits<float>::quiet_NaN();
+  const float infinity = std::numeric_limits<float>::infinity();
   const Case cases[] = {
+      {.name = "NaN LOD before sampler bias",
+       .opcode = 29,
+       .mip_filter = 1,
+       .lod = nan,
+       .expected = {1, 0, 0, 1},
+       .sampler_bias = 0.5f},
+      {"positive infinite LOD", 29, 1, 0, infinity, 0, 3, 0, {0, 0, 1, 1}},
+      {"negative infinite LOD", 29, 1, 0, -infinity, 0, 3, 0, {0, 0, 0, 1}},
+      {"NaN quad derivatives", 27, 1, 0, 0, 0, 3, nan, {0, 0, 0, 1}},
       {"explicit nearest", 29, 1, 0, 1.25f, 0, 3, 0, {1, 0, 0, 1}},
       {"explicit rounded up", 29, 1, 0, 1.75f, 0, 3, 0, {0, 1, 0, 1}},
       {"below nearest threshold", 29, 1, 0, 0.498046875f - 1.0f / 8192, 0, 3, 0, {0, 0, 0, 1}},

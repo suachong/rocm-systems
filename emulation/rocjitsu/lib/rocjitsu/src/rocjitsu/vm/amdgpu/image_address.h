@@ -289,7 +289,7 @@ inline std::optional<ImageMipLayout> image_mip_layout(bool gfx12, uint32_t swizz
                                                       uint32_t width, uint32_t height,
                                                       uint32_t levels, uint32_t level) {
   if (!width || !height || width > 65536 || height > 65536 || !levels || level >= levels ||
-      levels > uint32_t(std::bit_width(std::max(width, height))) ||
+      levels > 17 ||
       !(gfx12 ? gfx12_image_offset(0, 0, width, bytes, swizzle)
               : gfx11_image_offset(0, 0, width, bytes, swizzle)))
     return std::nullopt;
@@ -300,7 +300,9 @@ inline std::optional<ImageMipLayout> image_mip_layout(bool gfx12, uint32_t swizz
   const auto align = [](uint32_t value, uint32_t alignment) {
     return (value + alignment - 1) & ~(alignment - 1);
   };
-  // Storage extents round up at odd sizes; accessible texel extents round down.
+  // A block-compressed image viewed as uncompressed blocks can retain levels
+  // beyond the block dimensions' full mip chain. Those levels still occupy
+  // one block. Storage extents round up; accessible extents round down.
   const auto allocation_extent = [](uint32_t value, uint32_t mip) {
     return (value + (1u << mip) - 1) >> mip;
   };

@@ -290,6 +290,7 @@ public:
   void set_graphics_stage(std::shared_ptr<GraphicsStage> stage) {
     graphics_stage_ = std::move(stage);
   }
+  bool allocate_graphics_exports(uint32_t vertices, uint32_t primitives);
   void export_graphics(uint32_t target, uint32_t mask, const std::array<uint32_t, 4> &sources,
                        bool row);
   void prepare_gs_register(VectorMemState &state, uint32_t offset, uint32_t source,

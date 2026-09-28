@@ -10,6 +10,7 @@
 #include "rocjitsu/vm/amdgpu/image_address.h"
 #include "rocjitsu/vm/amdgpu/image_cube.h"
 #include "rocjitsu/vm/amdgpu/image_filter.h"
+#include "rocjitsu/vm/amdgpu/image_volume.h"
 #include "rocjitsu/vm/amdgpu/mem_state.h"
 #include "rocjitsu/vm/amdgpu/register_access.h"
 #include "rocjitsu/vm/amdgpu/wavefront.h"
@@ -21,6 +22,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <memory>
 #include <optional>
 
@@ -71,8 +73,7 @@ inline bool prepare_image_transfer(Wavefront &wf, VectorMemState &d, uint32_t re
   const bool packed_signed = transfer_mode == ImageTransferMode::PackedSigned ||
                              transfer_mode == ImageTransferMode::MipPackedSigned;
   if ((!gfx12 && arch != ROCJITSU_CODE_ARCH_RDNA3 && arch != ROCJITSU_CODE_ARCH_RDNA3_5) ||
-      unsupported_flags || (packed && d16) ||
-      (dim != 0 && dim != 1 && dim != 3 && dim != 4 && dim != 5) || !mask || (mask & ~15u) ||
+      unsupported_flags || (packed && d16) || dim > 5 || !mask || (mask & ~15u) ||
       (query && (d16 || (mask & ~3u))) || (modifiers.gather && std::popcount(mask) != 1))
     return unsupported();
   std::array<uint32_t, 8> r{};
@@ -81,20 +82,52 @@ inline bool prepare_image_transfer(Wavefront &wf, VectorMemState &d, uint32_t re
       return false;
   for (uint32_t i = 0; i < r.size(); ++i)
     r[i] = read_scalar_selector(wf, resource + i);
+  // An all-zero descriptor is an unbound image. GFX11/12 return zero
+  // without fetching coordinates, sampler state, or image memory.
+  if (std::ranges::all_of(r, [](uint32_t value) { return value == 0; })) {
+    // Compare-swap consumes replacement and comparison words but returns only
+    // the previous texel. Preserve the comparison registers even for null images.
+    d.buffer_components =
+        modifiers.gather ? 4 : std::popcount(mask) / (d.atomic_op == AtomicOp::CMPSWAP ? 2 : 1);
+    d.buffer_d16 = d16;
+    d.wf_size = wf.wf_size();
+    d.exec_mask = wf.exec();
+    d.lane_mask = 0;
+    d.elem_size = d.num_elems = 1;
+    d.dst_reg_base = wf.vgpr_alloc().base + data;
+    const uint32_t registers = d16 ? (d.buffer_components + 1) / 2 : d.buffer_components;
+    if (data >= wf.num_vgprs() || registers > wf.num_vgprs() - data)
+      return unsupported();
+    return true;
+  }
   const uint32_t type = r[3] >> 28;
   const bool is_array = type == 11 || type == 12 || type == 13;
+  const bool volume = type == 10;
+
+  if ((dim == 2) != volume || (volume && (sampler != ~0u || (r[5] & 16))))
+    return unsupported();
   const uint32_t swizzle = (r[3] >> 20) & 31;
   uint32_t width = ((r[1] >> 30) | ((r[2] & (gfx12 ? 0x3fff : 0xfff)) << 2)) + 1;
   uint32_t height = ((r[2] >> 14) & (gfx12 ? 0xffff : 0x3fff)) + 1;
   const uint32_t image_format = (r[1] >> (gfx12 ? 17 : 20)) & 255;
-  const uint32_t format = image_format == 66 ? 42 : image_format;
-  d.image_srgb = image_format == 66 && !packed;
+  const bool bc = image_format >= 109 && image_format <= 118;
+  const uint32_t format = image_format >= 115 && image_format <= 118
+                              ? (image_format <= 116 ? 22 : 50)
+                          : image_format == 66 || bc ? 42
+                                                     : image_format;
+  d.image_srgb =
+      (image_format == 66 || (bc && image_format <= 114 && !(image_format & 1))) && !packed;
+  d.image_bc_format = bc ? image_format : 0;
+  if (bc && (!d.is_load || atomic || packed || volume))
+    return unsupported();
   const bool compressed = !gfx12 && (r[6] & (1u << 21));
   const auto decoded = decode_buffer_format(format);
   if (decoded.failed())
     return unsupported();
   d.decoded_buffer_format = decoded.value();
-  const uint32_t bytes = d.decoded_buffer_format.byte_size();
+  const uint32_t bytes =
+      bc ? (image_format <= 110 || image_format == 115 || image_format == 116 ? 8 : 16)
+         : d.decoded_buffer_format.byte_size();
   if (packed) {
     // PCK ignores format conversion and descriptor channel selectors. DMASK
     // selects raw DWORDs; a sub-DWORD texel occupies one extended word.
@@ -118,28 +151,45 @@ inline bool prepare_image_transfer(Wavefront &wf, VectorMemState &d, uint32_t re
       ((r[5] >> (gfx12 ? 26 : 27)) | ((r[6] & 127) << (gfx12 ? 6 : 5))) / 256.0;
   const bool sample = sampler != ~0u;
   const bool one_dimensional = dim == 0 || dim == 4;
-  const uint32_t spatial_components = one_dimensional ? 1 : 2;
+  const uint32_t spatial_components = one_dimensional ? 1 : volume ? 3 : 2;
   const bool layer_coordinate = dim == 3 || dim == 4 || dim == 5;
   d.image_sampling = sample;
   const uint32_t first_layer = (r[4] >> 16) & (gfx12 ? 0x3fff : 0x1fff);
   const uint32_t last_layer = is_array ? r[4] & (gfx12 ? 0x3fff : 0x1fff) : 0;
-  if ((type != 8 && type != 9 && !is_array) || (dim == 0 && type != 8 && type != 12) ||
+  if ((type != 8 && type != 9 && !is_array && !volume) || (dim == 0 && type != 8 && type != 12) ||
       ((type == 8 || type == 12) && (height != 1 || (!query && swizzle))) ||
       (dim == 4 && type != 8 && type != 12) || (type == 12 && dim != 0 && dim != 4) ||
-      (!is_array && (r[4] >> 16)) || (!query && !bytes) ||
+      (!is_array && !volume && (r[4] >> 16)) || (!query && !bytes) ||
       (is_array && (first_layer > last_layer || (r[4] & (gfx12 ? 0xc000c000u : 0xe000e000u)))) ||
       first_level > last_level || last_level > max_level ||
-      (!query && max_level && !is_array && r[4]) || (!d.is_load && d.image_srgb && !atomic))
+      (!query && max_level && !is_array && !volume && r[4]) ||
+      (!d.is_load && d.image_srgb && !atomic))
     return unsupported();
   if (dim == 3 && (type != 11 || width != height || first_layer % 6 || last_layer < first_layer ||
                    last_layer - first_layer < 5))
     return unsupported();
   const uint32_t resource_width = width, resource_height = height;
+  const auto make_mip_layout = [&](uint32_t level) {
+    auto layout =
+        image_mip_layout(gfx12, swizzle, bytes, bc ? (resource_width + 3) / 4 : resource_width,
+                         bc ? (resource_height + 3) / 4 : resource_height, max_level + 1, level);
+    if (layout && bc) {
+      layout->width = std::max(1u, resource_width >> level);
+      layout->height = std::max(1u, resource_height >> level);
+    }
+    return layout;
+  };
+  const uint32_t resource_depth = volume ? (r[4] & (gfx12 ? 0x3fff : 0x1fff)) + 1 : 1;
+  const auto volume_mip = volume
+                              ? image_volume_mip_layout(gfx12, swizzle, bytes, width, height,
+                                                        resource_depth, max_level + 1, first_level)
+                              : std::optional<ImageVolumeMipLayout>{};
   // Queries use descriptor extents without requiring a supported memory layout.
   const auto mip =
-      query ? std::optional<ImageMipLayout>{{.width = std::max(1u, width >> first_level),
-                                             .height = std::max(1u, height >> first_level)}}
-            : image_mip_layout(gfx12, swizzle, bytes, width, height, max_level + 1, first_level);
+      query    ? std::optional<ImageMipLayout>{{.width = std::max(1u, width >> first_level),
+                                                .height = std::max(1u, height >> first_level)}}
+      : volume ? (volume_mip ? std::optional{volume_mip->plane} : std::nullopt)
+               : make_mip_layout(first_level);
   if (!mip)
     return unsupported();
   // Every lane and filter tap shares the descriptor's mip layouts. Compute
@@ -149,8 +199,7 @@ inline bool prepare_image_transfer(Wavefront &wf, VectorMemState &d, uint32_t re
   const auto get_mip_layout = [&](uint32_t level) -> const std::optional<ImageMipLayout> & {
     auto &layout = mip_layouts[level];
     if (!layout)
-      layout = image_mip_layout(gfx12, swizzle, bytes, resource_width, resource_height,
-                                max_level + 1, level);
+      layout = make_mip_layout(level);
     return layout;
   };
   width = mip->width;
@@ -317,7 +366,7 @@ inline bool prepare_image_transfer(Wavefront &wf, VectorMemState &d, uint32_t re
   const uint32_t pitch = type == 9 && swizzle == 0 && pitch_field ? pitch_field + 1 : mip->pitch;
   if (compressed && !query) {
     const bool depth = swizzle == 24 || swizzle == 28;
-    if ((type != 9 && type != 13) || (depth && (type == 13 || max_level)) ||
+    if ((type != 9 && type != 10 && type != 13) || (depth && (type != 9 || max_level)) ||
         (depth ? (bytes != 1 && bytes != 2 && bytes != 4) : (swizzle != 27 && swizzle != 31)))
       return unsupported();
     d.image_metadata = std::make_unique<ImageMetadataAccess>();
@@ -371,8 +420,6 @@ inline bool prepare_image_transfer(Wavefront &wf, VectorMemState &d, uint32_t re
       };
       double u = read(coordinate_offset, lane),
              v = one_dimensional ? 0.5 : read(coordinate_offset + 1, lane);
-      if (!std::isfinite(u) || !std::isfinite(v))
-        return unsupported();
       uint32_t layer = first_layer, face = 0, cube_base = first_layer;
       const auto cube_token = [&](double selected) -> std::optional<int32_t> {
         if (!std::isfinite(selected) || selected < INT32_MIN || selected > INT32_MAX)
@@ -406,9 +453,8 @@ inline bool prepare_image_transfer(Wavefront &wf, VectorMemState &d, uint32_t re
       uint32_t filter_count = 1;
       double sample_step_u = 0, sample_step_v = 0;
       if (sample_mode == ImageSampleMode::Explicit) {
-        lod = round_sample_fixed8(
-                  read(coordinate_offset + spatial_components + layer_coordinate, lane)) +
-              lod_bias;
+        const double input = read(coordinate_offset + spatial_components + layer_coordinate, lane);
+        lod = round_sample_fixed8(std::isnan(input) ? 0 : input) + lod_bias;
       } else if (sample_mode == ImageSampleMode::Zero) {
         lod = lod_bias;
       } else if (query || max_level || min_filter != mag_filter || (min_filter & 2) ||
@@ -443,10 +489,15 @@ inline bool prepare_image_transfer(Wavefront &wf, VectorMemState &d, uint32_t re
           const auto unfolded = [&](uint32_t source_lane) -> std::optional<std::array<double, 2>> {
             const double su = read(coordinate_offset, source_lane);
             const double sv = one_dimensional ? 0.5 : read(coordinate_offset + 1, source_lane);
+            const auto saturate_infinity = [](double value) {
+              return std::isinf(value)
+                         ? std::copysign(double(std::numeric_limits<float>::max()), value)
+                         : value;
+            };
+            if (dim != 3)
+              return std::array{saturate_infinity(su), saturate_infinity(sv)};
             if (!std::isfinite(su) || !std::isfinite(sv))
               return std::nullopt;
-            if (dim != 3)
-              return std::array{su, sv};
             const auto sf = cube_token(read(coordinate_offset + 2, source_lane));
             if (!sf)
               return std::nullopt;
@@ -490,9 +541,19 @@ inline bool prepare_image_transfer(Wavefront &wf, VectorMemState &d, uint32_t re
           dyu = difference((*bl)[0], (*tl)[0], 2);
           dyv = difference((*bl)[1], (*tl)[1], 3);
         }
-        if (!std::isfinite(dxu) || !std::isfinite(dxv) || !std::isfinite(dyu) ||
-            !std::isfinite(dyv))
-          return unsupported();
+        // GFX11/12 discard NaN derivatives and saturate infinite gradients.
+        // Preserve NaNs until after quad subtraction: replacing a coordinate
+        // with zero first would produce a spurious footprint.
+        const auto finite_gradient = [](double value) {
+          return std::isnan(value) ? 0.0
+                 : std::isinf(value)
+                     ? std::copysign(double(std::numeric_limits<float>::max()), value)
+                     : value;
+        };
+        dxu = finite_gradient(dxu);
+        dxv = finite_gradient(dxv);
+        dyu = finite_gradient(dyu);
+        dyv = finite_gradient(dyv);
         const auto footprint_axes = image_footprint(dxu, dxv, dyu, dyv, normalized ? width : 1,
                                                     normalized ? height : 1, gradient_rounding);
         const auto [major_lod, minor_lod] = footprint_axes.lods;
@@ -524,8 +585,8 @@ inline bool prepare_image_transfer(Wavefront &wf, VectorMemState &d, uint32_t re
           filter_count = 1;
         }
       }
-      if (!std::isfinite(lod))
-        return unsupported();
+      if (std::isnan(lod))
+        lod = 0;
       if (modifiers.lod_clamp) {
         const double minimum =
             read(coordinate_offset + spatial_components + layer_coordinate, lane);
@@ -559,6 +620,20 @@ inline bool prepare_image_transfer(Wavefront &wf, VectorMemState &d, uint32_t re
       }
       if (modifiers.gather && level < uint32_t(resident_min_lod))
         continue;
+      // Hardware converts NaNs to zero and saturates infinities before
+      // address wrapping. Reduce large repeating coordinates before the
+      // half-texel offset, which would otherwise disappear in host arithmetic.
+      const auto address_input = [&](double value, uint32_t extent, uint32_t wrap) {
+        if (std::isnan(value))
+          value = 0;
+        else if (std::isinf(value))
+          value = std::copysign(double(std::numeric_limits<float>::max()), value);
+        if (wrap <= 1 && std::abs(value) >= 0x1p32)
+          value = std::fmod(value, double(normalized ? 1 : extent) * (wrap == 1 ? 2 : 1));
+        return value;
+      };
+      u = address_input(u, width, wrap_x);
+      v = address_input(v, height, wrap_y);
       if (wrap_x == 3)
         u = std::abs(u);
       if (wrap_y == 3)
@@ -678,11 +753,11 @@ inline bool prepare_image_transfer(Wavefront &wf, VectorMemState &d, uint32_t re
               image_layer_base(gfx12, resource_base + selected->offset, selected->slice_size,
                                selected_layer, bytes, swizzle);
           const auto address =
-              gfx12 ? gfx12_image_address(selected_base, *tx + selected->tail_x,
-                                          *ty + selected->tail_y,
+              gfx12 ? gfx12_image_address(selected_base, (bc ? *tx / 4 : *tx) + selected->tail_x,
+                                          (bc ? *ty / 4 : *ty) + selected->tail_y,
                                           max_level ? selected->pitch : pitch, bytes, swizzle)
-                    : gfx11_image_address(selected_base, *tx + selected->tail_x,
-                                          *ty + selected->tail_y,
+                    : gfx11_image_address(selected_base, (bc ? *tx / 4 : *tx) + selected->tail_x,
+                                          (bc ? *ty / 4 : *ty) + selected->tail_y,
                                           max_level ? selected->pitch : pitch, bytes, swizzle);
           if (!address)
             return unsupported();
@@ -704,13 +779,17 @@ inline bool prepare_image_transfer(Wavefront &wf, VectorMemState &d, uint32_t re
       const uint64_t selected_base = image_layer_base(gfx12, resource_base + lane_mip->offset,
                                                       lane_mip->slice_size, layer, bytes, swizzle);
       const auto address =
-          gfx12 ? gfx12_image_address(selected_base, x + lane_mip->tail_x, y + lane_mip->tail_y,
+          gfx12 ? gfx12_image_address(selected_base, (bc ? x / 4 : x) + lane_mip->tail_x,
+                                      (bc ? y / 4 : y) + lane_mip->tail_y,
                                       max_level ? lane_mip->pitch : pitch, bytes, swizzle)
-                : gfx11_image_address(selected_base, x + lane_mip->tail_x, y + lane_mip->tail_y,
+                : gfx11_image_address(selected_base, (bc ? x / 4 : x) + lane_mip->tail_x,
+                                      (bc ? y / 4 : y) + lane_mip->tail_y,
                                       max_level ? lane_mip->pitch : pitch, bytes, swizzle);
       if (!address)
         return unsupported();
       d.per_lane_addr[lane] = *address;
+      if (bc)
+        d.image_bc_texels[lane] = (x & 3) + ((y & 3) << 2);
       if (d.image_metadata) {
         d.image_metadata->coordinates[lane] = x | (y << 16);
         d.image_metadata->layers[lane] = layer;
@@ -730,6 +809,26 @@ inline bool prepare_image_transfer(Wavefront &wf, VectorMemState &d, uint32_t re
     if (relative_level > last_level - first_level)
       continue;
     const uint32_t level = first_level + relative_level;
+    if (volume) {
+      const auto selected =
+          image_volume_mip_layout(gfx12, swizzle, bytes, resource_width, resource_height,
+                                  resource_depth, max_level + 1, level);
+      if (!selected)
+        return unsupported();
+      const auto address = image_volume_address(gfx12, base - mip->offset, *selected, x, y,
+                                                load_coordinate(2), bytes, swizzle);
+      if (address) {
+        d.per_lane_addr[lane] = *address;
+        if (d.image_metadata) {
+          // Render-optimized 3D tiles use the same DCC layout as array slices.
+          d.image_metadata->coordinates[lane] = x | (y << 16);
+          d.image_metadata->layers[lane] = load_coordinate(2);
+          d.image_metadata->levels[lane] = level;
+        }
+        d.lane_mask |= uint64_t{1} << lane;
+      }
+      continue;
+    }
     const auto &selected = get_mip_layout(level);
     if (!selected)
       return unsupported();
@@ -740,14 +839,18 @@ inline bool prepare_image_transfer(Wavefront &wf, VectorMemState &d, uint32_t re
     const uint64_t layer_base = image_layer_base(gfx12, base - mip->offset + selected->offset,
                                                  selected->slice_size, layer, bytes, swizzle);
     const uint32_t selected_pitch = level == first_level ? pitch : selected->pitch;
-    const auto address =
-        gfx12 ? gfx12_image_address(layer_base, x + selected->tail_x, y + selected->tail_y,
-                                    selected_pitch, bytes, swizzle)
-              : gfx11_image_address(layer_base, x + selected->tail_x, y + selected->tail_y,
-                                    selected_pitch, bytes, swizzle);
+    const auto address = gfx12
+                             ? gfx12_image_address(layer_base, (bc ? x / 4 : x) + selected->tail_x,
+                                                   (bc ? y / 4 : y) + selected->tail_y,
+                                                   selected_pitch, bytes, swizzle)
+                             : gfx11_image_address(layer_base, (bc ? x / 4 : x) + selected->tail_x,
+                                                   (bc ? y / 4 : y) + selected->tail_y,
+                                                   selected_pitch, bytes, swizzle);
     if (!address)
       return unsupported();
     d.per_lane_addr[lane] = *address;
+    if (bc)
+      d.image_bc_texels[lane] = (x & 3) + ((y & 3) << 2);
     if (d.image_metadata) {
       d.image_metadata->coordinates[lane] = x | (y << 16);
       d.image_metadata->layers[lane] = layer;

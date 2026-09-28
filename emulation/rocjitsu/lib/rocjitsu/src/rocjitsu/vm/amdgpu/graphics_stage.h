@@ -19,6 +19,7 @@ public:
   virtual ~GraphicsStage() = default;
   virtual std::shared_ptr<GsRegisters> gs_registers() const { return {}; }
   virtual void initialize(Wavefront &wave, uint32_t workgroup, uint32_t wave_index) = 0;
+  virtual bool allocate_exports(Wavefront &, uint32_t, uint32_t) { return false; }
   /// Pixel validity accompanies exports even when no color components are enabled.
   virtual void export_mask(Wavefront &wave, uint64_t mask) = 0;
   virtual void export_lane(Wavefront &wave, uint32_t lane, uint32_t target, uint32_t mask,
