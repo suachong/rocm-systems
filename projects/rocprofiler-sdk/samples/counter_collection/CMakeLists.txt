@@ -218,7 +218,7 @@ set_tests_properties(
                LABELS
                "samples"
                ENVIRONMENT
-               "${counter-collection-device-profiling-env}"
+               "${counter-collection-device-profiling-env};ROCPROF_DIAGNOSTIC=1"
                FAIL_REGULAR_EXPRESSION
                "${ROCPROFILER_DEFAULT_FAIL_REGEX}"
                FIXTURES_SETUP
@@ -268,7 +268,7 @@ set_tests_properties(
                LABELS
                "samples"
                ENVIRONMENT
-               "${counter-collection-device-profiling-sync-env}"
+               "${counter-collection-device-profiling-sync-env};ROCPROF_DIAGNOSTIC=1"
                FAIL_REGULAR_EXPRESSION
                "${ROCPROFILER_DEFAULT_FAIL_REGEX}"
                FIXTURES_SETUP

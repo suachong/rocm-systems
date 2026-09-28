@@ -24,6 +24,7 @@
 
 #include <libgen.h>
 #include "client.hpp"
+#include "diagnostic_utils.hpp"
 
 #define HIP_CALL(call)                                                                             \
     do                                                                                             \
@@ -63,21 +64,41 @@ kernelC(T* C_d, const T* A_d, size_t N)
 void
 launchKernels(const long NUM_LAUNCH, const long SYNC_INTERVAL, const int DEV_ID)
 {
+    // Print diagnostic info if enabled
+    rocprofiler_diag::print_system_info();
+    rocprofiler_diag::print_gpu_info(DEV_ID);
+
     // Normal HIP Calls
     HIP_CALL(hipSetDevice(DEV_ID));
+    rocprofiler_diag::sync_and_check("after hipSetDevice");
+
     [[maybe_unused]] hipDeviceProp_t devProp;
     HIP_CALL(hipGetDeviceProperties(&devProp, DEV_ID));
 
     int* gpuMem = nullptr;
     HIP_CALL(hipMalloc((void**) &gpuMem, 1 * sizeof(int)));
+    rocprofiler_diag::print_memory_alloc("gpuMem", gpuMem, sizeof(int));
+
+    rocprofiler_diag::print_counter_collection_start(2);  // kernelA and kernelB
 
     for(long i = 0; i < NUM_LAUNCH; i++)
     {
         // KernelA and KernelB to be profiled as part of the session
+        if(rocprofiler_diag::is_diagnostic_enabled() && i == 0) {
+            rocprofiler_diag::print_pre_kernel_state("kernelA", dim3(1), dim3(1));
+        }
         hipLaunchKernelGGL(kernelA, dim3(1), dim3(1), 0, 0, 1, 2);
+        rocprofiler_diag::check_gpu_error("kernelA launch");
+
         hipLaunchKernelGGL(kernelB, dim3(1), dim3(1), 0, 0, 1, 2);
-        if(i % SYNC_INTERVAL == (SYNC_INTERVAL - 1)) HIP_CALL(hipDeviceSynchronize());
+        rocprofiler_diag::check_gpu_error("kernelB launch");
+
+        if(i % SYNC_INTERVAL == (SYNC_INTERVAL - 1)) {
+            HIP_CALL(hipDeviceSynchronize());
+            rocprofiler_diag::check_gpu_error("sync after kernelA/B batch");
+        }
     }
+    rocprofiler_diag::sync_and_check("after all kernelA/B launches");
 
     const int NElems = 512 * 512;
     const int Nbytes = NElems * sizeof(int);
@@ -92,22 +113,39 @@ launchKernels(const long NUM_LAUNCH, const long SYNC_INTERVAL, const int DEV_ID)
     HIP_CALL(hipDeviceSynchronize());
 
     HIP_CALL(hipMalloc(&A_d, Nbytes));
+    rocprofiler_diag::print_memory_alloc("A_d", A_d, Nbytes);
+
     HIP_CALL(hipMalloc(&C_d, Nbytes));
+    rocprofiler_diag::print_memory_alloc("C_d", C_d, Nbytes);
+
     HIP_CALL(hipMemcpy(A_d, A_h, Nbytes, hipMemcpyHostToDevice));
     HIP_CALL(hipDeviceSynchronize());
+    rocprofiler_diag::sync_and_check("after A_d memcpy");
+
     const unsigned blocks          = 512;
     const unsigned threadsPerBlock = 256;
     for(long i = 0; i < NUM_LAUNCH; i++)
     {
+        if(rocprofiler_diag::is_diagnostic_enabled() && i == 0) {
+            rocprofiler_diag::print_pre_kernel_state("kernelC", dim3(blocks), dim3(threadsPerBlock));
+        }
         hipLaunchKernelGGL(kernelC, dim3(blocks), dim3(threadsPerBlock), 0, 0, C_d, A_d, NElems);
-        if(i % SYNC_INTERVAL == (SYNC_INTERVAL - 1)) HIP_CALL(hipDeviceSynchronize());
+        rocprofiler_diag::check_gpu_error("kernelC launch");
+
+        if(i % SYNC_INTERVAL == (SYNC_INTERVAL - 1)) {
+            HIP_CALL(hipDeviceSynchronize());
+            rocprofiler_diag::check_gpu_error("sync after kernelC batch");
+        }
     }
+    rocprofiler_diag::sync_and_check("after all kernelC launches");
     HIP_CALL(hipMemcpy(C_h, C_d, Nbytes, hipMemcpyDeviceToHost));
     HIP_CALL(hipDeviceSynchronize());
     HIP_CALL(hipFree(gpuMem));
     HIP_CALL(hipFree(A_d));
     HIP_CALL(hipFree(C_d));
     HIP_CALL(hipDeviceReset());
+
+    rocprofiler_diag::print_diagnostic_summary();
 }
 
 int
