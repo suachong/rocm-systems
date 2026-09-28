@@ -9,17 +9,17 @@ Batch I/O
 `batch-roundtrip.cpp
 <https://github.com/ROCm/rocm-systems/blob/develop/projects/hipfile/examples/batch/batch-roundtrip.cpp>`_
 reads a file into a registered GPU buffer using batch IO operations, writes
-the buffer back out in a second batch phase, and verifies the output matches
+the buffer back out in a second batch phase, and verifies that the output matches
 the input. 4KiB IOs are used and the batch queue is refilled by submitting
-additional batch IO operations completions are received.
+additional batch IO operations as IO completions are received.
 
 When to use this pattern
 =========================
 
 Use batch I/O when you need to:
 
-- Amortize submission overhead across many small transfers instead of paying it
-  per request.
+- Amortize submission overhead across many small transfers instead of having
+  per-request overhead.
 - Keep the storage device busy with a bounded number of outstanding requests.
 - Process completions as they arrive, in whatever order the device returns them.
 
@@ -36,6 +36,11 @@ Verify you have:
 
 Step-by-step walkthrough
 ===========================
+
+The walkthrough follows a complete file round trip, from creating the input
+file and registering resources to verifying the output and cleaning up. Reads
+and writes run in separate phases, each using a bounded window of 4 KiB
+requests that is refilled as completions arrive.
 
 Parse arguments and seed the input file
 ---------------------------------------
@@ -103,11 +108,11 @@ Describe a request
    request.operation.opcode                = opcode;
    request.operation.cookie                = request.cookie.get();
 
-``mode`` must be ``hipFileBatch``.  The ``cookie`` is an opaque pointer
-that hipFile hands back in the completion event. The example points it at a
-``BatchCookie`` holding the chunk index and the byte count that chunk should
-transfer. Because the cookie is the only link between an event and its request,
-it must stay valid until that request completes.
+``mode`` must be ``hipFileBatch``.  The ``cookie`` is an opaque pointer that
+hipFile hands back in the completion event. The example passes a pointer to
+the ``BatchCookie`` holding the chunk index and the byte count that chunk
+should transfer. Because the cookie is the only link between an event and
+its request, it must stay valid until that request completes.
 
 Reads at the tail of the file expect fewer than ``BATCH_IO_SIZE`` bytes, so
 ``expected_bytes`` is clamped to the bytes remaining in the payload. Writes
@@ -196,7 +201,7 @@ Batch requests carry no ordering guarantees:
 
 - Events can come back in any order, and one ``hipFileBatchIOGetStatus()`` call
   can return anywhere from ``min_nr`` to ``nr`` events.
-- Requests in a batch can overlap in time, so two requests should not modify the
+- Requests in a batch can overlap in time, so two requests must not modify the
   same file or buffer region.
 - Ordering between phases has to be enforced by the application. This example
   drains the read phase entirely before submitting any writes.
