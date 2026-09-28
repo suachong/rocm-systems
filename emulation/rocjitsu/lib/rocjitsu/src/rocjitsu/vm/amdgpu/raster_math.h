@@ -18,6 +18,11 @@ inline float truncate_float(double value) {
   return result;
 }
 
+// Clipping, depth and polygon offset flush FP32 denormals while keeping the sign.
+inline float flush_denormal(float value) {
+  return std::abs(value) < 0x1p-126f ? std::copysign(0.0f, value) : value;
+}
+
 // Vertex setup and fragment W use a linear reciprocal seed followed by a
 // fixed-point Newton step. These coefficients and rounding stages match every
 // normalized FP32 mantissa captured on physical RDNA3 and RDNA4. Shader
@@ -108,13 +113,29 @@ inline std::array<float, 2> clip_weights(float a_distance, float b_distance) {
           truncate_float(double(a_distance) * inverse)};
 }
 
-// Constant components bypass interpolation. Otherwise each product and the
-// sum truncate to FP32, before viewport transformation and subpixel snapping.
+// Constant components bypass interpolation. Each product truncates to FP32;
+// their sum uses the same exponent alignment as setup differences.
 inline float clip_component(float a, float b, std::array<float, 2> weights) {
   if (a == b)
     return a;
-  return truncate_float(double(truncate_float(double(a) * weights[0])) +
-                        truncate_float(double(b) * weights[1]));
+  return vertex_difference(truncate_float(double(a) * weights[0]),
+                           -truncate_float(double(b) * weights[1]));
+}
+
+// With PA_CL_CLIP_CNTL.DX_LINEAR_ATTR_CLIP_ENA, clipping interpolates
+// noperspective barycentrics in screen space. Each endpoint weight becomes
+// trunc(trunc(weight * endpoint W) * reciprocal(new W)). Zero and subnormal
+// operands give a zero product, even times an infinite reciprocal.
+inline std::array<float, 2> linear_clip_weights(std::array<float, 2> weights, float previous_w,
+                                                float current_w, float new_w) {
+  const auto multiply = [](float a, float b) {
+    a = flush_denormal(a);
+    b = flush_denormal(b);
+    return a == 0 || b == 0 ? 0.0f : truncate_float(double(a) * b);
+  };
+  const float inverse = reciprocal(flush_denormal(new_w));
+  return {multiply(multiply(weights[0], previous_w), inverse),
+          multiply(multiply(weights[1], current_w), inverse)};
 }
 
 // Setup truncates the weighted numerator before scaling by reciprocal area.
@@ -169,7 +190,8 @@ inline double area_reciprocal(double value) {
 
 // Depth gradients truncate the FP32 numerator times the 32-bit reciprocal
 // toward zero at 32 significant bits. Keep the full integer product to avoid
-// a host-double rounding carry at a truncation boundary.
+// a host-double rounding carry at a truncation boundary. Magnitudes below
+// 2^-122, denormal at 1/16-pixel scale, flush to zero.
 inline double depth_gradient(float numerator, double inverse_area) {
   if (numerator == 0 || inverse_area == 0 || !std::isfinite(numerator) ||
       !std::isfinite(inverse_area))
@@ -181,7 +203,7 @@ inline double depth_gradient(float numerator, double inverse_area) {
   const unsigned shift = std::bit_width(product) - 32;
   const double result =
       std::ldexp(double(product >> shift), numerator_exponent + inverse_exponent + int(shift) - 56);
-  return std::copysign(result, double(numerator) * inverse_area);
+  return std::copysign(result < 0x1p-122 ? 0.0 : result, double(numerator) * inverse_area);
 }
 
 // Physical RDNA3/4 perspective interpolation rounds the product using the
@@ -310,7 +332,9 @@ inline bool can_omit_bounded_planes(const Plane &first, const Plane &second, dou
 // for either slope across a whole tile. Conversion to this signed fixed-point
 // representation rounds downward, including negative slopes and tile depths.
 // Before alignment, negative slopes round to 27 significant bits with ties
-// away from zero. Retain the wider setup gradients for each new tile center.
+// away from zero, but unrounded magnitudes below a quarter of the shared unit
+// shift out entirely. Retain the wider setup gradients for each new tile center
+// and for choosing its shared exponent and small-slope cutoff.
 struct DepthPlane {
   double dx, dy, base, origin_x, origin_y;
 
@@ -333,6 +357,8 @@ struct DepthPlane {
     const double tile_base = std::floor(center / unit) * unit;
     const auto align_slope = [unit, quantization_unit](double slope) {
       if (slope < 0) {
+        if (-slope < unit / 4)
+          return 0.0;
         const double slope_unit = quantization_unit(slope, 26);
         slope = -std::floor(-slope / slope_unit + 0.5) * slope_unit;
       }
@@ -340,10 +366,56 @@ struct DepthPlane {
     };
     const double tile_dx = align_slope(dx);
     const double tile_dy = align_slope(dy);
-    return truncate_float(tile_base + (x + 0.5 - center_x) * tile_dx +
-                          (y + 0.5 - center_y) * tile_dy);
+    return flush_denormal(truncate_float(tile_base + (x + 0.5 - center_x) * tile_dx +
+                                         (y + 0.5 - center_y) * tile_dy));
   }
 };
+
+// The polygon offset constant is scaled by 2^NEG_NUM_DB_BITS. Float depth also
+// scales it by the raw FP32 exponent field of the largest vertex depth
+// magnitude, so zero and denormal depths use -127 rather than -126.
+inline double depth_bias_constant(float offset, uint32_t format, float largest_depth) {
+  int exponent = static_cast<int8_t>(format);
+  if (format & 0x100)
+    exponent += int((std::bit_cast<uint32_t>(std::abs(largest_depth)) >> 23) & 0xff) - 127;
+  return std::ldexp(double(offset), exponent);
+}
+
+// Physical RDNA3/4 polygon offset uses FP32 terms, and denormal terms flush to
+// zero. The larger setup gradient magnitude truncates to FP32 before its
+// product with the slope scale, which truncates again. A shared-exponent adder
+// joins the constant term: both operands align to the larger exponent with 23
+// fraction bits, shifted-out bits round toward negative infinity, and an
+// operand at least 24 binades smaller contributes nothing. The sum truncates
+// to FP32 before the clamp, whose zero value disables it with either sign.
+inline float depth_bias(double dx, double dy, float scale, double constant, float clamp) {
+  const float gradient = truncate_float(std::max(std::abs(dx), std::abs(dy)));
+  const float slope = flush_denormal(truncate_float(double(gradient) * scale));
+  const float offset =
+      std::abs(constant) < 0x1p-126 ? std::copysign(0.0f, float(constant)) : float(constant);
+  float bias = slope + offset;
+  if (slope != 0 && offset != 0 && std::isfinite(bias)) {
+    const int slope_exponent = std::ilogb(slope), offset_exponent = std::ilogb(offset);
+    const int exponent = std::max(slope_exponent, offset_exponent);
+    const auto align = [exponent](float value, int value_exponent) {
+      return exponent - value_exponent >= 24 ? 0.0
+                                             : std::floor(std::ldexp(double(value), 23 - exponent));
+    };
+    bias = flush_denormal(truncate_float(
+        std::ldexp(align(slope, slope_exponent) + align(offset, offset_exponent), exponent - 23)));
+  }
+  if (clamp > 0)
+    return std::min(bias, clamp);
+  if (clamp < 0)
+    return std::max(bias, clamp);
+  return bias;
+}
+
+// The viewport depth clamp orders a negative zero below a positive minimum.
+inline float clamp_viewport_depth(float depth, float minimum, float maximum) {
+  const float clamped = std::clamp(depth, minimum, maximum);
+  return std::signbit(clamped) && !std::signbit(minimum) ? minimum : clamped;
+}
 
 inline double round_subpixel(double value) {
   const double scaled = value * 256;

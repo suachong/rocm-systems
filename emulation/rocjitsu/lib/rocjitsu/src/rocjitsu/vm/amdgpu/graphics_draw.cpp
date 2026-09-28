@@ -1586,7 +1586,7 @@ void GraphicsDraw::rasterize(const GpuVmAccess &memory, const VertexGroup &group
   const float gy = std::bit_cast<float>(context_[gfx12 ? 0x10b : 0x2fa]);
   const bool valid_guard = std::isfinite(gx) && std::isfinite(gy) && gx >= 1 && gy >= 1;
   const auto guard_distance = [](double position, double w, float guard, int sign) {
-    return raster::truncate_float(double(raster::truncate_float(w * guard)) + sign * position);
+    return raster::vertex_difference(raster::truncate_float(w * guard), -sign * position);
   };
   for (uint32_t p = 0; p < group.output_primitives; ++p) {
     if (group.primitives[p] & (1u << 31))
@@ -1595,6 +1595,7 @@ void GraphicsDraw::rasterize(const GpuVmAccess &memory, const VertexGroup &group
     struct Point {
       double x, y, w, z;
       std::array<double, 3> barycentric{};
+      std::array<double, 3> linear{};
     };
     std::array<Point, 3> v{}, screen{}, clip_positions{};
     uint32_t outside_near = 0, outside_far = 0, nonpositive_w = 0;
@@ -1617,6 +1618,7 @@ void GraphicsDraw::rasterize(const GpuVmAccess &memory, const VertexGroup &group
       nonpositive_w += w <= 0;
       clip_positions[k] = {x, y, w, z};
       clip_positions[k].barycentric[k] = 1;
+      clip_positions[k].linear[k] = 1;
       if (!(clip_control & (1u << 16))) {
         const float near = (clip_control & (1u << 19)) ? 0.0f : -w;
         outside_near += !(clip_control & (1u << 26)) && z < near;
@@ -1649,8 +1651,9 @@ void GraphicsDraw::rasterize(const GpuVmAccess &memory, const VertexGroup &group
       continue;
     // Clip coverage in homogeneous coordinates and carry the original
     // barycentrics so added vertices do not replace shader-visible parameters.
+    const bool clipped = clip_xy || outside_near || outside_far;
     uint32_t clip_origin = 0;
-    if (clip_xy) {
+    if (clipped) {
       // The clipper orders the polygon in homogeneous X, before projection.
       // If two X coordinates tie, start at the opposite vertex.
       for (uint32_t k = 1; k < 3; ++k)
@@ -1664,7 +1667,7 @@ void GraphicsDraw::rasterize(const GpuVmAccess &memory, const VertexGroup &group
           clip_origin = k;
     }
     std::vector<Point> coverage(v.begin(), v.end());
-    if (clip_xy || outside_near || outside_far) {
+    if (clipped) {
       if (primitive_type_ == kRectangleList)
         throw std::runtime_error("graphics clipped rectangles are not implemented");
       coverage.assign(clip_positions.begin(), clip_positions.end());
@@ -1683,13 +1686,26 @@ void GraphicsDraw::rasterize(const GpuVmAccess &memory, const VertexGroup &group
             const auto component = [&](double a, double b) {
               return raster::clip_component(a, b, weights);
             };
+            const float w = component(previous.w, current.w);
+            // Screen-space noperspective clipping is only qualified with
+            // DX_LINEAR_ATTR_CLIP_ENA, which RADV always sets.
+            const auto linear_weights =
+                (clip_control & (1u << 24))
+                    ? raster::linear_clip_weights(weights, previous.w, current.w, w)
+                    : weights;
+            const auto linear = [&](double a, double b) {
+              return raster::clip_component(a, b, linear_weights);
+            };
             output.push_back({component(previous.x, current.x),
                               component(previous.y, current.y),
-                              component(previous.w, current.w),
+                              w,
                               component(previous.z, current.z),
                               {component(previous.barycentric[0], current.barycentric[0]),
                                component(previous.barycentric[1], current.barycentric[1]),
-                               component(previous.barycentric[2], current.barycentric[2])}});
+                               component(previous.barycentric[2], current.barycentric[2])},
+                              {linear(previous.linear[0], current.linear[0]),
+                               linear(previous.linear[1], current.linear[1]),
+                               linear(previous.linear[2], current.linear[2])}});
           }
           if (current_distance >= 0)
             output.push_back(current);
@@ -1701,7 +1717,7 @@ void GraphicsDraw::rasterize(const GpuVmAccess &memory, const VertexGroup &group
       if (outside_near)
         clip([&](Point point) { return point.z + ((clip_control & (1u << 19)) ? 0 : point.w); });
       if (outside_far)
-        clip([](Point point) { return point.w - point.z; });
+        clip([](Point point) { return raster::vertex_difference(point.w, point.z); });
       if (clip_xy) {
         if (!valid_guard)
           throw std::runtime_error("unsupported graphics guard band");
@@ -1745,24 +1761,26 @@ void GraphicsDraw::rasterize(const GpuVmAccess &memory, const VertexGroup &group
     const auto polygon = coverage;
     const auto original_screen = v;
     const auto original_indices = indices;
-    const uint32_t triangle_count = clip_xy ? polygon.size() - 2 : 1;
+    const uint32_t triangle_count = clipped ? polygon.size() - 2 : 1;
     for (uint32_t triangle = 0; triangle < triangle_count; ++triangle) {
       indices = original_indices;
       v = original_screen;
       screen = original_screen;
-      if (clip_xy) {
+      if (clipped) {
         coverage = {polygon[0], polygon[triangle + 1], polygon[triangle + 2]};
         std::copy(coverage.begin(), coverage.end(), screen.begin());
         area = edge(screen[0], screen[1], screen[2].x, screen[2].y);
         if (area == 0)
           continue;
       }
-      // Choose the smallest W, then the leftmost vertex. Equal-W axis-aligned
-      // right triangles use the corner joining the two axis-aligned edges.
+      // Choose the largest setup reciprocal W, then the leftmost vertex. Nearly
+      // equal W values can share a reciprocal. Equal-W axis-aligned right
+      // triangles use the corner joining the two axis-aligned edges.
       uint32_t origin = 0;
+      const auto inverse_w = [&](uint32_t k) { return raster::reciprocal(screen[k].w); };
       for (uint32_t k = 1; k < 3; ++k)
-        if (screen[k].w < screen[origin].w ||
-            (screen[k].w == screen[origin].w &&
+        if (inverse_w(k) > inverse_w(origin) ||
+            (inverse_w(k) == inverse_w(origin) &&
              (screen[k].x < screen[origin].x ||
               (screen[k].x == screen[origin].x && screen[k].y < screen[origin].y))))
           origin = k;
@@ -1771,7 +1789,7 @@ void GraphicsDraw::rasterize(const GpuVmAccess &memory, const VertexGroup &group
         if (a.w == b.w && a.w == c.w && ((a.x == b.x && a.y == c.y) || (a.y == b.y && a.x == c.x)))
           origin = k;
       }
-      const uint32_t parameter_origin = clip_xy ? (clip_origin + origin) % 3 : origin;
+      const uint32_t parameter_origin = clipped ? (clip_origin + origin) % 3 : origin;
       std::rotate(indices.begin(), indices.begin() + parameter_origin, indices.end());
       std::rotate(v.begin(), v.begin() + parameter_origin, v.end());
       std::rotate(screen.begin(), screen.begin() + origin, screen.end());
@@ -1789,7 +1807,7 @@ void GraphicsDraw::rasterize(const GpuVmAccess &memory, const VertexGroup &group
             a};
       };
       const auto original_weight = [&](uint32_t vertex, uint32_t component) {
-        return clip_xy ? screen[vertex].barycentric[(parameter_origin + component) % 3]
+        return clipped ? screen[vertex].barycentric[(parameter_origin + component) % 3]
                        : double(vertex == component);
       };
       const auto perspective_plane = [&](uint32_t component) {
@@ -1804,16 +1822,17 @@ void GraphicsDraw::rasterize(const GpuVmAccess &memory, const VertexGroup &group
       const raster::Plane plane_rw =
           plane(raster::reciprocal(screen[0].w), raster::reciprocal(screen[1].w),
                 raster::reciprocal(screen[2].w));
-      // Reconstruct clipped noperspective weights in wide precision; these are not
-      // the vertex reciprocal-W values captured from primitive setup.
-      const raster::Plane plane_i = clip_xy ? plane(original_weight(0, 1) * v[1].w / screen[0].w,
-                                                    original_weight(1, 1) * v[1].w / screen[1].w,
-                                                    original_weight(2, 1) * v[1].w / screen[2].w)
-                                            : plane(0, 1, 0);
-      const raster::Plane plane_j = clip_xy ? plane(original_weight(0, 2) * v[2].w / screen[0].w,
-                                                    original_weight(1, 2) * v[2].w / screen[1].w,
-                                                    original_weight(2, 2) * v[2].w / screen[2].w)
-                                            : plane(0, 0, 1);
+      const auto linear_plane = [&](uint32_t component) {
+        const uint32_t original = (parameter_origin + component) % 3;
+        if (!(clip_control & (1u << 24)))
+          return plane(original_weight(0, component) * v[component].w / screen[0].w,
+                       original_weight(1, component) * v[component].w / screen[1].w,
+                       original_weight(2, component) * v[component].w / screen[2].w);
+        return plane(screen[0].linear[original], screen[1].linear[original],
+                     screen[2].linear[original]);
+      };
+      const raster::Plane plane_i = clipped ? linear_plane(1) : plane(0, 1, 0);
+      const raster::Plane plane_j = clipped ? linear_plane(2) : plane(0, 0, 1);
       const float depth_b = raster::vertex_difference(screen[1].z, screen[0].z);
       const float depth_c = raster::vertex_difference(screen[2].z, screen[0].z);
       raster::DepthPlane plane_z{
@@ -1835,19 +1854,11 @@ void GraphicsDraw::rasterize(const GpuVmAccess &memory, const VertexGroup &group
         if ((format & ~0x1ffu) || !std::isfinite(scale) || !std::isfinite(offset) ||
             !std::isfinite(clamp))
           throw std::runtime_error("unsupported graphics depth bias state");
-        int exponent = static_cast<int8_t>(format);
-        if (format & 0x100) {
-          const double maximum =
-              std::max({std::abs(screen[0].z), std::abs(screen[1].z), std::abs(screen[2].z)});
-          exponent += maximum == 0 ? -126 : std::max(-126, std::ilogb(maximum));
-        }
-        double bias = std::max(std::abs(plane_z.dx), std::abs(plane_z.dy)) * scale +
-                      std::ldexp(double(offset), exponent);
-        if (clamp > 0)
-          bias = std::min(bias, double(clamp));
-        else if (clamp < 0)
-          bias = std::max(bias, double(clamp));
-        plane_z.base += bias;
+        const float largest = static_cast<float>(
+            std::max({std::abs(screen[0].z), std::abs(screen[1].z), std::abs(screen[2].z)}));
+        plane_z.base +=
+            raster::depth_bias(plane_z.dx, plane_z.dy, scale,
+                               raster::depth_bias_constant(offset, format, largest), clamp);
       }
       const bool rectangle = primitive_type_ == kRectangleList;
       const auto [xmin, xmax] = std::minmax_element(coverage.begin(), coverage.end(),
@@ -1935,20 +1946,8 @@ void GraphicsDraw::rasterize(const GpuVmAccess &memory, const VertexGroup &group
                      px < std::max({v[0].x, v[1].x, v[2].x}) &&
                      py >= std::min({v[0].y, v[1].y, v[2].y}) &&
                      py < std::max({v[0].y, v[1].y, v[2].y});
-          } else if (coverage.size() == 3) {
-            inside = inside_edges(coverage, area, px, py);
           } else {
-            // Depth clipping precedes snapping, which can make the resulting
-            // polygon nonconvex or reverse one fan triangle's winding. Union
-            // triangle coverage while retaining the primitive's facing and
-            // original interpolation planes. Emit each sample only once.
-            inside = false;
-            for (uint32_t k = 1; k + 1 < coverage.size(); ++k) {
-              const std::array triangle{coverage[0], coverage[k], coverage[k + 1]};
-              const double triangle_area =
-                  edge(triangle[0], triangle[1], triangle[2].x, triangle[2].y);
-              inside |= inside_edges(triangle, triangle_area, px, py);
-            }
+            inside = inside_edges(coverage, area, px, py);
           }
           const bool sample_enabled = (context_[0x30e + (fy & 1)] >> (16 * (fx & 1))) & 1;
           if (inside && sample_enabled && fx >= left && fx < right && fy >= top && fy < bottom)
@@ -2336,7 +2335,8 @@ void GraphicsDraw::write_output_fragment(const Memory &memory, const FragmentWav
     if (!address || memory.read(*address, {reinterpret_cast<std::byte *>(&previous_bits),
                                            depth_bytes_}) != VmAccessOutcome::Complete)
       throw std::runtime_error("graphics depth read failed");
-    const float clamped_depth = clamp_depth ? std::clamp(f.z, depth_min, depth_max) : f.z;
+    const float clamped_depth =
+        clamp_depth ? raster::clamp_viewport_depth(f.z, depth_min, depth_max) : f.z;
     uint32_t next_bits = std::bit_cast<uint32_t>(clamped_depth);
     if (depth_bytes_ == 2) {
       const std::array<uint32_t, 1> component{next_bits};

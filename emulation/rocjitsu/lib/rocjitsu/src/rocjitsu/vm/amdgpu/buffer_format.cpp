@@ -688,39 +688,74 @@ void complete_buffer_format_load(Wavefront &wf, ComputeUnitCore &cu, const Vecto
           }
         for (uint32_t c = 0; c < d.buffer_components; ++c) {
           const uint32_t selector = (d.buffer_selectors >> (3 * c)) & 7;
+          const bool bc_scalar =
+              !d.image_sample->comparison && d.image_bc_format >= 115 && d.image_bc_format <= 118;
+          const bool bc_signed = bc_scalar && !(d.image_bc_format & 1);
           const bool fixed_unorm = !d.image_sample->comparison && format.number == Number::Unorm &&
                                    (format.widths[0] == 8 || format.widths[0] == 10) &&
                                    (!d.image_srgb || selector == 7);
-          const uint32_t unorm_width = format.widths[0] == 10 ? 10 : 8;
+          const uint32_t unorm_width = bc_signed ? 7 : format.widths[0] == 10 ? 10 : 8;
           const uint32_t unorm_max = (1u << unorm_width) - 1;
-          const auto filter_sample = [&](uint32_t filter_index) {
-            const auto filter_level = [&](uint32_t level) {
-              std::array<double, 4> channels{};
-              const auto &access = *d.image_sample;
-              const uint32_t corners = access.filters[filter_index].cube_corners[lane][level];
-              for (uint32_t tap = 0; tap < 4; ++tap) {
-                const uint32_t first = filter_index * access.taps_per_filter +
-                                       (level * 4 + tap) * access.texels_per_tap;
-                const auto channel = [&](uint32_t source) {
-                  if (integer_texels)
-                    return double(texels[first + source][c]);
-                  const double value = std::bit_cast<float>(texels[first + source][c]);
-                  return fixed_unorm ? round_even(value * unorm_max) : value;
-                };
-                channels[tap] = channel(0);
-                if (corners & (1u << tap))
-                  channels[tap] =
-                      (channels[tap] * 21846 + channel(1) * 21845 + channel(2) * 21845) / 65536;
+          const auto filter_level = [&](uint32_t filter_index, uint32_t level) {
+            std::array<double, 4> channels{};
+            const auto &access = *d.image_sample;
+            const uint32_t corners = access.filters[filter_index].cube_corners[lane][level];
+            for (uint32_t tap = 0; tap < 4; ++tap) {
+              const uint32_t first =
+                  filter_index * access.taps_per_filter + (level * 4 + tap) * access.texels_per_tap;
+              const auto channel = [&](uint32_t source) {
+                if (integer_texels)
+                  return double(texels[first + source][c]);
+                const double value = std::bit_cast<float>(texels[first + source][c]);
+                // BC4/5 retain six fractional bits in decoded texel units.
+                if (bc_scalar)
+                  return round_even(value * unorm_max * 64) / 64;
+                return fixed_unorm ? round_even(value * unorm_max) : value;
+              };
+              channels[tap] = channel(0);
+              if (corners & (1u << tap))
+                channels[tap] =
+                    (channels[tap] * 21846 + channel(1) * 21845 + channel(2) * 21845) / 65536;
+            }
+            const auto &level_weights = weights[filter_index][level];
+            if (!fixed_unorm && !bc_scalar)
+              return filter_float_texels(
+                  channels, level_weights, corners,
+                  format.number == Number::Float && format.widths[0] == 32 ? 25 : 12);
+            return channels[0] * level_weights[0] + channels[1] * level_weights[1] +
+                   channels[2] * level_weights[2] + channels[3] * level_weights[3];
+          };
+          if (bc_scalar) {
+            // BC4/5 accumulate weighted mips with 27 fractional texel bits.
+            // Keep mip contributions separate: RDNA3 consumes the smaller mip
+            // first, RDNA4 the larger one. Cancellation and exponent growth
+            // make that order observable even after texture normalization.
+            ImageFilterAccumulator accumulator(0);
+            const uint32_t normalization = std::bit_floor(filter_count);
+            for (uint32_t pass = 0; pass < levels; ++pass) {
+              const uint32_t level =
+                  cu.arch() == ROCJITSU_CODE_ARCH_RDNA4 ? pass : levels - 1 - pass;
+              const double mip_weight = levels == 1 ? 1.0
+                                        : level     ? d.image_sample->mip_fractions[lane]
+                                                    : 1.0 - d.image_sample->mip_fractions[lane];
+              for (uint32_t filter = 0; filter < filter_count; ++filter) {
+                const double value = filter_level(filter, level) * mip_weight *
+                                     image_anisotropic_filter_weight(filter_count, filter) *
+                                     normalization;
+                accumulator.add(round_even(value * 0x1p27) * 0x1p-27);
               }
-              const auto &level_weights = weights[filter_index][level];
-              if (!fixed_unorm)
-                return filter_float_texels(
-                    channels, level_weights, corners,
-                    format.number == Number::Float && format.widths[0] == 32 ? 25 : 12);
-              return channels[0] * level_weights[0] + channels[1] * level_weights[1] +
-                     channels[2] * level_weights[2] + channels[3] * level_weights[3];
-            };
-            double filtered = filter_level(0);
+            }
+            // Round to 29 significant bits, retaining at least eight integer
+            // bits, then discard signed low bits before magnitude conversion.
+            const double scale = std::ldexp(1.0, 29 - std::max(8, accumulator.exponent));
+            const double filtered = round_even(accumulator.value * scale) / scale / normalization;
+            const double units = std::floor(filtered * 0x1p13);
+            values[c] = encode_filtered_unorm(static_cast<uint64_t>(std::abs(units)), unorm_width) |
+                        (units < 0 ? 0x80000000u : 0);
+            continue;
+          }
+          const auto filter_sample = [&](uint32_t filter_index) {
+            double filtered = filter_level(filter_index, 0);
             if (d.image_sample->taps_per_filter == 8 * d.image_sample->texels_per_tap) {
               const double fraction = d.image_sample->mip_fractions[lane];
               if (fixed_unorm) {
@@ -728,15 +763,16 @@ void complete_buffer_format_load(Wavefront &wf, ComputeUnitCore &cu, const Vecto
                 // before the two contributions are added. Fixed texel values
                 // and Q8 fractions keep these binary scales exact and normal.
                 filtered = (round_even(filtered * (1 - fraction) * 0x1p19) +
-                            round_even(filter_level(1) * fraction * 0x1p19)) *
+                            round_even(filter_level(filter_index, 1) * fraction * 0x1p19)) *
                            0x1p-19;
               } else {
                 // Do not multiply an unused mip's NaN/infinity by zero, or lose
                 // signed zero at an exact mip level.
                 if (fraction == 1)
-                  filtered = filter_level(1);
+                  filtered = filter_level(filter_index, 1);
                 else if (fraction != 0)
-                  filtered = 0.0 + filtered * (1 - fraction) + filter_level(1) * fraction;
+                  filtered =
+                      0.0 + filtered * (1 - fraction) + filter_level(filter_index, 1) * fraction;
                 if (std::isnan(filtered))
                   filtered = kFilterNan;
               }

@@ -204,7 +204,7 @@ inline bool prepare_image_transfer(Wavefront &wf, VectorMemState &d, uint32_t re
   };
   width = mip->width;
   height = mip->height;
-  bool normalized = true, seamless_cube = false;
+  bool normalized = true, seamless_cube = false, truncate_coordinates = false;
   uint32_t min_filter = 0, mag_filter = 0, mip_filter = 0, max_anisotropy = 1;
   uint32_t aniso_threshold = 0, aniso_bias = 0, perf_mip = 0;
   double min_lod = 0, max_lod = 0, lod_bias = 0;
@@ -258,6 +258,7 @@ inline bool prepare_image_transfer(Wavefront &wf, VectorMemState &d, uint32_t re
     if (seamless_cube)
       wrap_x = wrap_y = 2;
     normalized = !(s[0] & (1u << 15));
+    truncate_coordinates = s[0] & (1u << 27);
     if (dim == 3 && !normalized)
       return unsupported();
     d.image_srgb &= !(s[0] & (1u << 31));
@@ -605,6 +606,12 @@ inline bool prepare_image_transfer(Wavefront &wf, VectorMemState &d, uint32_t re
       lod = round_sample_fixed8(lod);
       const uint32_t selected_filter = lod <= 0 ? mag_filter : min_filter;
       const bool linear = selected_filter & 1;
+      // TRUNC_COORD selects truncation for point filtering. Otherwise the
+      // texture unit rounds to eight fractional bits before selecting a texel.
+      const auto texel_origin = [&](double position) {
+        return std::floor(!linear && !truncate_coordinates ? round_sample_fixed8(position)
+                                                           : position);
+      };
       if (!(selected_filter & 2))
         filter_count = 1;
       lod = mip_filter ? std::clamp(lod, 0.0, double(last_level - first_level)) : 0;
@@ -708,8 +715,8 @@ inline bool prepare_image_transfer(Wavefront &wf, VectorMemState &d, uint32_t re
               px = std::clamp(px, 0.0, double(selected->width - 1));
             if (linear && !modifiers.gather && !seamless_cube && (wrap_y == 2 || wrap_y == 3))
               py = std::clamp(py, 0.0, double(selected->height - 1));
-            x0 = std::floor(px);
-            y0 = std::floor(py);
+            x0 = texel_origin(px);
+            y0 = texel_origin(py);
             access.filters[filter_index].fractions[lane][mip_index] =
                 linear ? std::array{fraction(px - x0), fraction(py - y0)} : std::array{0.0f, 0.0f};
           }
@@ -772,9 +779,9 @@ inline bool prepare_image_transfer(Wavefront &wf, VectorMemState &d, uint32_t re
         d.lane_mask |= uint64_t{1} << lane;
         continue;
       }
-      x = *address_coordinate(std::floor(u * (normalized ? lane_mip->width : 1) + offset_x),
+      x = *address_coordinate(texel_origin(u * (normalized ? lane_mip->width : 1) + offset_x),
                               lane_mip->width, wrap_x);
-      y = *address_coordinate(std::floor(v * (normalized ? lane_mip->height : 1) + offset_y),
+      y = *address_coordinate(texel_origin(v * (normalized ? lane_mip->height : 1) + offset_y),
                               lane_mip->height, wrap_y);
       const uint64_t selected_base = image_layer_base(gfx12, resource_base + lane_mip->offset,
                                                       lane_mip->slice_size, layer, bytes, swizzle);

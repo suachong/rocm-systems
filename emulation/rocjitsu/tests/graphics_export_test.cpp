@@ -2511,9 +2511,104 @@ TEST(GraphicsRasterMathTest, NegativeDepthSlopesMatchPhysicalPacking) {
        7,
        3,
        0x3eada23au},
+      // Tiny negative slopes shift out before rounding. The remaining witnesses
+      // distinguish the raw slope, strict cutoff, and per-tile exponent.
+      {{-0x1.66cfe68ep-33, -0x1.7e9abc78p-21, 0x1.ffe4dcp-1, 0x1.c665p+8, 0x1.1654p+7},
+       423,
+       0,
+       0x3f7ff8e8u},
+      {{-0x1.fffffffep-39, 0x1.85fffffep-32, 0x1.82bed4p-7, -0x1.36d4p+6, -0x1.c8p+0},
+       14,
+       4,
+       0x3c415f6cu},
+      {{-0x1p-32, 0x1.0fap-26, 0x1.0040b6p-1, -0x1.2e84p+6, 0x1.70b8p+5}, 41, 51, 0x3f00205cu},
+      {{-0x1.68p-38, -0x1.1a2c6p-24, 0x1.ffde04p-7, -0x1.16d3p+8, 0x1.8588p+6}, 55, 1, 0x3c8004b6u},
   };
   for (const auto &test : cases)
     EXPECT_EQ(std::bit_cast<uint32_t>(test.plane.at(test.x, test.y)), test.expected);
+}
+
+TEST(GraphicsRasterMathTest, DepthBiasMatchesPhysicalRdna3AndRdna4) {
+  // Raw gl_FragCoord.z witnesses from polygon-offset triangles captured on both
+  // cards. Together they separate FP32 gradient and product truncation, the
+  // aligned sum and its 24-binade drop, the zero-depth exponent, every denormal
+  // flush, and both clamp signs from nearby alternatives.
+  struct Case {
+    float numerator_x, numerator_y;
+    double inverse_area, base, origin_x, origin_y;
+    float largest_depth;
+    bool enabled;
+    uint32_t scale, offset, clamp, format;
+    int x, y;
+    uint32_t expected;
+  };
+  const Case cases[] = {
+      // Crysis shadow pixels (898,432) and (873,278).
+      {-0x1.9f48fp-12f, 0x1.cd868p-16f, -0x1.a298527cp-6, 0x1.fbac2p-2, 0x1.bec68p+9, 0x1.af2dp+8,
+       0x1.fbbd4ap-2f, true, 0x40cccccd, 0x00000000, 0x3ad1b717, 0x1e9, 898, 432, 0x3efddd08},
+      {-0x1.194p-21f, -0x1.3acccp-13f, -0x1.39ce91fcp-2, 0x1.fa6acep-2, 0x1.b3cc8p+9, 0x1.16b9p+8,
+       0x1.fa6ef2p-2f, true, 0x40cccccd, 0x00000000, 0x3ad1b717, 0x1e9, 873, 278, 0x3efd3682},
+      // An operand 24 binades below the other contributes nothing.
+      {-0x1.f6d93cp+4f, -0x1.2d25f2p+2f, 0x1.3d91c326p-17, 0x1.c60f1cp-2, -0x1.26cp+6, -0x1.2b1p+6,
+       0x1.c60f1cp-2f, true, 0xb644ec64, 0x3a062908, 0x00000000, 0x0, 2, 4, 0x3ed5e1a8},
+      // A negative-zero clamp is disabled.
+      {0x1.696fccp+0f, 0x1.30a2e4p+2f, -0x1.12085a3ep-13, 0x1.fed172p-2, -0x1.aa64p+6, 0x1.630cp+7,
+       0x1.fed172p-2f, true, 0xc2c52c51, 0x30b5ec82, 0x80000000, 0x0, 40, 167, 0x3ef2be94},
+      // Shifted-out bits round toward negative infinity.
+      {0x1.36a998p+2f, -0x1.bbb8b8p+3f, 0x1.417d073cp-17, 0x1.44a54p-2, -0x1.3a2cp+6, 0x1.017dp+8,
+       0x1.804fd6p-2f, true, 0xc2bdfcdb, 0xae9122e3, 0x00000000, 0x0, 29, 17, 0x3eb4d0e2},
+      // A positive clamp limits the sum.
+      {-0x1.1d2c1ep-1f, 0x1.b12fecp-5f, -0x1.05c820b8p-6, 0x1.ee0694p-2, 0x1.36c8p+6, 0x1.f11p+5,
+       0x1.1431cp-1f, true, 0x40cccccd, 0x00000000, 0x3ad1b717, 0x1e9, 82, 57, 0x3f07dd3e},
+      // A zero largest depth scales the constant by 2^-127.
+      {0x0.0p+0f, 0x0.0p+0f, 0x1.a36e2ebp-18, 0x0.0p+0, -0x1.9p+6, -0x1.9p+6, 0x0.0p+0f, true,
+       0x42000000, 0x5d800000, 0x00000000, 0x1e9, 0, 0, 0x12800000},
+      // Denormal depths flush to zero.
+      {0x0.0p+0f, 0x0.0p+0f, 0x1.a36e2ebp-18, 0x1.0p-130, -0x1.9p+6, -0x1.9p+6, 0x1.0p-130f, false,
+       0x00000000, 0x00000000, 0x00000000, 0x1e9, 0, 0, 0x00000000},
+      {0x0.0p+0f, 0x0.0p+0f, 0x1.a36e2ebp-18, 0x1.0p-126, -0x1.9p+6, -0x1.9p+6, 0x1.0p-126f, true,
+       0x00000000, 0x80c00000, 0x00000000, 0x0, 0, 0, 0x80000000},
+      // Gradients below 2^-122 flush per axis; 2^-122 itself survives.
+      {0x1.4p-125f, 0x1.4p-126f, 0x1.47ae147ap-17, 0x1.0p-120, -0x1.0p+6, -0x1.0p+6, 0x1.0008p-120f,
+       false, 0x00000000, 0x00000000, 0x00000000, 0x1e9, 0, 0, 0x03800000},
+      {0x1.0p-106f, 0x0.0p+0f, 0x1.0p-16, 0x1.0p-126, -0x1.0p+6, -0x1.0p+6, 0x1.001p-114f, false,
+       0x00000000, 0x00000000, 0x00000000, 0x1e9, 63, 0, 0x05ff2000},
+      {0x1.fffep-107f, 0x0.0p+0f, 0x1.0p-16, 0x1.0p-126, -0x1.0p+6, -0x1.0p+6, 0x1.000fp-114f,
+       false, 0x00000000, 0x00000000, 0x00000000, 0x1e9, 63, 0, 0x00800000},
+      {0x1.0p-94f, -0x1.0p-108f, 0x1.0p-16, 0x1.0p-100, -0x1.0p+6, -0x1.0p+6, 0x1.4p-100f, false,
+       0x00000000, 0x00000000, 0x00000000, 0x1e9, 0, 63, 0x0d881000},
+      // A denormal sum, slope term, or constant term flushes to zero.
+      {0x1.3ffd8p-103f, 0x1.3ffbp-104f, 0x1.47ae147ap-17, 0x1.0p-126, -0x1.0p+6, -0x1.0p+6,
+       0x1.0p-111f, true, 0x41800000, 0x83ccab33, 0x00000000, 0x0, 0, 0, 0x071acf30},
+      {0x1.3ffd8p-103f, 0x1.3ffbp-104f, 0x1.47ae147ap-17, 0x1.0p-126, -0x1.0p+6, -0x1.0p+6,
+       0x1.0p-111f, true, 0x3c800000, 0x00800000, 0x00000000, 0x0, 0, 0, 0x071ad330},
+      {0x1.3ffd8p-103f, 0x1.3ffbp-104f, 0x1.47ae147ap-17, 0x1.0p-126, -0x1.0p+6, -0x1.0p+6,
+       0x1.0p-111f, true, 0x41000000, 0x00400000, 0x00000000, 0x0, 0, 0, 0x071b9bfb},
+  };
+  for (const auto &test : cases) {
+    amdgpu::raster::DepthPlane plane{
+        amdgpu::raster::depth_gradient(test.numerator_x, test.inverse_area),
+        amdgpu::raster::depth_gradient(test.numerator_y, test.inverse_area), test.base,
+        test.origin_x, test.origin_y};
+    if (test.enabled)
+      plane.base += amdgpu::raster::depth_bias(
+          plane.dx, plane.dy, std::bit_cast<float>(test.scale) / 16.0f,
+          amdgpu::raster::depth_bias_constant(std::bit_cast<float>(test.offset), test.format,
+                                              test.largest_depth),
+          std::bit_cast<float>(test.clamp));
+    EXPECT_EQ(std::bit_cast<uint32_t>(plane.at(test.x, test.y)), test.expected);
+  }
+}
+
+TEST(GraphicsRasterMathTest, ViewportDepthClampStoresNegativeZeroAsMinimum) {
+  // A negative denormal biased depth reads back as -0 in gl_FragCoord.z on
+  // RDNA3/4, while the clamped D32 attachment holds +0.
+  const float flushed = -0.0f;
+  EXPECT_EQ(std::bit_cast<uint32_t>(amdgpu::raster::clamp_viewport_depth(flushed, 0, 1)), 0u);
+  EXPECT_EQ(amdgpu::raster::clamp_viewport_depth(flushed, 0.25f, 1), 0.25f);
+  EXPECT_EQ(amdgpu::raster::clamp_viewport_depth(-0.5f, 0, 1), 0.0f);
+  EXPECT_EQ(amdgpu::raster::clamp_viewport_depth(0.5f, 0, 1), 0.5f);
+  EXPECT_EQ(amdgpu::raster::clamp_viewport_depth(1.5f, 0, 1), 1.0f);
 }
 
 TEST(GraphicsRasterMathTest, SubpixelQuantizationRoundsMidpointsToEven) {
@@ -3115,6 +3210,7 @@ TEST_P(GraphicsExportTest, RasterCoverageFragmentInputsAndUnsupportedStates) {
     uint32_t samples = 0;
     uint32_t sample_coverage = 15;
     uint32_t inputs = 2;
+    float z_scale = 0;
     std::array<float, 4> depth_bias{};
     bool depth_only = false;
     float depth = 0;
@@ -3135,9 +3231,8 @@ TEST_P(GraphicsExportTest, RasterCoverageFragmentInputsAndUnsupportedStates) {
   const Case cases[] = {
       // This is a host-safety witness, not a physical interpolation oracle:
       // near clipping retains covered samples although the original snapped
-      // screen vertices are collinear. Their zero interpolation area produces
-      // a NaN quad center from entirely finite exported positions. The interior
-      // [1,3) scissor avoids a separate snapped-polygon coverage boundary.
+      // screen vertices are collinear. Setup now uses the clipped vertices.
+      // The interior [1,3) scissor avoids a snapped-polygon coverage boundary.
       {.name = "near clipping with collinear original snapped vertices",
        .clip_control = 1u << 19,
        .full_scissor = false,
@@ -3148,6 +3243,91 @@ TEST_P(GraphicsExportTest, RasterCoverageFragmentInputsAndUnsupportedStates) {
                                                 {0.5f + 3.0f / 2048, 0.5f + 5.0f / 2048, 1, 1},
                                                 {1.5f + 5.0f / 2048, 1.5f + 3.0f / 2048, 1, 1}}}},
       {.name = "flat first provoking vertex", .inputs = 0xaf28, .flat = true},
+      // Physical perspective I/J, noperspective I/J, and gl_FragCoord.z.
+      // Depth clipping rebuilds setup planes with the rounded far distance.
+      {.name = "near clipped inputs and depth",
+       .clip_control = (1u << 19) | (1u << 24),
+       .inputs = 0x8422,
+       .z_scale = 1,
+       .full_scissor = true,
+       .triangle = true,
+       .expected_coverage = 0x230,
+       .positions =
+           std::array<std::array<float, 4>, 3>{
+               {{-0x1.c8496ep+4f, 0x1.9df1p+5f, 0x1.6aa1a2p+4f, 0x1.d159b8p+5f},
+                {-0x1.b8ac14p+12f, -0x1.8c3a2cp+17f, -0x1.85108ep+15f, 0x1.eb96f4p+19f},
+                {-0x1.055f1ep+3f, -0x1.b24dc2p+2f, 0x1.d37004p+2f, 0x1.194c5p+3f}}},
+       .fragment_inputs =
+           FragmentInputWitness{0x10000,
+                                {0x3d83993du, 0x3535bc12u, 0x3e9757a3u, 0x3d5cc8f4u, 0x3f2729f9u}}},
+      {.name = "far clipped inputs and depth",
+       .clip_control = (1u << 19) | (1u << 24),
+       .inputs = 0x8422,
+       .z_scale = 1,
+       .full_scissor = true,
+       .triangle = true,
+       .expected_coverage = 0x10,
+       .positions =
+           std::array<std::array<float, 4>, 3>{
+               {{-0x1.2271d4p+1f, 0x1.aa99fp-3f, 0x1.9c1c6p+1f, 0x1.640a8ep+1f},
+                {-0x1.5a4034p+13f, -0x1.58fd6ep+13f, 0x1.07b3a6p+13f, 0x1.f3da4ep+13f},
+                {0x1.9e68fep-8f, -0x1.5132f2p-9f, 0x1.4ea3dcp-7f, 0x1.01573ep-7f}}},
+       .fragment_inputs =
+           FragmentInputWitness{0x10000,
+                                {0x37a44469u, 0x3f58b17eu, 0x3ed6b7fcu, 0x3c11d308u, 0x3f65033bu}}},
+      {.name = "near and far clipped inputs and depth",
+       .clip_control = (1u << 19) | (1u << 24),
+       .inputs = 0x8422,
+       .z_scale = 1,
+       .full_scissor = true,
+       .triangle = true,
+       .expected_coverage = 0x40,
+       .positions =
+           std::array<std::array<float, 4>, 3>{
+               {{0x1.cdddc6p-6f, -0x1.71adp-3f, 0x1.9bd90ep-2f, 0x1.79e09cp-2f},
+                {0x1.487172p-9f, 0x1.b8495p-9f, -0x1.c1d228p-10f, 0x1.15b4fap-8f},
+                {0x1.975676p+8f, 0x1.24d9c8p+8f, -0x1.3ff1cp+6f, 0x1.b6c514p+8f}}},
+       .fragment_inputs =
+           FragmentInputWitness{0x10002,
+                                {0x38f74cd4u, 0x3f0ef79fu, 0x3e4c0428u, 0x3f4b26eeu, 0x3f535eddu}}},
+      {.name = "far clipping interpolates near-plane residual",
+       .clip_control = (1u << 19) | (1u << 24),
+       .inputs = 0x8422,
+       .z_scale = 1,
+       .full_scissor = true,
+       .triangle = true,
+       .expected_coverage = 0x660,
+       .positions =
+           std::array<std::array<float, 4>, 3>{
+               {{0x1.95cca6p+19f, -0x1.09a082p+16f, 0x1.4a4e14p+20f, 0x1.2156ccp+20f},
+                {0x1.5b6a88p+4f, 0x1.ffd61cp+7f, 0x1.fa36dcp+6f, 0x1.21266ep+8f},
+                {-0x1.80d9a6p+1f, -0x1.608dc8p+1f, -0x1.6e003cp-3f, 0x1.ed7f2cp+1f}}},
+       .fragment_inputs =
+           FragmentInputWitness{0x10002,
+                                {0x3986b3bau, 0x3f7feeb1u, 0x3bbf0f80u, 0x3e9ae40fu, 0x3f4731d3u}}},
+      // Near-clipped W values differ by one ULP but share a setup reciprocal.
+      // Choosing the smaller W rotates all four physical barycentric inputs.
+      {.name = "clipped origin uses rounded reciprocal W",
+       .clip_control = (1u << 19) | (1u << 24),
+       .inputs = 0x8022,
+       .full_scissor = true,
+       .triangle = true,
+       .expected_coverage = 0xf0,
+       .positions =
+           std::array<std::array<float, 4>, 3>{
+               {{0x1.dc9972p+0f, 0x1.152facp-4f, 0x1.9485c2p+1f, 0x1.9e79f6p+1f},
+                {-0x1.80e7cap+2f, -0x1.466fc8p-3f, -0x1.a4759cp-3f, -0x1.a84da6p-4f},
+                {0x1.a2bebcp-4f, -0x1.4047fp-4f, -0x1.723a6cp-3f, -0x1.448e44p-4f}}},
+       .fragment_inputs =
+           FragmentInputWitness{0x10000, {0x3f4f92d6u, 0x3ddc8196u, 0xbe6e6954u, 0x3fa1b7a4u}}},
+      {.name = "guard clipping preserves tiny negative W coverage",
+       .clip_control = 1u << 19,
+       .full_scissor = true,
+       .triangle = true,
+       .expected_coverage = 0x777,
+       .positions =
+           std::array<std::array<float, 4>, 3>{
+               {{-0.75f, -0.5f, 0, -0x1.8p-39f}, {0.75f, -0.5f, 0.25f, 1}, {0, 0.75f, 0.25f, 1}}}},
       {.name = "single-sample coverage input",
        .inputs = 0xc000,
        .fragment_inputs = FragmentInputWitness{0x10001, {1}}},
@@ -3454,6 +3634,7 @@ TEST_P(GraphicsExportTest, RasterCoverageFragmentInputsAndUnsupportedStates) {
     state.context_registers[0x215] = test.shader_mask;
     state.context_registers[0x195] = 4;
     state.context_registers[0x198] = test.inputs;
+    state.context_registers[0x113] = std::bit_cast<uint32_t>(test.z_scale);
     state.context_registers[0x2f9] = 0x2d;
     state.context_registers[0x205] = 0x43f;
     state.context_registers[0x10f] = state.context_registers[0x110] =
@@ -3630,13 +3811,14 @@ TEST_P(GraphicsExportTest, RasterCoverageFragmentInputsAndUnsupportedStates) {
   }
 }
 
-TEST_P(GraphicsExportTest, DepthClippedCoverageUnionsFanAndRetainsPolygonFacing) {
+TEST_P(GraphicsExportTest, DepthClippedFanCoverageAndPolygonFacing) {
   const bool gfx12 = GetParam() == ROCJITSU_CODE_ARCH_RDNA4;
   struct Case {
     const char *name;
-    std::array<uint32_t, 4> offsets;
+    std::array<int32_t, 4> offsets;
     std::array<float, 3> depth;
     uint32_t coverage;
+    bool overlap = false;
   };
   // Raw 4x4 framebuffer masks agree on physical RDNA3/4 for all six vertex
   // permutations. Offsets are in 1/1024 screen pixels. Some snapped fan pieces
@@ -3656,6 +3838,9 @@ TEST_P(GraphicsExportTest, DepthClippedCoverageUnionsFanAndRetainsPolygonFacing)
       {"near offset control", {3, 7, 7, 3}, {-1, 1, 1}, 0x8400},
       {"far original", {3, 5, 5, 3}, {2, 0, 0}, 0x8400},
       {"unclipped collinear control", {3, 5, 5, 3}, {0, 0, 0}, 0},
+      // Additive blending on both cards confirms two invocations at (2,2)
+      // for cyclic orders and none for the three reversed orders.
+      {"overlapping snapped fan", {-11, -13, -13, -20}, {-1, 1, 1}, 0x400, true},
   };
   std::fenv_t saved;
   ASSERT_EQ(std::feholdexcept(&saved), 0);
@@ -3680,6 +3865,8 @@ TEST_P(GraphicsExportTest, DepthClippedCoverageUnionsFanAndRetainsPolygonFacing)
             !((permutation[0] > permutation[1]) ^ (permutation[0] > permutation[2]) ^
               (permutation[1] > permutation[2]));
         uint32_t expected = interior ? 0x400 : test.coverage;
+        if (test.overlap && !expected_front)
+          expected = 0;
         if ((cull == 1 && expected_front) || (cull == 2 && !expected_front))
           expected = 0;
         const uint32_t color = cull && !expected_front ? 0xff00ff00 : 0xff0000ff;
@@ -3730,7 +3917,7 @@ TEST_P(GraphicsExportTest, DepthClippedCoverageUnionsFanAndRetainsPolygonFacing)
                           {(1u << (gfx12 ? 9 : 10)) | (2u << (gfx12 ? 18 : 20)), 0, 0, 0});
         const auto dispatch = draw->advance(*access_);
         EXPECT_EQ(bool(dispatch), expected != 0);
-        uint32_t seen = 0;
+        uint32_t seen = 0, invocations = 0;
         if (dispatch) {
           for (uint32_t workgroup = 0; workgroup < dispatch->total_wgs; ++workgroup) {
             wave_->set_wg_coord(workgroup, 0, 0);
@@ -3745,7 +3932,7 @@ TEST_P(GraphicsExportTest, DepthClippedCoverageUnionsFanAndRetainsPolygonFacing)
                 ASSERT_LT(xy & 0xffff, 4u);
                 ASSERT_LT(xy >> 16, 4u);
                 const uint32_t sample = 1u << ((xy >> 16) * 4 + (xy & 0xffff));
-                EXPECT_EQ(seen & sample, 0u); // Shared fan edges must not duplicate a fragment.
+                ++invocations;
                 seen |= sample;
               }
               draw->export_lane(*wave_, lane, 0, 15,
@@ -3756,6 +3943,7 @@ TEST_P(GraphicsExportTest, DepthClippedCoverageUnionsFanAndRetainsPolygonFacing)
           EXPECT_FALSE(draw->advance(*access_));
         }
         EXPECT_EQ(seen, expected);
+        EXPECT_EQ(invocations, test.overlap ? (expected ? 2u : 0u) : std::popcount(expected));
         for (uint32_t y = 0; y < 4; ++y)
           for (uint32_t x = 0; x < 4; ++x) {
             const auto offset = gfx12 ? amdgpu::gfx12_image_offset(x, y, 4, 4, 3)
@@ -4992,6 +5180,79 @@ TEST_P(GraphicsExportTest, BcScalarLoadsPreserveFractionalInterpolationAndNormal
     amdgpu::complete_buffer_format_load(*wave_, *cu_, d);
     for (uint32_t c = 0; c < 4; ++c)
       EXPECT_EQ(wave_->debug_read_vgpr(12 + c, 0), test.expected);
+  }
+}
+
+TEST_P(GraphicsExportTest, BcScalarFilteringMatchesPhysicalPrecisionAndMipOrder) {
+  const bool gfx12 = GetParam() == ROCJITSU_CODE_ARCH_RDNA4;
+  struct Case {
+    uint32_t format, mode, sample;
+    std::array<uint32_t, 2> expected;
+    std::optional<uint32_t> gfx12_green = std::nullopt;
+  };
+  // Physical GFX1100/GFX1201 witnesses: signed floor, bilinear rounding carry,
+  // weighted-mip precision, cancellation, and the architecture's mip order.
+  // Modes select bilinear, explicit fractional LOD, or anisotropic sampling.
+  constexpr Case cases[] = {
+      {115, 0, 775, {0x3f0d33cc, 0x3f0d33cc}},
+      {116, 0, 6, {0xbd484081, 0xbd484081}},
+      {117, 1, 23, {0x3ee48dce, 0x3f1d9020}},
+      {118, 1, 45, {0x3eb6cc38, 0xbec10c18}},
+      {116, 2, 144191, {0x3ca6870e, 0x3ca6870e}},
+      {117, 2, 254703, {0x3ede7dbe, 0x3f0d856d}, 0x3f0d8575},
+      {118, 2, 225003, {0xbe2cfefe, 0xbed1aab5}},
+  };
+  wave_->set_exec(1);
+  for (const auto &test : cases) {
+    SCOPED_TRACE(test.format);
+    SCOPED_TRACE(test.sample);
+    cu_->l1_vector().invalidate_all();
+    cache_.invalidate_all();
+    const uint32_t stride = test.mode ? 512 : 256;
+    const uint32_t block = test.sample / 1024;
+    std::array<uint8_t, 512> bytes{};
+    uint32_t seed = 0xdead1234;
+    for (uint32_t i = 0; i < (block + 1) * stride; ++i) {
+      seed ^= seed << 13;
+      seed ^= seed >> 17;
+      seed ^= seed << 5;
+      if (i >= block * stride)
+        bytes[i - block * stride] = seed;
+    }
+    ASSERT_EQ(access_->write(0x100000, std::as_bytes(std::span(bytes))),
+              amdgpu::VmAccessOutcome::Complete);
+    // The 2x2 mip precedes the 4x4 base level in a two-level linear image.
+    const uint32_t mips = test.mode != 0;
+    const std::array<uint32_t, 8> descriptor{
+        0x1000,   (test.format << (gfx12 ? 17 : 20)) | (3u << 30) | (mips << (gfx12 ? 12 : 16)),
+        3u << 14, (9u << 28) | 0xfac | (mips << (gfx12 ? 15 : 16)),
+        0,        0,
+        0,        0};
+    for (uint32_t r = 0; r < descriptor.size(); ++r)
+      wave_->debug_write_sgpr(8 + r, descriptor[r]);
+    wave_->debug_write_sgpr(4, test.mode == 2 ? 0x08000892 : 0x08000092);
+    wave_->debug_write_sgpr(5, (mips * 256) << (gfx12 ? 13 : 12));
+    wave_->debug_write_sgpr(6, test.mode == 2 ? 0x08f00000 : 0x00500000 | (mips << 27));
+    wave_->debug_write_sgpr(7, 0);
+    const uint32_t phase = (test.sample / 16) % 64, lane = test.sample % 16;
+    const float u = (lane % 4 + float((phase * 37 + lane * 11) & 255) / 256) / 4;
+    const float v = (lane / 4 + float((phase * 71 + lane * 23) & 255) / 256) / 4;
+    std::array<float, 6> operands{};
+    if (test.mode == 2)
+      operands = {float(1u << (lane % 4)) / 4,
+                  float(phase % 3) / 8,
+                  float(phase % 5) / 64,
+                  (1 + float((phase / 3) % 4) / 4) / 4,
+                  u,
+                  v};
+    else
+      operands = {u, v, float((phase * 13 + lane * 47) & 255) / 256};
+    for (uint32_t r = 0; r < operands.size(); ++r)
+      wave_->debug_write_vgpr(r, 0, std::bit_cast<uint32_t>(operands[r]));
+    ASSERT_NO_FATAL_FAILURE(sample(test.mode == 2 ? 28 : test.mode == 1 ? 29 : 31, 1));
+    EXPECT_EQ(wave_->debug_read_vgpr(12, 0), test.expected[0]);
+    EXPECT_EQ(wave_->debug_read_vgpr(13, 0),
+              gfx12 ? test.gfx12_green.value_or(test.expected[1]) : test.expected[1]);
   }
 }
 
@@ -7648,6 +7909,7 @@ TEST_P(GraphicsExportTest, HardwareSampleFiltersAndAddressesUnorm8) {
     float u, v;
     std::array<uint32_t, 4> expected;
     bool srgb = false;
+    bool truncate_coordinates = false;
   };
   // Filtering results were captured with the same 2x2 texture on physical
   // gfx1100 and gfx1201. Compare raw floats, including the fractional precision.
@@ -7686,6 +7948,21 @@ TEST_P(GraphicsExportTest, HardwareSampleFiltersAndAddressesUnorm8) {
        1,
        {0x3f000000, 0x3ee16161, 0x3f0a0a0a, 0x3f206060}},
       {"nearest repeat", 0, false, false, 0, 1.25f, 0.25f, first},
+      {"nearest rounded texel boundary", 2, false, false, 0, 0.5f - 1.0f / 1024, 0.25f, second},
+      {"nearest truncated texel boundary", 2, false, false, 0, 0.5f - 1.0f / 1024, 0.25f, first,
+       false, true},
+      {"nearest below rounding boundary", 2, false, false, 0, 0.5f - 3.0f / 2048, 0.25f, first},
+      {"nearest rounded border boundary", 6, false, false, 0, -1.0f / 2048, 0.25f, first},
+      {"nearest truncated border boundary",
+       6,
+       false,
+       false,
+       0,
+       -1.0f / 2048,
+       0.25f,
+       {0, 0, 0, 0},
+       false,
+       true},
       {"linear repeat", 0, true, false, 0, 1.25f, 0.25f, first},
       {"negative repeat", 0, true, false, 0, -0.25f, 0.25f, second},
       {"mirror repeat", 1, true, false, 0, 1.25f, 0.25f, second},
@@ -7781,7 +8058,8 @@ TEST_P(GraphicsExportTest, HardwareSampleFiltersAndAddressesUnorm8) {
       SCOPED_TRACE(test.name);
       wave_->debug_write_sgpr(9, ((test.srgb ? 66u : format) << (gfx12 ? 17 : 20)) | (1u << 30));
       wave_->debug_write_sgpr(4, test.wrap | (test.wrap << 3) | (2 << 6) |
-                                     (uint32_t(test.unnormalized) << 15));
+                                     (uint32_t(test.unnormalized) << 15) |
+                                     (uint32_t(test.truncate_coordinates) << 27));
       wave_->debug_write_sgpr(5, 0);
       wave_->debug_write_sgpr(6, test.linear ? (1 << 20) | (1 << 22) : 0);
       wave_->debug_write_sgpr(7, test.border << 30);
