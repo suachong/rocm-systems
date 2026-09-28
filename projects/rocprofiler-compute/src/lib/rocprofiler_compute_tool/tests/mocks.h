@@ -111,6 +111,8 @@ public:
     void at_intercept_table_registration_hsa(rocprofiler_intercept_library_cb_t callback,
                                              void*                              user_data) override;
 
+    void query_available_agents(rocprofiler_query_available_agents_cb_t callback, void* user_data) override;
+
     struct hsa_intercept_registration_info
     {
         rocprofiler_intercept_library_cb_t callback  = nullptr;
@@ -119,6 +121,8 @@ public:
 
     // Test functions
     void set_available_counters(const std::vector<std::string>& counter_names);
+    void set_available_agents(const std::vector<rocprofiler_agent_t>& agents);
+    void set_query_available_agents_fails(bool fails);
     const std::vector<uint64_t>&                        get_created_contexts() const;
     const std::vector<uint64_t>&                        get_started_contexts() const;
     const std::vector<dispatch_counting_service_info>&  get_dispatch_counting_service_info() const;
@@ -136,6 +140,8 @@ private:
     std::vector<query_counter_record_info>       m_query_counter_record_info;
     std::vector<std::string>                     m_counter_names;
     std::vector<hsa_intercept_registration_info> m_hsa_intercept_registration_info;
+    std::vector<rocprofiler_agent_t>             m_available_agents;
+    bool                                         m_query_available_agents_fails = false;
 };
 
 class MockCountersWriter : public rocprofiler_compute_tool::CountersWriter
