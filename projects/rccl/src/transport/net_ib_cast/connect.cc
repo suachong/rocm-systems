@@ -9,6 +9,8 @@
 #include "common_cast.h"
 #include "p2p_resiliency_cast.h"
 
+#include <atomic>
+
 NCCL_PARAM(IbCastGidIndex, "IB_GID_INDEX", -1);
 NCCL_PARAM(IbCastRoutableFlidIbGidIndex, "IB_ROUTABLE_FLID_GID_INDEX", 1);
 NCCL_PARAM(IbCastRoceVersionNum, "IB_ROCE_VERSION_NUM", 2);
@@ -47,6 +49,7 @@ static int IbCastCalculateNqps(int isP2p, int localNdevs, int remoteNdevs, const
   return maxNqps;
 }
 
+
 #define NCCL_CTS_QP_SLOT_INVALID 0xFF
 enum ncclIbChannelType {
   ncclIbChannelTypeCts = 0,
@@ -60,8 +63,45 @@ struct ncclChannelToUd {
   bool udAllocated;
 };
 
+
+// Controls AINIC QP-to-UDMA assignment:
+//  - 0 channelId-based affinity,
+//  - 1 balances P2P QPs using round-robin distribution and preserving collective affinity
+//  - 2 balance all QPs using round-robin on a system-level.
+RCCL_PARAM(IbCastUDMAPolicy, "IB_UDMA_POLICY", 0);
 static ncclChannelToUd nccl_channel_ud_map[MAX_IB_DEVS][MAXCHANNELS][ncclIbChannelTypeMax];
 static bool nccl_channel_last_ud[MAX_IB_DEVS][ncclIbChannelTypeMax];
+static std::atomic<unsigned int> nccl_p2p_udma_idx[MAX_IB_DEVS] = {};
+
+enum ncclIbCastUBMA {
+  ncclIbCastUBMALow,
+  ncclIbCastUBMAHigh,
+  ncclIbCastUBMANone,
+};
+
+static ncclIbCastUBMA ncclIbCastSelectUDMA(const struct ncclIbQpCreateAttr* createQpAttrs) {
+  if (rcclParamIbCastUDMAPolicy() == 2) {
+    return ncclIbCastUBMANone;
+  }
+
+  if ((rcclParamIbCastUDMAPolicy() == 1) && createQpAttrs->isP2p) {
+    unsigned int udmaIdx = nccl_p2p_udma_idx[createQpAttrs->ibDevN].fetch_add(1, std::memory_order_relaxed);
+    bool useHighUdma = (udmaIdx & 1) != 0;
+    return useHighUdma ? ncclIbCastUBMAHigh : ncclIbCastUBMALow;
+  }
+
+  enum ncclIbChannelType channelType =
+    createQpAttrs->isDataQp ? ncclIbChannelTypeData : ncclIbChannelTypeCts;
+  ncclChannelToUd* channelToUd =
+    &nccl_channel_ud_map[createQpAttrs->ibDevN][createQpAttrs->channelId][channelType];
+  if (!channelToUd->udAllocated) {
+    bool lastUd = nccl_channel_last_ud[createQpAttrs->ibDevN][channelType];
+    channelToUd->udId = lastUd;
+    channelToUd->udAllocated = true;
+    nccl_channel_last_ud[createQpAttrs->ibDevN][channelType] = !lastUd;
+  }
+  return channelToUd->udId ? ncclIbCastUBMAHigh : ncclIbCastUBMALow;
+}
 
 static inline bool IbCastIsCtsOffloadEnabled(int isP2p) {
   return IbCastOffloadEnabled && !(isP2p && rcclParamIbCastP2pDisableCts());
@@ -423,7 +463,6 @@ static ncclResult_t ncclIbCreateQpMlx5(struct ncclIbQpCreateAttr* createQpAttrs,
 
 static ncclResult_t ncclIbCreateQpIonic(struct ncclIbQpCreateAttr* createQpAttrs, struct ncclIbQp* qp) {
   struct ibv_qp_init_attr qpInitAttr;
-  enum ncclIbChannelType channel_type = (createQpAttrs->isDataQp ? ncclIbChannelTypeData : ncclIbChannelTypeCts);
   memset(&qpInitAttr, 0, sizeof(struct ibv_qp_init_attr));
   qpInitAttr.qp_context = createQpAttrs->qpContext;
   qpInitAttr.send_cq = createQpAttrs->cq;
@@ -455,16 +494,10 @@ static ncclResult_t ncclIbCreateQpIonic(struct ncclIbQpCreateAttr* createQpAttrs
     qpInitAttr.sq_sig_all &= (~(1 << 19));
   }
 
-  if (!nccl_channel_ud_map[createQpAttrs->ibDevN][createQpAttrs->channelId][channel_type].udAllocated) {
-    bool lud = nccl_channel_last_ud[createQpAttrs->ibDevN][channel_type];
-    nccl_channel_ud_map[createQpAttrs->ibDevN][createQpAttrs->channelId][channel_type].udId = lud;
-    nccl_channel_ud_map[createQpAttrs->ibDevN][createQpAttrs->channelId][channel_type].udAllocated = true;
-    nccl_channel_last_ud[createQpAttrs->ibDevN][channel_type] =
-      !(nccl_channel_last_ud[createQpAttrs->ibDevN][channel_type]);
-  }
-  if (nccl_channel_ud_map[createQpAttrs->ibDevN][createQpAttrs->channelId][channel_type].udId) {
+  enum ncclIbCastUBMA udma_id = ncclIbCastSelectUDMA(createQpAttrs);
+  if (udma_id == ncclIbCastUBMAHigh) {
     wrap_ionicdv_pd_set_udma_mask(createQpAttrs->pd, IONIC_UDMA_MASK_HIGH);
-  } else {
+  } else if (udma_id == ncclIbCastUBMALow) {
     wrap_ionicdv_pd_set_udma_mask(createQpAttrs->pd, IONIC_UDMA_MASK_LOW);
   }
 
@@ -487,6 +520,7 @@ void IbCastBuildDataQpCreateAttr(struct ncclIbNetCommBase* base, int devIndex, s
   out->pd = devBase->pd;
   out->ibDevN = devBase->ibDevN;
   out->useIonic = IbCastAinicRoce;
+  out->isP2p = base->isP2p;
   if (base->isSend) {
     out->maxRecvWorkRequest = 0;
     out->maxSendWorkRequest = 2 * NET_IB_MAX_REQUESTS;
@@ -822,6 +856,7 @@ static ncclResult_t IbCastSenderQpsCreate(ncclIbSendComm* comm, struct ncclIbCon
     qpCreateAttrs.channelId = channelId;
     qpCreateAttrs.ibDevN = commDev->base.ibDevN;
     qpCreateAttrs.useIonic = IbCastAinicRoce;
+    qpCreateAttrs.isP2p = comm->base.isP2p;
 
     if (ibDev->ibProvider == IB_PROVIDER_MLX5 && ncclParamIbCastOooRq()) {
       if (ibDev->ar == 0) {
@@ -1049,6 +1084,7 @@ ib_recv_dev_list:
   comm->base.vProps = mergedDev->vProps;
   // Read isP2p from handle
   isP2p = handle->isP2p;
+  comm->base.isP2p = isP2p;
   comm->useCtsOffload = IbCastIsCtsOffloadEnabled(isP2p) && !handle->isRMA;
   comm->base.recvMatchingScheme = IbCastResolveRecvMatchingScheme(comm->useCtsOffload);
 
@@ -1366,6 +1402,7 @@ static ncclResult_t IbCastReceiverQpsCreateToRts(ncclIbRecvComm* rComm, struct n
     qpCreateAttrs.channelId = channelId;
     qpCreateAttrs.ibDevN = rCommDev->base.ibDevN;
     qpCreateAttrs.useIonic = IbCastAinicRoce;
+    qpCreateAttrs.isP2p = rComm->base.isP2p;
 
     if (rComm->base.resiliency) {
       IbCastResiliencyDataRqSizeGet(rComm->base.resiliency, devIndex, &qpCreateAttrs.maxRecvWorkRequest);
@@ -1479,6 +1516,7 @@ static ncclResult_t IbCastReceiverQpsCreateToRts(ncclIbRecvComm* rComm, struct n
       qpCreateAttrs.channelId = channelId;
       qpCreateAttrs.ibDevN = rCommDev->base.ibDevN;
       qpCreateAttrs.useIonic = IbCastAinicRoce;
+      qpCreateAttrs.isP2p = rComm->base.isP2p;
 
       NCCLCHECK(IbCastQpCreate(&rCommDev->gpuFlush.qp, &qpCreateAttrs));
       rCommDev->gpuFlush.qp.channelId = channelId;
@@ -1652,6 +1690,7 @@ ib_recv:
   /* copy back the received info */
   memcpy(&remMeta, stage->buffer, sizeof(struct ncclIbConnectionMetadata));
 
+  rComm->base.isP2p = remMeta.isP2p;
   rComm->useCtsOffload = IbCastIsCtsOffloadEnabled(remMeta.isP2p) && !remMeta.isRMA;
   rComm->base.recvMatchingScheme = IbCastResolveRecvMatchingScheme(rComm->useCtsOffload);
   INFO(NCCL_NET, "NET/IB: ncclIbAccept isP2p=%d isRMA=%d useCtsOffload=%d (IbP2pDisableCts=%ld) recvMatchingScheme=%d",
