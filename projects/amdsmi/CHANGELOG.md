@@ -62,6 +62,8 @@ Full documentation for amd_smi_lib is available at [https://rocm.docs.amd.com/pr
 
 ### Resolved Issues
 
+- Fixed nearest-GPU topology ordering to sort by hop count, then link weight, with equal pairs treated as equivalent.
+
 - **Fixed `rsmi_dev_reg_table_get()` failing on register-state images that contain no SMN entries**.  
   - The loop-back test ran before the SMN and instance counters reached zero, so an image with no SMN entries re-entered the loop and read past the end of the image; the call then returned an error for a well-formed file.
 
