@@ -199,18 +199,19 @@ struct ReduceOp<T, 4> {
   }
 };
 
-// NCCL lowers floating-point Avg to PreMulSum: each source is multiplied by
-// 1 / nRanks in the source datatype before the sum. CE currently instantiates
-// Avg only for BF16, the gradient datatype used by Primus GPT-OSS. Keeping the
-// pre-op in the persistent reduce avoids a separate full-buffer scaling pass.
+// Symmetric ReduceScatter lowers floating-point Avg to SumPostDiv. CE currently
+// instantiates Avg only for BF16, the gradient datatype used by Primus GPT-OSS.
+// Accumulate first and scale once at the output: compared with applying 1/nRanks
+// to every rank input, this removes nRanks-1 multiplies per output element and
+// avoids rounding every source before the reduction.
 template <typename T, int RedOp>
-struct CeReducePreOp {
+struct CeReducePostOp {
   __device__ __forceinline__ static T apply(T value, int /*nRanks*/) {
     return value;
   }
 };
 template <>
-struct CeReducePreOp<hip_bfloat16, 4> {
+struct CeReducePostOp<hip_bfloat16, 4> {
   __device__ __forceinline__ static hip_bfloat16 apply(hip_bfloat16 value, int nRanks) {
     const hip_bfloat16 scale = (hip_bfloat16)(1.0f / (float)nRanks);
     return (hip_bfloat16)((float)value * (float)scale);
@@ -315,10 +316,6 @@ __global__ __launch_bounds__(256) void ncclCeLocalReduceKernelVec(
       for (int i = 0; i < U; i++) {
         size_t elementOffset = (vi + (size_t)i * stride) * W;
         acc[i].vec = *reinterpret_cast<const LT*>(slotIn + elementOffset);
-        if constexpr (RedOp == 4) {
-#pragma unroll
-          for (int k = 0; k < W; k++) acc[i].v[k] = CeReducePreOp<T, RedOp>::apply(acc[i].v[k], nRanks);
-        }
       }
 #ifdef CE_REDUCE_VECTORIZE_OK
 #pragma clang loop unroll(disable)
@@ -338,8 +335,7 @@ __global__ __launch_bounds__(256) void ncclCeLocalReduceKernelVec(
           // W is small and a compile-time constant, and any
           // pragma here regresses runtime performance.
           for (int k = 0; k < W; k++) {
-            acc[i].v[k] =
-              ReduceOp<T, RedOp>::apply(acc[i].v[k], CeReducePreOp<T, RedOp>::apply(tmp[i].v[k], nRanks));
+            acc[i].v[k] = ReduceOp<T, RedOp>::apply(acc[i].v[k], tmp[i].v[k]);
           }
         }
       }
@@ -347,6 +343,10 @@ __global__ __launch_bounds__(256) void ncclCeLocalReduceKernelVec(
       for (int i = 0; i < U; i++) {
         size_t outOffset = (vi + (size_t)i * stride) * W;
         T* dst = chunkOut + outOffset;
+        if constexpr (RedOp == 4) {
+#pragma unroll
+          for (int k = 0; k < W; k++) acc[i].v[k] = CeReducePostOp<T, RedOp>::apply(acc[i].v[k], nRanks);
+        }
         if ((reinterpret_cast<uintptr_t>(dst) & 15) == 0) {
           *reinterpret_cast<LT*>(dst) = acc[i].vec;
         } else {
@@ -363,10 +363,6 @@ __global__ __launch_bounds__(256) void ncclCeLocalReduceKernelVec(
       for (size_t vIdx = vectorTailStart + tid; vIdx < nVec; vIdx += stride) {
         Pack acc;
         acc.vec = *reinterpret_cast<const LT*>(slotIn + vIdx * W);
-        if constexpr (RedOp == 4) {
-#pragma unroll
-          for (int k = 0; k < W; k++) acc.v[k] = CeReducePreOp<T, RedOp>::apply(acc.v[k], nRanks);
-        }
 #ifdef CE_REDUCE_VECTORIZE_OK
 #pragma clang loop unroll(disable)
 #else
@@ -378,10 +374,14 @@ __global__ __launch_bounds__(256) void ncclCeLocalReduceKernelVec(
           tmp.vec = *reinterpret_cast<const LT*>(slotIn + rankOffset);
           // no pragma here, same rationale as the twin loop in the strided-unroll section above.
           for (int k = 0; k < W; k++) {
-            acc.v[k] = ReduceOp<T, RedOp>::apply(acc.v[k], CeReducePreOp<T, RedOp>::apply(tmp.v[k], nRanks));
+            acc.v[k] = ReduceOp<T, RedOp>::apply(acc.v[k], tmp.v[k]);
           }
         }
         T* dst = chunkOut + vIdx * W;
+        if constexpr (RedOp == 4) {
+#pragma unroll
+          for (int k = 0; k < W; k++) acc.v[k] = CeReducePostOp<T, RedOp>::apply(acc.v[k], nRanks);
+        }
         if ((reinterpret_cast<uintptr_t>(dst) & 15) == 0) {
           *reinterpret_cast<LT*>(dst) = acc.vec;
         } else {
@@ -395,13 +395,13 @@ __global__ __launch_bounds__(256) void ncclCeLocalReduceKernelVec(
     if (tailBase < currentChunkElems) {
       for (size_t i = tid; tailBase + i < currentChunkElems; i += stride) {
         size_t globalIdx = tailBase + i;
-        T a = CeReducePreOp<T, RedOp>::apply(slotIn[globalIdx], nRanks);
+        T a = slotIn[globalIdx];
         // No pragma here, unneeded
         for (int r = 1; r < nRanks; r++) {
           T v = slotIn[(size_t)r * slotChunkElems + globalIdx];
-          a = ReduceOp<T, RedOp>::apply(a, CeReducePreOp<T, RedOp>::apply(v, nRanks));
+          a = ReduceOp<T, RedOp>::apply(a, v);
         }
-        chunkOut[globalIdx] = a;
+        chunkOut[globalIdx] = CeReducePostOp<T, RedOp>::apply(a, nRanks);
       }
     }
     if (totalSteps > NCCL_CE_NUM_SLOTS) {

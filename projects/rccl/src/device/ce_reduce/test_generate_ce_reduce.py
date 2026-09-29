@@ -353,6 +353,11 @@ class CeReducePersistentContractTest(unittest.TestCase):
         self.assertIn("int ncclCeLocalReduceMaxBlocks()", dispatcher)
         self.assertIn("(size_t)ncclCeLocalReduceMaxBlocks()", self.impl)
 
+    def test_bf16_avg_scales_once_after_reduction(self) -> None:
+        self.assertIn("struct CeReducePostOp<hip_bfloat16, 4>", self.impl)
+        self.assertNotIn("CeReducePreOp", self.impl)
+        self.assertIn("CeReducePostOp<T, RedOp>::apply(a, nRanks)", self.impl)
+
     def test_launch_bounds_matches_launcher_thread_count(self) -> None:
         bounds = re.search(r"__launch_bounds__\((\d+)\)", self.impl)
         threads = re.search(r"const int threads\s*=\s*(\d+);", self.launcher)
