@@ -6,6 +6,7 @@
 #include "util/amdgpu_log.h"
 #include "util/amdgpu_rcp.h"
 #include "util/amdgpu_rsq.h"
+#include "util/amdgpu_sqrt.h"
 #include "util/amdgpu_trig.h"
 
 #include <array>
@@ -71,6 +72,14 @@ template <typename Coefficient, size_t N> constexpr auto columns(const Coefficie
 }
 inline constexpr auto exp_columns = columns(util::detail::exp::coefficients);
 inline constexpr auto log_columns = columns(util::detail::log::coefficients);
+inline constexpr auto sqrt_columns = columns(util::detail::sqrt::coefficients);
+[[gnu::target("avx512f,avx512dq,avx512cd,avx2"), gnu::always_inline]] inline V
+table_coefficient(V index, const uint32_t *table) {
+  auto indices = _mm512_zextsi256_si512(_mm512_cvtepi64_epi32(index));
+  auto values =
+      _mm512_permutex2var_epi32(_mm512_loadu_si512(table), indices, _mm512_loadu_si512(table + 16));
+  return _mm512_cvtepu32_epi64(_mm512_castsi512_si256(values));
+}
 template <bool Logarithm, unsigned Field>
 [[gnu::target("avx512f,avx512dq,avx512cd,avx2"), gnu::always_inline]] inline V
 coefficient(V index) {
@@ -79,10 +88,7 @@ coefficient(V index) {
     table = log_columns[Field].data();
   else
     table = exp_columns[Field].data();
-  auto indices = _mm512_zextsi256_si512(_mm512_cvtepi64_epi32(index));
-  auto values =
-      _mm512_permutex2var_epi32(_mm512_loadu_si512(table), indices, _mm512_loadu_si512(table + 16));
-  V result = _mm512_cvtepu32_epi64(_mm512_castsi512_si256(values));
+  V result = table_coefficient(index, table);
   if constexpr (Logarithm)
     result = select(_mm512_cmpeq_epi64_mask(index, constant(32)), constant(log_columns[Field][32]),
                     result);
@@ -469,6 +475,58 @@ trig_batch(const uint32_t *input, uint32_t *output, unsigned denorm, bool quiet_
   _mm256_storeu_si256(reinterpret_cast<__m256i *>(output), narrowed);
 }
 
+[[gnu::target("avx512f,avx512dq,avx512cd,avx2"), gnu::noinline]] void
+sqrt_batch(const uint32_t *input, uint32_t *output, bool quiet_snan) {
+  V bits = _mm512_cvtepu32_epi64(_mm256_loadu_si256(reinterpret_cast<const __m256i *>(input)));
+  V magnitude = band(bits, 0x7fffffff), sign = band(bits, 0x80000000);
+  V exponent = _mm512_srli_epi64(magnitude, 23);
+  V parity = band(_mm512_xor_si512(exponent, constant(1)), 1);
+  V index = _mm512_or_si512(_mm512_slli_epi64(parity, 23), band(bits, 0x7fffff));
+  V segment = _mm512_srli_epi64(index, 19), fraction = band(index, 0x7ffff);
+  V product = mul(table_coefficient(segment, sqrt_columns[1].data()), fraction);
+  V bias = select(_mm512_cmpge_epu64_mask(product, constant(uint64_t{1} << 40)), constant(1u << 16),
+                  constant(1u << 15));
+  V linear = _mm512_srli_epi64(add(product, bias), 17);
+  V square_input = band(fraction, ~uint64_t{3});
+  V square = _mm512_srli_epi64(mul(square_input, square_input), 14);
+  V inner =
+      add(_mm512_slli_epi64(table_coefficient(segment, sqrt_columns[2].data()), 8),
+          _mm512_srai_epi64(
+              sub(constant(256), mul(table_coefficient(segment, sqrt_columns[3].data()), fraction)),
+              10));
+  V quadratic = mul(inner, square);
+  V negated =
+      select(_mm512_cmpge_epu64_mask(quadratic, constant(uint64_t{1} << 47)),
+             _mm512_slli_epi64(_mm512_srai_epi64(sub(constant(1u << 23), quadratic), 24), 1),
+             _mm512_srai_epi64(sub(constant(1u << 22), quadratic), 23));
+  V sum = add(_mm512_slli_epi64(table_coefficient(segment, sqrt_columns[0].data()), 22),
+              add(_mm512_slli_epi64(linear, 19), _mm512_slli_epi64(negated, 12)));
+  V result = add(constant(0x3f800000), round_even<24>(sum));
+  V adjustment = _mm512_srai_epi64(sub(sub(exponent, constant(127)), parity), 1);
+  result = add(result, _mm512_slli_epi64(adjustment, 23));
+  result = select(_mm512_cmpneq_epi64_mask(sign, constant(0)), constant(0xffc00000), result);
+  result = select(_mm512_cmplt_epu64_mask(magnitude, constant(0x00800000)), sign, result);
+  result = select(_mm512_cmpeq_epi64_mask(bits, constant(0x7f800000)), bits, result);
+  result = select(_mm512_cmpgt_epu64_mask(magnitude, constant(0x7f800000)),
+                  _mm512_or_si512(bits, constant(quiet_snan ? 0x00400000 : 0)), result);
+
+  V remainder = band(sum, (1u << 24) - 1);
+  unsigned corrections = _mm512_cmpge_epu64_mask(remainder, constant((1u << 23) - 8192)) &
+                         _mm512_cmple_epu64_mask(remainder, constant((1u << 23) + 8192)) &
+                         _mm512_cmpge_epu64_mask(bits, constant(0x00800000)) &
+                         _mm512_cmplt_epu64_mask(bits, constant(0x7f800000));
+  // Capture indices before storing: input and output can alias.
+  uint32_t indices[8];
+  if (corrections)
+    _mm256_storeu_si256(reinterpret_cast<__m256i *>(indices), _mm512_cvtepi64_epi32(index));
+  _mm256_storeu_si256(reinterpret_cast<__m256i *>(output), _mm512_cvtepi64_epi32(result));
+  while (corrections) {
+    const unsigned lane = std::countr_zero(corrections);
+    corrections &= corrections - 1;
+    output[lane] = util::detail::amdgpu_sqrt_correct(indices[lane], output[lane]);
+  }
+}
+
 #endif
 uint32_t scalar(F32Operation operation, uint32_t bits, unsigned denorm, bool quiet) {
   switch (operation) {
@@ -484,6 +542,8 @@ uint32_t scalar(F32Operation operation, uint32_t bits, unsigned denorm, bool qui
     return std::bit_cast<uint32_t>(util::amdgpu_rcp_f32(std::bit_cast<float>(bits)));
   case F32Operation::Rsq:
     return std::bit_cast<uint32_t>(util::amdgpu_rsq_f32(std::bit_cast<float>(bits)));
+  case F32Operation::Sqrt:
+    return util::detail::amdgpu_sqrt_bits(bits, quiet);
   }
   return 0;
 }
@@ -518,6 +578,10 @@ void evaluate_f32_simd(F32Operation operation, const uint32_t *input, uint32_t *
     case F32Operation::Cos:
       for (std::size_t i = 0; i < count; i += 8)
         trig_batch<true>(input + i, output + i, denorm, quiet_snan);
+      break;
+    case F32Operation::Sqrt:
+      for (std::size_t i = 0; i < count; i += 8)
+        sqrt_batch(input + i, output + i, quiet_snan);
       break;
     case F32Operation::Rcp:
     case F32Operation::Rsq:

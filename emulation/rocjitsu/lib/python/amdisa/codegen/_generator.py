@@ -14394,12 +14394,10 @@ class CodeGenerator:
                 include_integer_transcendentals=False,
             )
             if mnemonic.rsplit('_', 1)[0].upper() in FLUSH_NEAREST_F32_OPS:
-                # LOG/EXP ignore guest rounding. Even the integer batch can
+                # LOG/EXP/SQRT ignore guest rounding. Even the integer batch can
                 # allocate cold destination storage, so retain its original
                 # environment. OMOD and clamp also need this FP policy.
                 lines.append('  fp_mode::ScopedEnvironment environment(0);')
-            if integer_probe is not None:
-                lines.append(integer_probe)
             alu_classifiers = {
                 'v_mul_f32_vop2': 'classify_mul_f32_vop2',
                 'v_mul_f32_vop3': 'classify_mul_f32_vop3',
@@ -14431,12 +14429,14 @@ class CodeGenerator:
                 # such return; the classifier separately records the transient
                 # per-instruction causes used for trap delivery.
                 lines.append('  wf.set_trapsts(wf.trapsts() | alu_causes);')
-            if probe is not None:
+            for candidate in (integer_probe, probe):
+                if candidate is None:
+                    continue
                 if classifier is None:
-                    lines.append(probe)
+                    lines.append(candidate)
                 else:
                     lines.append('  if (!alu_exception_trap_enables(wf)) {')
-                    lines.append(probe.replace('  ', '    ', 1))
+                    lines.append(candidate.replace('  ', '    ', 1))
                     lines.append('  }')
             lines.append(prefixed_body)
             lines.append('}')

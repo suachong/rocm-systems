@@ -634,7 +634,8 @@ SIMD_VOP1_UNARY: dict[str, tuple[str, str, str]] = {
     'v_sqrt_f32_vop1': (
         'float32_t',
         'float32_t',
-        '[](auto a) { return util::sqrt_f32_simd(a); }',
+        '[&wf](auto a) { return util::sqrt_f32_simd(a, '
+        'amdgpu::fp_mode::quiets_nan(wf.cu().arch(), wf.ieee_mode())); }',
     ),
     # LOG and EXP share their integer scalar mappings. Their complete
     # instruction bodies save the host environment for output scaling.
@@ -712,8 +713,8 @@ SIMD_VOP1_UNARY: dict[str, tuple[str, str, str]] = {
         ' auto f = util::f16_to_f32_simd(a);'
         ' return util::f32_to_f16_simd(f - util::floor_simd(f)); }',
     ),
-    # f16 transcendentals operate on promoted inputs. RSQ applies the F16
-    # input-denormal policy; the other operations reuse the F32 helpers.
+    # f16 transcendentals operate on promoted inputs. RSQ/SQRT apply the F16
+    # input-denormal policy; RCP reuses its F32 helper.
     'v_rcp_f16_vop1': (
         'uint32_t',
         'uint32_t',
@@ -730,8 +731,10 @@ SIMD_VOP1_UNARY: dict[str, tuple[str, str, str]] = {
     'v_sqrt_f16_vop1': (
         'uint32_t',
         'uint32_t',
-        '[](auto a) {'
-        ' return util::f32_to_f16_simd(util::sqrt_f32_simd(util::f16_to_f32_simd(a))); }',
+        '[&wf](auto a) {'
+        ' return util::f32_to_f16_simd(util::sqrt_f16_simd(util::f16_to_f32_simd(a), '
+        'wf.fp_denorm_mode_f16_f64(), '
+        'amdgpu::fp_mode::quiets_nan(wf.cu().arch(), wf.ieee_mode()))); }',
     ),
     # Half LOG/EXP rounds once before applying output modifiers.
     'v_exp_f16_vop1': (
@@ -2019,8 +2022,8 @@ SIMD_VOP3_UNARY_FP64: dict[str, str] = {
 
 
 # VOP3 f16 unary operations widen to f32 for modifiers and narrow the result.
-# Rounding and SQRT preserve input denormals; RCP uses the f32 helper.
-# RSQ applies half denormal policy. LOG/EXP use log_exp_f16_simd to apply
+# Rounding preserves input denormals; RCP uses the f32 helper.
+# RSQ/SQRT apply half denormal policy. LOG/EXP use log_exp_f16_simd to apply
 # half denormal, overflow and NaN policies and round to f16 before OMOD.
 SIMD_VOP3_UNARY_FP16: dict[str, str] = {
     'v_ceil_f16_vop3': '[](auto a) { return util::ceil_simd(a); }',
@@ -2028,11 +2031,8 @@ SIMD_VOP3_UNARY_FP16: dict[str, str] = {
     'v_trunc_f16_vop3': '[](auto a) { return util::trunc_simd(a); }',
     'v_rndne_f16_vop3': '[](auto a) { return util::rndne_simd(a); }',
     'v_sqrt_f16_vop3': (
-        '[](auto a) {'
-        ' auto r = util::stdx::sqrt(a);'
-        ' util::stdx::where(util::stdx::isnan(a), r) = a;'
-        ' util::stdx::where(a < 0.0f, r) = std::numeric_limits<float>::quiet_NaN();'
-        ' return r; }'
+        '[&wf](auto a) { return util::sqrt_f16_simd(a, wf.fp_denorm_mode_f16_f64(), '
+        'amdgpu::fp_mode::quiets_nan(wf.cu().arch(), wf.ieee_mode())); }'
     ),
     'v_rcp_f16_vop3': '[](auto a) { return util::rcp_f32_simd(a); }',
     'v_rsq_f16_vop3': (
@@ -2642,6 +2642,7 @@ def integer_transcendental_probe_line(
         'v_cos_f32': 'Cos',
         'v_rcp_f32': 'Rcp',
         'v_rsq_f32': 'Rsq',
+        'v_sqrt_f32': 'Sqrt',
     }.get(base)
     if transcendental and form in ('vop1', 'vop3') and not true16_vop3:
         return (

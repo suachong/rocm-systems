@@ -427,7 +427,8 @@ def gen_vector_unary(
             L.extend(vop3_src_mod('s', 0, has_abs))
         math_map_f16 = {
             'rcp': '1.0f / s',
-            'sqrt': 'std::sqrt(s)',
+            'sqrt': 'amdgpu::transcendental::sqrt_f16(s, wf.fp_denorm_mode_f16_f64(), '
+            'amdgpu::fp_mode::quiets_nan(wf.cu().arch(), wf.ieee_mode()))',
             'rsq': 'amdgpu::transcendental::rsq_f16(s, wf.fp_denorm_mode_f16_f64())',
             'floor': 'std::floor(s)',
             'ceil': 'std::ceil(s)',
@@ -479,7 +480,8 @@ def gen_vector_unary(
         math_map = {
             'rcp': 'amdgpu::transcendental::rcp_f32(s)',
             'rcp_iflag': 'amdgpu::transcendental::rcp_f32(s)',
-            'sqrt': 'amdgpu::transcendental::sqrt_f32(s)',
+            'sqrt': 'amdgpu::transcendental::sqrt_f32(s, '
+            'amdgpu::fp_mode::quiets_nan(wf.cu().arch(), wf.ieee_mode()))',
             'rsq': 'amdgpu::transcendental::rsq_f32(s)',
             'floor': 'std::floor(s)',
             'ceil': 'std::ceil(s)',

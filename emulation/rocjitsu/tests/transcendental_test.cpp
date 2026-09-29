@@ -100,6 +100,40 @@ TEST(TranscendentalTest, SqrtF32SpecialCases) {
   EXPECT_EQ(sqrt_f32(std::numeric_limits<float>::infinity()),
             std::numeric_limits<float>::infinity());
   EXPECT_FLOAT_EQ(sqrt_f32(4.0f), 2.0f);
+  EXPECT_EQ(std::bit_cast<uint32_t>(sqrt_f32(std::bit_cast<float>(0x7fa12345u), false)),
+            0x7fa12345u);
+}
+
+TEST(TranscendentalTest, SqrtF32MatchesPhysicalRdna3AndRdna4) {
+  // Raw words captured on gfx1100 and gfx1201. Rows exercise, in order: a Crysis shader
+  // input, round-half-even ties, square truncation, the dropped square-input bits, the
+  // linear rounding shift, the cubic-product bias, product normalization, sparse residuals,
+  // exponent edges, and special values.
+  const uint32_t cases[][2] = {
+      {0x3f7a2707u, 0x3f7d0f30u}, {0x3f800001u, 0x3f800000u}, {0x3f800005u, 0x3f800002u},
+      {0x3f80005fu, 0x3f800030u}, {0x3f8015eeu, 0x3f800af7u}, {0x4005a8f7u, 0x3fb8fa71u},
+      {0x3f823902u, 0x3f811b48u}, {0x4006e699u, 0x3fb9d5bau}, {0x3f8339a8u, 0x3f819a42u},
+      {0x400659f1u, 0x3fb974bfu}, {0x00800001u, 0x20000000u}, {0x00ffffffu, 0x203504f3u},
+      {0x01000001u, 0x203504f4u}, {0x3fffffffu, 0x3fb504f3u}, {0x407fffffu, 0x3fffffffu},
+      {0x7e800001u, 0x5f000000u}, {0x7f7fffffu, 0x5f7fffffu}, {0x00000000u, 0x00000000u},
+      {0x80000000u, 0x80000000u}, {0x00000001u, 0x00000000u}, {0x80000001u, 0x80000000u},
+      {0xbf800000u, 0xffc00000u}, {0xff800000u, 0xffc00000u}, {0x7f800000u, 0x7f800000u},
+      {0x7fa12345u, 0x7fe12345u}, {0xffa12345u, 0xffe12345u},
+  };
+  for (const auto &test : cases)
+    EXPECT_EQ(std::bit_cast<uint32_t>(sqrt_f32(std::bit_cast<float>(test[0]))), test[1])
+        << std::hex << test[0];
+}
+
+TEST(TranscendentalTest, SqrtF32CompleteNormalizedHardwareDigest) {
+  // FNV-style hash of raw result words captured independently on gfx1100 and gfx1201.
+  // Cover every mantissa in both exponent parities without storing the 64 MiB capture.
+  uint64_t digest = 14695981039346656037ull;
+  for (uint32_t index = 0; index < (1u << 24); ++index) {
+    const float input = std::bit_cast<float>(0x3f800000u + index);
+    digest = (digest ^ std::bit_cast<uint32_t>(sqrt_f32(input))) * 1099511628211ull;
+  }
+  EXPECT_EQ(digest, 0x514d49d31f12176bull);
 }
 
 TEST(TranscendentalTest, LogF32SpecialCases) {

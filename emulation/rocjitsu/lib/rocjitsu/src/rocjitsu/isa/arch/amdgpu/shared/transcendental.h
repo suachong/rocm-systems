@@ -9,12 +9,12 @@
 /// These reference implementations produce results within the ULP accuracy
 /// specified by the ISA manuals (typically 1 ULP for f32, 2 ULP for f64).
 /// They are used by the simulator's execute() bodies for V_RCP_F32,
-/// V_RSQ_F32, V_RSQ_F16, V_SQRT_F32, V_LOG_F32, V_EXP_F32, V_SIN_F32, V_COS_F32,
+/// V_RSQ_F32, V_RSQ_F16, V_SQRT_F32, V_SQRT_F16, V_LOG_F32, V_EXP_F32, V_SIN_F32, V_COS_F32,
 /// V_RCP_F64, V_RSQ_F64, V_SQRT_F64.
-/// F32 reciprocal and F32/F16 reciprocal square root match the captured RDNA3/4 mappings.
-/// F16 RSQ applies the half input-denormal policy after promotion to F32.
-/// F32 LOG/EXP and SIN/COS use staged integer arithmetic modeled from RDNA3/4 captures,
-/// including coordinate truncation and intermediate product rounding.
+/// F32 reciprocal, square root and F32/F16 reciprocal square root match the captured RDNA3/4
+/// mappings. F16 RSQ/SQRT apply the half input-denormal policy after promotion to F32. F32 LOG/EXP
+/// and SIN/COS use staged integer arithmetic modeled from RDNA3/4 captures, including coordinate
+/// truncation and intermediate product rounding.
 ///
 /// All functions handle special cases (NaN, Inf, denormals, ±0) per the
 /// AMD ISA specification.
@@ -24,6 +24,7 @@
 #include "util/amdgpu_log.h"
 #include "util/amdgpu_rcp.h"
 #include "util/amdgpu_rsq.h"
+#include "util/amdgpu_sqrt.h"
 #include "util/amdgpu_trig.h"
 #include "util/simd.h"
 
@@ -37,18 +38,6 @@ namespace rocjitsu {
 namespace amdgpu {
 namespace transcendental {
 
-/// @brief Flush f32 denormals to sign-preserving zero.
-///
-/// @details SQRT flushes input denormals regardless of the shader's
-/// denorm mode. LOG and EXP handle denormals inside their shared integer
-/// mappings and do not use this helper.
-inline float flush_denorm_f32(float x) {
-  uint32_t bits = std::bit_cast<uint32_t>(x);
-  if ((bits & 0x7F800000u) == 0 && (bits & 0x007FFFFFu) != 0)
-    return std::copysign(0.0f, x);
-  return x;
-}
-
 /// @brief AMD single-precision reciprocal matching physical RDNA3/4 (within 1 ULP).
 inline float rcp_f32(float x) { return util::amdgpu_rcp_f32(x); }
 
@@ -58,14 +47,14 @@ inline float rsq_f32(float x) { return util::amdgpu_rsq_f32(x); }
 /// @brief F16 reciprocal square root in the promoted F32 domain, with F16 input policy.
 inline float rsq_f16(float x, uint32_t denorm_mode) { return util::amdgpu_rsq_f16(x, denorm_mode); }
 
-/// @brief sqrt(x) (single-precision square root, correctly-rounded).
-inline float sqrt_f32(float x) {
-  x = flush_denorm_f32(x);
-  if (std::isnan(x))
-    return std::bit_cast<float>(std::bit_cast<uint32_t>(x) | 0x00400000u);
-  if (x < 0.0f)
-    return std::numeric_limits<float>::quiet_NaN();
-  return std::sqrt(x);
+/// @brief Single-precision square root matching physical RDNA3/4 (within 1 ULP).
+inline float sqrt_f32(float x, bool quiet_snan = true) {
+  return util::amdgpu_sqrt_f32(x, quiet_snan);
+}
+
+/// @brief Square root on promoted half inputs, with the F16 input-denormal policy.
+inline float sqrt_f16(float x, uint32_t denorm_mode, bool quiet_snan = true) {
+  return util::amdgpu_sqrt_f16(x, denorm_mode, quiet_snan);
 }
 
 /// @brief log2(x) using the captured RDNA3/4 reduction and staged approximation.

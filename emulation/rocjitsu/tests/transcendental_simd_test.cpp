@@ -13,6 +13,7 @@
 #include "util/amdgpu_log.h"
 #include "util/amdgpu_rcp.h"
 #include "util/amdgpu_rsq.h"
+#include "util/amdgpu_sqrt.h"
 #include "util/amdgpu_trig.h"
 #include "util/simd_test_hooks.h"
 
@@ -34,12 +35,15 @@ using namespace rocjitsu;
 using amdgpu::transcendental::evaluate_f32_simd;
 using amdgpu::transcendental::F32Operation;
 constexpr std::array operations{F32Operation::Log, F32Operation::Exp, F32Operation::Sin,
-                                F32Operation::Cos, F32Operation::Rcp, F32Operation::Rsq};
-constexpr std::array<uint32_t, 32> edges{
-    0,          0x80000000, 1,          0x80000001, 0x007fffff, 0x00800000, 0x33800000, 0xb3800000,
-    0x39bfffff, 0x39c00000, 0x3d000001, 0x3d7fffff, 0x3e000000, 0x3e800001, 0x3f7bffff, 0x3f7c0000,
-    0x3f7dffff, 0x3f7e0000, 0x3f7fffff, 0x3f800000, 0x3f800001, 0x3f810000, 0x3f820000, 0x3f83ffff,
-    0x3f840000, 0xbf800000, 0x43000000, 0xc2fc0001, 0x7f800000, 0xff800000, 0x7f812345, 0xffc12345};
+                                F32Operation::Cos, F32Operation::Rcp, F32Operation::Rsq,
+                                F32Operation::Sqrt};
+constexpr std::array<uint32_t, 40> edges{
+    0, 0x80000000, 1, 0x80000001, 0x007fffff, 0x00800000, 0x33800000, 0xb3800000, 0x39bfffff,
+    0x39c00000, 0x3d000001, 0x3d7fffff, 0x3e000000, 0x3e800001, 0x3f7bffff, 0x3f7c0000, 0x3f7dffff,
+    0x3f7e0000, 0x3f7fffff, 0x3f800000, 0x3f800001, 0x3f810000, 0x3f820000, 0x3f83ffff, 0x3f840000,
+    0xbf800000, 0x43000000, 0xc2fc0001, 0x7f800000, 0xff800000, 0x7f812345, 0xffc12345,
+    // SQRT residuals and staged-rounding boundaries, including both correction signs.
+    0x3f7a2707, 0x3f8339a8, 0x400659f1, 0x4006e699, 0x4005a8f7, 0x3f823902, 0x3f8015ee, 0x3f80005f};
 uint32_t reference(F32Operation op, uint32_t bits, unsigned denorm, bool quiet) {
   switch (op) {
   case F32Operation::Log:
@@ -54,6 +58,8 @@ uint32_t reference(F32Operation op, uint32_t bits, unsigned denorm, bool quiet) 
     return std::bit_cast<uint32_t>(util::amdgpu_rcp_f32(std::bit_cast<float>(bits)));
   case F32Operation::Rsq:
     return std::bit_cast<uint32_t>(util::amdgpu_rsq_f32(std::bit_cast<float>(bits)));
+  case F32Operation::Sqrt:
+    return util::detail::amdgpu_sqrt_bits(bits, quiet);
   }
   return 0;
 }
@@ -153,14 +159,14 @@ TEST(TranscendentalSimd, DecodedInstructionsPreserveMasksAliasesAndBroadcasts) {
                   continue;
                 const uint32_t dst = alias ? 0 : 6;
                 // Same independently assembled opcodes as the FP MODE fixtures.
-                const uint32_t e32_rdna[]{0x7e004f00, 0x7e004b00, 0x7e006b00,
-                                          0x7e006d00, 0x7e005500, 0x7e005d00};
-                const uint32_t e32_gcn[]{0x7e004300, 0x7e004100, 0x7e005300,
-                                         0x7e005500, 0x7e004500, 0x7e004900};
-                const uint32_t e64_rdna[]{0xd5a70000, 0xd5a50000, 0xd5b50000,
-                                          0xd5b60000, 0xd5aa0000, 0xd5ae0000};
-                const uint32_t e64_gcn[]{0xd1610000, 0xd1600000, 0xd1690000,
-                                         0xd16a0000, 0xd1620000, 0xd1640000};
+                const uint32_t e32_rdna[]{0x7e004f00, 0x7e004b00, 0x7e006b00, 0x7e006d00,
+                                          0x7e005500, 0x7e005d00, 0x7e006700};
+                const uint32_t e32_gcn[]{0x7e004300, 0x7e004100, 0x7e005300, 0x7e005500,
+                                         0x7e004500, 0x7e004900, 0x7e004f00};
+                const uint32_t e64_rdna[]{0xd5a70000, 0xd5a50000, 0xd5b50000, 0xd5b60000,
+                                          0xd5aa0000, 0xd5ae0000, 0xd5b30000};
+                const uint32_t e64_gcn[]{0xd1610000, 0xd1600000, 0xd1690000, 0xd16a0000,
+                                         0xd1620000, 0xd1640000, 0xd1670000};
                 std::array<uint32_t, 3> words{};
                 if (e64) {
                   words[0] = (gcn ? e64_gcn[op] : e64_rdna[op]) | dst;
@@ -179,8 +185,8 @@ TEST(TranscendentalSimd, DecodedInstructionsPreserveMasksAliasesAndBroadcasts) {
                 auto decoded = decoder->decode(words.data());
                 ASSERT_FALSE(decoded.failed());
                 auto instruction = std::move(decoded).value();
-                const char *names[]{"v_log_f32", "v_exp_f32", "v_sin_f32",
-                                    "v_cos_f32", "v_rcp_f32", "v_rsq_f32"};
+                const char *names[]{"v_log_f32", "v_exp_f32", "v_sin_f32", "v_cos_f32",
+                                    "v_rcp_f32", "v_rsq_f32", "v_sqrt_f32"};
                 EXPECT_EQ(instruction->mnemonic(), std::string(names[op]) + (e64 ? "" : "_e32"));
                 for (unsigned denorm : {0u, 3u})
                   for (uint64_t mask :
@@ -252,6 +258,55 @@ TEST(TranscendentalSimd, DecodedInstructionsPreserveMasksAliasesAndBroadcasts) {
               }
       wave->halt();
     }
+  }
+}
+TEST(TranscendentalSimd, SquareRootPreservesExceptionState) {
+  ForceScalarGuard guard;
+  for (auto arch : {ROCJITSU_CODE_ARCH_RDNA3, ROCJITSU_CODE_ARCH_RDNA4}) {
+    amdgpu::GpuMemory memory("sqrt_memory");
+    amdgpu::L2Cache cache("sqrt_cache");
+    cache.set_backing_memory(&memory);
+    amdgpu::ComputeUnitCore::Config cfg{};
+    cfg.arch = arch;
+    cfg.num_wf_slots = 1;
+    cfg.sgprs_per_wf = 106;
+    cfg.vgprs_per_wf = 256;
+    cfg.lds_size_kb = 64;
+    auto cu = amdgpu::ComputeUnitCore::create("sqrt_cu", cfg, &memory, &cache);
+    auto decoder = Decoder::create(arch);
+    auto *wave = cu->dispatch_wf(0, 0, 106, 256, 32);
+    ASSERT_NE(wave, nullptr);
+    const uint32_t base = wave->vgpr_alloc().base;
+    for (bool e64 : {false, true}) {
+      const uint32_t words[]{e64 ? 0xd5b30006u : 0x7e0c6700u, e64 ? 0x02010100u : 0u, 0};
+      auto decoded = decoder->decode(words);
+      ASSERT_FALSE(decoded.failed());
+      auto instruction = std::move(decoded).value();
+      // Both masks enter the SIMD path; only EXEC=3 enables the negative lane.
+      for (uint64_t mask : {3u, 5u})
+        for (bool enabled : {false, true})
+          for (bool scalar : {false, true}) {
+            SCOPED_TRACE(testing::Message() << arch << " e64 " << e64 << " EXEC " << mask
+                                            << " enabled " << enabled << " scalar " << scalar);
+            util::set_force_scalar_for_testing(scalar);
+            wave->set_mode_raw(0xf0u | (enabled ? 0x1000u : 0u));
+            wave->set_gfx12_trap_ctrl_raw(enabled ? 1u : 0u);
+            wave->set_trapsts(0x40u);
+            wave->clear_pending_alu_causes();
+            wave->set_exec(mask);
+            for (unsigned lane = 0; lane < 32; ++lane) {
+              cu->write_vgpr(base, lane, lane == 1 ? 0xbf800000u : 0x40800000u);
+              cu->write_vgpr(base + 6, lane, 0xdeadbeefu);
+            }
+            ASSERT_TRUE(cu->execute_instruction(instruction.get(), *wave).succeeded());
+            const uint32_t invalid = (mask & 2u) ? 1u : 0u;
+            EXPECT_EQ(wave->trapsts(), 0x40u | invalid);
+            EXPECT_EQ(wave->pending_alu_causes(), invalid);
+            EXPECT_EQ(cu->read_vgpr(base + 6, 0), 0x40000000u);
+            EXPECT_EQ(cu->read_vgpr(base + 6, 1), invalid ? 0xffc00000u : 0xdeadbeefu);
+          }
+    }
+    wave->halt();
   }
 }
 } // namespace

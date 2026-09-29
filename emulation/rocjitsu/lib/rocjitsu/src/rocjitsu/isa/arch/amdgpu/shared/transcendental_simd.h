@@ -7,7 +7,7 @@
 #include <cstdint>
 
 namespace rocjitsu::amdgpu::transcendental {
-enum class F32Operation { Log, Exp, Sin, Cos, Rcp, Rsq };
+enum class F32Operation { Log, Exp, Sin, Cos, Rcp, Rsq, Sqrt };
 
 /// Whether the host supports the exact eight-lane integer implementation.
 bool supports_f32_simd();

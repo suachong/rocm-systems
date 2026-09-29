@@ -222,19 +222,19 @@ constexpr std::array<PseudoScalarSpecialCase, 85> kSpecialCases{{
      "",
      {.source_opsel = true},
      1u << 2},
-    {"f32_round_toward_negative", "v_s_sqrt_f32", f32_bits(5.0f), 0x400F1BBCu, "", {}, 2u},
-    {"f32_round_toward_zero", "v_s_sqrt_f32", f32_bits(5.0f), 0x400F1BBCu, "", {}, 3u},
+    {"f32_round_toward_negative", "v_s_sqrt_f32", f32_bits(5.0f), 0x400F1BBDu, "", {}, 2u},
+    {"f32_round_toward_zero", "v_s_sqrt_f32", f32_bits(5.0f), 0x400F1BBDu, "", {}, 3u},
     {"f16_round_toward_negative",
      "v_s_sqrt_f16",
      0xCAFE4200u,
-     0x00003EEDu,
+     0x00003EEEu,
      "",
      {.source_opsel = true},
      2u << 2},
     {"f16_round_toward_zero",
      "v_s_sqrt_f16",
      0xCAFE4200u,
-     0x00003EEDu,
+     0x00003EEEu,
      "",
      {.source_opsel = true},
      3u << 2},
@@ -970,7 +970,8 @@ TEST(PseudoScalarHelperTest, PreservesAndFlushesSignedDenormals) {
             0x80000000u);
   const uint32_t f32_allowed_negative_input = amdgpu::pseudo_scalar::execute_f32(
       Operation::SQRT, f32_negative_minimum, false, false, 0, 1, 0, false);
-  EXPECT_TRUE(std::isnan(std::bit_cast<float>(f32_allowed_negative_input)));
+  // F32 SQRT flushes input denormals independently of MODE.
+  EXPECT_EQ(f32_allowed_negative_input, 0x80000000u);
   EXPECT_EQ(amdgpu::pseudo_scalar::execute_f32(Operation::RCP, f32_negative_maximum, false, false,
                                                0, 2, 0, false),
             0x80000000u);
