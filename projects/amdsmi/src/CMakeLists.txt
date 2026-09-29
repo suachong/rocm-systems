@@ -173,8 +173,8 @@ else()
     # An installed package wins, so a distribution that ships libamdcuid
     # separately gets the one it shipped rather than a second copy built here.
     # 2.1 adds amdcuid_get_handle_by_dev_path() and AMDCUID_QUERY_SOURCE, and
-    # 2.2 takes GPUs from the driver's cuid_unit_id; an older install is passed
-    # over in favour of the in-tree sources.
+    # 2.2 takes the node key from UEFI; an older install is passed over in
+    # favour of the in-tree sources.
     find_package(amdcuid ${AMDSMI_AMDCUID_MIN_VERSION} CONFIG QUIET HINTS "${AMDCUID_HINT_DIR}")
 
     if(NOT amdcuid_FOUND AND EXISTS "${AMDCUID_SOURCE_DIR}/CMakeLists.txt")
@@ -192,6 +192,39 @@ else()
             set(amdcuid_FOUND TRUE)
             set(amdcuid_VERSION "in-tree")
             set(amdcuid_DIR "${AMDCUID_SOURCE_DIR}")
+            # An installed libamdcuid package ships this file itself.
+            # systemd-tmpfiles reads only fixed system directories, so the
+            # destination is absolute. As with the Python sitelib, it is
+            # installed only under DESTDIR, which packaging sets and a plain
+            # prefix install does not, so the latter never writes to /usr.
+            if(UNIX AND NOT APPLE)
+                option(AMDSMI_INSTALL_CUID_TMPFILES "Install amdcuid.conf into AMDCUID_TMPFILES_DIR" ON)
+                set(AMDCUID_TMPFILES_DIR
+                    "/usr/lib/tmpfiles.d"
+                    CACHE PATH
+                    "Directory systemd-tmpfiles reads amdcuid.conf from"
+                )
+                if(AMDSMI_INSTALL_CUID_TMPFILES AND AMDCUID_TMPFILES_DIR)
+                    set(_amdsmi_tmpfiles_src "${AMDCUID_SOURCE_DIR}/scripts/tmpfiles.d/amdcuid.conf")
+                    string(
+                        CONFIGURE
+                            [[
+if("$ENV{DESTDIR}" STREQUAL "")
+    message(STATUS "amdsmi: DESTDIR unset; skipping @AMDCUID_TMPFILES_DIR@/amdcuid.conf (set DESTDIR=/ to install it)")
+else()
+    file(
+        INSTALL "@_amdsmi_tmpfiles_src@"
+        DESTINATION "@AMDCUID_TMPFILES_DIR@"
+        FILE_PERMISSIONS OWNER_READ OWNER_WRITE GROUP_READ WORLD_READ
+    )
+endif()
+]]
+                        _amdsmi_tmpfiles_install_code
+                        @ONLY
+                    )
+                    install(CODE "${_amdsmi_tmpfiles_install_code}" COMPONENT dev)
+                endif()
+            endif()
         endif()
     endif()
 
@@ -253,8 +286,8 @@ else()
         WARNING
         "CUID support: disabled -- BUILD_CUID=AUTO and no amdcuid ${AMDSMI_AMDCUID_MIN_VERSION} CMake package was found "
         "(AMDCUID_HINT_DIR=${AMDCUID_HINT_DIR}), and no sources at AMDCUID_SOURCE_DIR "
-        "(${AMDCUID_SOURCE_DIR}). amdsmi_get_gpu_cuid_info() will return "
-        "AMDSMI_STATUS_NOT_SUPPORTED in this build. "
+        "(${AMDCUID_SOURCE_DIR}). amdsmi_get_gpu_cuid_info() and "
+        "amdsmi_set_cuid_seed() will return AMDSMI_STATUS_NOT_SUPPORTED in this build. "
         "Pass -DBUILD_CUID=ON to make this a hard error, or -DBUILD_CUID=OFF to make it "
         "deliberate."
     )
@@ -330,6 +363,9 @@ function(amdsmi_configure_common_target _TARGET)
             # build never installs.
             target_sources(${_TARGET} PRIVATE ${AMDCUID_IN_TREE_OBJECTS})
             target_include_directories(${_TARGET} SYSTEM PRIVATE ${AMDCUID_INCLUDE_DIRS})
+            # The absorbed objects include rocm-sha256, which an installed
+            # libamdcuid does not export.
+            target_compile_definitions(${_TARGET} PRIVATE AMDSMI_CUID_HAS_SHA256)
         else()
             target_link_libraries(${_TARGET} PRIVATE amdcuid::amdcuid)
         endif()

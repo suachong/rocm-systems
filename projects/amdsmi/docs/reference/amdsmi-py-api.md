@@ -517,15 +517,16 @@ Field | Content
 `primary` | Canonical CUID as a UUIDv8 string. Empty when the caller lacks the privilege to read it, since the primary payload embeds the raw serial number. An empty value is not an error
 `derived` | Derived CUID as a UUIDv8 string. Names the component without disclosing its serial, and is the value to record
 `component_type` | On-wire Component Type by name: `PLATFORM`, `CPU`, `GPU`, `NIC`, `NPU`, `STORAGE`, `MEMORY`, `GENPCIE`, `GENC`, `RACKTRAY`, `RACK`, `OTHER`, or `UNKNOWN`
-`source` | Which stage of the staged lookup answered: `DRIVER`, `LIBRARY` or `UNKNOWN`
-`auxiliary` | `True` for a temporary CUID: the identity was synthesised from non-privileged information. Such a value changes when the OS is reinstalled and is not unique across nodes
+`source` | Which stage of the staged lookup answered: `DRIVER`, `LIBRARY` or `UNKNOWN`. This is provenance, not the state of the node key
+`auxiliary` | `True` for a temporary CUID: the identity was synthesised from non-privileged information because no hardware serial was reachable. Such a value changes when the OS is reinstalled and is not unique across nodes
 
-Auxiliary (temporary) CUIDs are keyed by the machine ID. There is no node key
-yet, so every derived CUID is temporary, and a GPU partition has none: a
-handle for the one partition of a GPU in SPX reports the whole GPU's CUID, and
-one for a partition in DPX and above raises `AMDSMI_STATUS_NOT_SUPPORTED`.
-The result is built from several queries, so it is not atomic under a
-topology change. If the auxiliary flag cannot be read, the call raises
+Auxiliary (temporary) CUIDs are keyed by the machine ID, not the node key.
+A handle for a GPU partition reports the partition's CUID. Where the partition
+has none, the handle for the one partition of a GPU in SPX reports the whole
+GPU's CUID, and one for a partition in DPX and above raises
+`AMDSMI_STATUS_NOT_SUPPORTED`.
+The result is built from several queries, so it is not atomic under a concurrent
+rekey or topology change. If the auxiliary flag cannot be read, the call raises
 rather than reporting `False`.
 
 Exceptions that can be thrown by `amdsmi_get_gpu_cuid_info` function:
@@ -561,12 +562,104 @@ finally:
     amdsmi.amdsmi_shut_down()
 ```
 
+### amdsmi_set_cuid_seed
+
+Description: Sets the node key. The key is node-wide, not per device: changing
+it replaces every CUID derived with the node key and leaves primary and
+temporary CUIDs unchanged. This is an administrative identity change rather
+than a routine operation. Requires elevation.
+
+The key is written to the `cuid_seed` of one amdgpu device. The driver stores
+it in the `AmdCuidKey` UEFI variable and re-keys every component, or changes
+nothing if that fails. Without amdgpu, the key is written to the `AmdCuidKey`
+variable through efivarfs. A seed whose 32 bytes are all equal, or that is a
+public constant zero-padded to 32 bytes, is refused.
+
+Input parameters:
+
+* `seed` exactly `AMDSMI_CUID_SEED_SIZE` (32) bytes of secret material. Any
+  other size is corruption, not a shorter secret
+
+Output: None
+
+Exceptions that can be thrown by `amdsmi_set_cuid_seed` function:
+
+* `AmdSmiParameterException`
+* `AmdSmiLibraryException`
+
+#### Possible Library Exceptions
+
+- `AMDSMI_STATUS_INVAL` - Invalid parameters, or a refused seed
+- `AMDSMI_STATUS_NO_PERM` - Permission Denied (requires sudo); nothing changed
+- `AMDSMI_STATUS_IO` - The node key is now `seed`, but derived CUIDs were not refreshed
+- `AMDSMI_STATUS_NOT_SUPPORTED` - Feature not supported, or neither an amdgpu device exposing `cuid_seed` nor efivarfs is available
+- `AMDSMI_STATUS_API_FAILED` - The key was not stored
+
+Example:
+
+```python
+import amdsmi
+try:
+    amdsmi.amdsmi_init()
+    with open("/path/to/cuid.seed", "rb") as f:
+        amdsmi.amdsmi_set_cuid_seed(f.read())
+except amdsmi.AmdSmiException as e:
+    print(e)
+finally:
+    amdsmi.amdsmi_shut_down()
+```
+
+### amdsmi_get_cuid_seed_info
+
+Description: Reports the node key's provisioning status and fingerprint. The key
+is read from an amdgpu device's `cuid_seed`, else from the `AmdCuidKey` UEFI
+variable, and is never returned. Requires elevation.
+
+Input parameters: `None`
+
+Output: Dictionary with fields
+
+Field | Content
+---|---
+`provisioned` | `True` when an administrator set the key; `False` when amdgpu generated it
+`fingerprint` | First 8 octets of the unkeyed SHA-256 of the key, as lowercase hex
+
+A non-root caller gets `AMDSMI_STATUS_NO_PERM`, and a host with no key, or a
+malformed `AmdCuidKey`, gets `AMDSMI_STATUS_API_FAILED`. Neither means
+`provisioned=False`.
+
+Exceptions that can be thrown by `amdsmi_get_cuid_seed_info` function:
+
+* `AmdSmiLibraryException`
+
+#### Possible Library Exceptions
+
+- `AMDSMI_STATUS_NO_PERM` - Permission Denied (requires sudo)
+- `AMDSMI_STATUS_NOT_SUPPORTED` - Feature not supported
+- `AMDSMI_STATUS_API_FAILED` - API call failed
+
+Example:
+
+```python
+import amdsmi
+try:
+    amdsmi.amdsmi_init()
+    info = amdsmi.amdsmi_get_cuid_seed_info()
+    print("Provisioned:", info['provisioned'])
+    print("Fingerprint:", info['fingerprint'])
+except amdsmi.AmdSmiException as e:
+    print(e)
+finally:
+    amdsmi.amdsmi_shut_down()
+```
+
 ### amdsmi_get_cuid_components
 
 Description: Lists every component on the node that has a CUID: the platform,
-each CPU package, each AMD GPU, and each NIC function, ordered by component
-type, then BDF, then device path. Needs no processor handle. Every derived CUID is
-temporary; for a caller other than root `primary` is empty.
+each CPU package, each AMD GPU or GPU partition, and each NIC function, ordered by
+component type, then BDF, then device path. Needs no processor handle. For root, CPU, NIC
+and platform CUIDs are derived with the node key; for any other caller, or
+without a node key, they are temporary and `primary` is empty.
 
 Input parameters: `None`
 

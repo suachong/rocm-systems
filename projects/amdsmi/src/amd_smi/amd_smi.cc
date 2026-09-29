@@ -30,6 +30,9 @@
 
 #ifdef BUILD_CUID
 #include "amd_cuid.h"
+#ifdef AMDSMI_CUID_HAS_SHA256
+#include "rocm/sha2/sha256.h"
+#endif
 #endif
 
 #include "amd_smi/amdsmi.h"
@@ -1667,6 +1670,94 @@ amdsmi_status_t amdsmi_get_gpu_cuid_info(amdsmi_processor_handle processor_handl
   return AMDSMI_STATUS_SUCCESS;
 #else
   (void)processor_handle;
+  return AMDSMI_STATUS_NOT_SUPPORTED;
+#endif
+}
+
+amdsmi_status_t amdsmi_set_cuid_seed(const uint8_t seed[AMDSMI_CUID_SEED_SIZE]) {
+  AMDSMI_CHECK_INIT();
+
+  if (seed == nullptr) {
+    return AMDSMI_STATUS_INVAL;
+  }
+
+#ifdef BUILD_CUID
+  // amdcuid_set_hash_key() hands the key to the driver and then refreshes. It
+  // returns one status for both halves, so whether the key changed is read
+  // back.
+#ifndef AMDSMI_CUID_HAS_SHA256
+  amdcuid_key_info_t before = {};
+  const bool before_known = amdcuid_get_key_info(&before) == AMDCUID_STATUS_SUCCESS;
+#endif
+
+  const amdcuid_status_t status = amdcuid_set_hash_key(seed);
+  if (status == AMDCUID_STATUS_SUCCESS) {
+    return AMDSMI_STATUS_SUCCESS;
+  }
+  if (status == AMDCUID_STATUS_INVALID_ARGUMENT) {
+    return AMDSMI_STATUS_INVAL;
+  }
+  if (status == AMDCUID_STATUS_UNSUPPORTED) {
+    return AMDSMI_STATUS_NOT_SUPPORTED;
+  }
+  // The library refuses a non-root caller before touching anything. For root,
+  // PERMISSION_DENIED is the driver refusing the seed.
+  if (status == AMDCUID_STATUS_PERMISSION_DENIED && geteuid() != 0) {
+    return AMDSMI_STATUS_NO_PERM;
+  }
+
+  amdcuid_key_info_t after = {};
+  if (amdcuid_get_key_info(&after) != AMDCUID_STATUS_SUCCESS || after.provisioned == 0) {
+    return AMDSMI_STATUS_API_FAILED;
+  }
+#ifdef AMDSMI_CUID_HAS_SHA256
+  uint8_t digest[rocm::sha2::SHA256_DIGEST_SIZE] = {};
+  rocm::sha2::sha256_digest(seed, AMDSMI_CUID_SEED_SIZE, digest);
+  static_assert(sizeof(after.fingerprint) <= sizeof(digest), "fingerprint is a SHA-256 prefix");
+  const bool committed = memcmp(after.fingerprint, digest, sizeof(after.fingerprint)) == 0;
+#else
+  // Without SHA-256 the new key is recognised only by the fingerprint having
+  // changed.
+  const bool committed =
+      !before_known || before.provisioned == 0 ||
+      memcmp(before.fingerprint, after.fingerprint, sizeof(after.fingerprint)) != 0;
+#endif
+  return committed ? AMDSMI_STATUS_IO : AMDSMI_STATUS_API_FAILED;
+#else
+  return AMDSMI_STATUS_NOT_SUPPORTED;
+#endif
+}
+
+amdsmi_status_t amdsmi_get_cuid_seed_info(amdsmi_cuid_seed_info_t* info) {
+  AMDSMI_CHECK_INIT();
+
+  if (info == nullptr) {
+    return AMDSMI_STATUS_INVAL;
+  }
+  memset(info, 0, sizeof(*info));
+
+#ifdef BUILD_CUID
+  // The library never reads a key for a non-root caller, so its answer
+  // would look like a host without one.
+  if (geteuid() != 0) {
+    return AMDSMI_STATUS_NO_PERM;
+  }
+  amdcuid_key_info_t key_info = {};
+  const amdcuid_status_t status = amdcuid_get_key_info(&key_info);
+  switch (status) {
+    case AMDCUID_STATUS_SUCCESS:
+      break;
+    case AMDCUID_STATUS_INVALID_ARGUMENT:
+      return AMDSMI_STATUS_INVAL;
+    default:
+      return AMDSMI_STATUS_API_FAILED;
+  }
+  info->provisioned = key_info.provisioned;
+  static_assert(sizeof(info->fingerprint) == sizeof(key_info.fingerprint),
+                "fingerprint width must match the CUID library's");
+  memcpy(info->fingerprint, key_info.fingerprint, sizeof(info->fingerprint));
+  return AMDSMI_STATUS_SUCCESS;
+#else
   return AMDSMI_STATUS_NOT_SUPPORTED;
 #endif
 }

@@ -3623,9 +3623,9 @@ typedef struct {
   //! Which stage of the staged lookup answered.
   amdsmi_cuid_source_t source;
   //! Non-zero for a temporary CUID, payload bit 117: the identity was
-  //! synthesised from non-privileged information. It is keyed by the machine
-  //! ID, so it changes when the OS is reinstalled and is not unique across
-  //! nodes. Do not
+  //! synthesised from non-privileged information because no hardware serial
+  //! was reachable. It is keyed by the machine ID, not the node key, so it
+  //! changes when the OS is reinstalled and is not unique across nodes. Do not
   //! record it in the same column as a canonical CUID. Meaningful only
   //! on ::AMDSMI_STATUS_SUCCESS: there is no encoding for "undetermined", so a
   //! call that cannot establish this flag fails rather than reporting zero.
@@ -3637,6 +3637,29 @@ typedef struct {
   uint64_t reserved[8];
 } amdsmi_cuid_info_t;
 
+//! Length of the node key, in bytes. The CUID specification defines a 256-bit
+//! shared secret; this is the only accepted length, not a maximum.
+#define AMDSMI_CUID_SEED_SIZE 32
+//! Length of the node key fingerprint, in bytes.
+#define AMDSMI_CUID_SEED_FINGERPRINT_SIZE 8
+
+/**
+ *  @brief State of the node key.
+ *
+ *  The key itself is deliberately absent: amd-smi output ends up in public bug
+ *  reports, so the key must not have a path out through it. The fingerprint
+ *  answers whether two nodes carry the same key without answering what it is.
+ */
+typedef struct {
+  //! Non-zero when an administrator set the key; zero when amdgpu
+  //! generated it.
+  uint8_t provisioned;
+  uint8_t reserved_flags[7];  //!< Reserved.
+  //! First 8 octets of the unkeyed SHA-256 of the key.
+  uint8_t fingerprint[AMDSMI_CUID_SEED_FINGERPRINT_SIZE];
+  uint64_t reserved[4];
+} amdsmi_cuid_seed_info_t;
+
 /**
  *  @brief Returns the Component Unified ID of the device, with its provenance
  *
@@ -3645,17 +3668,19 @@ typedef struct {
  *  Prefer this over ::amdsmi_get_gpu_device_uuid, which returns a legacy device
  *  UUID rather than a CUID.
  *
- *  Where the driver publishes a partition's identity, under
- *  /sys/class/drm/renderD<n>/device/xcp, a handle naming that partition is
- *  looked up there. A partition has no temporary CUID, and without a node key
- *  it has no other. In SPX, where the one partition covers every XCC, the
- *  handle then reports the whole GPU's CUID, with the GPU's source and primary
- *  CUID; in DPX and above it gets ::AMDSMI_STATUS_NOT_SUPPORTED. Where the
- *  driver publishes no partition identity, the only value available is the
- *  physical device's, which would name every partition of one GPU
- *  identically: a GPU in SPX, or one reporting no compute mode, reports it,
- *  and every handle of a GPU in a mode with more than one partition gets
- *  ::AMDSMI_STATUS_NOT_SUPPORTED.
+ *  Where the driver publishes a partition's own CUID, under
+ *  /sys/class/drm/renderD<n>/device/xcp, a handle naming that partition gets
+ *  it, with source ::AMDSMI_CUID_SOURCE_DRIVER. That includes partition 0 of a
+ *  partitionable GPU, whose CUID carries a non-zero UnitID and so differs from
+ *  the physical device's. Where the partition has no CUID, as with an amdgpu
+ *  without the key store, a handle for a GPU in SPX, whose one partition
+ *  covers every XCC, reports the whole GPU's CUID with the GPU's source and
+ *  primary CUID, and one in DPX and above gets ::AMDSMI_STATUS_NOT_SUPPORTED.
+ *  Where the driver publishes no partition identity, the only value
+ *  available is the physical device's, which would name every partition of
+ *  one GPU identically: a GPU in SPX, or one reporting no compute mode,
+ *  reports it, and every handle of a GPU in a mode with more than one
+ *  partition gets ::AMDSMI_STATUS_NOT_SUPPORTED.
  *
  *  On failure @p info comes back cleared, never partly filled: a caller that
  *  may not read the auxiliary flag gets ::AMDSMI_STATUS_NO_PERM rather than a
@@ -3669,14 +3694,70 @@ typedef struct {
  *
  *  @return ::amdsmi_status_t | ::AMDSMI_STATUS_SUCCESS on success,
  *          ::AMDSMI_STATUS_NOT_SUPPORTED when built without CUID support, when
- *          no CUID exists for this device, for a partition the driver
- *          publishes, or for a partition other than partition 0 whose driver
- *          publishes nothing,
+ *          no CUID exists for this device, or for a partition other than
+ *          partition 0 whose driver publishes no per-partition CUID,
  *          ::AMDSMI_STATUS_NO_PERM when this caller may not read
  *          a field the snapshot must report, non-zero on other failures
  */
 amdsmi_status_t amdsmi_get_gpu_cuid_info(amdsmi_processor_handle processor_handle,
                                          amdsmi_cuid_info_t* info);
+
+/**
+ *  @brief Sets the node key
+ *
+ *  @ingroup tagProcDiscovery
+ *
+ *  Node-wide, not per-device: one key shared by every component and every
+ *  producer on the node. Setting it replaces every CUID derived with the node
+ *  key; primary and temporary CUIDs are unchanged. It is an administrative
+ *  invalidation rather than a routine operation.
+ *
+ *  @platform{gpu_bm_linux}
+ *
+ *  @param[in] seed Pointer to exactly ::AMDSMI_CUID_SEED_SIZE bytes of secret
+ *             material. Any other length is a caller error; there is no length
+ *             parameter because there is no other accepted length.
+ *
+ *  The key is written to the cuid_seed of one amdgpu device. The driver
+ *  stores it in the AmdCuidKey UEFI variable and re-keys every component, or
+ *  changes nothing if that fails. Without amdgpu, the key is written to the
+ *  AmdCuidKey variable through efivarfs. All 32 bytes equal, or a public
+ *  constant zero-padded to 32 bytes, is refused.
+ *
+ *  @return ::amdsmi_status_t | ::AMDSMI_STATUS_SUCCESS on success,
+ *          ::AMDSMI_STATUS_NO_PERM when the caller is not root (nothing is
+ *          changed), ::AMDSMI_STATUS_INVAL for a null or refused @p seed,
+ *          ::AMDSMI_STATUS_IO when the node key is now @p seed but the
+ *          refresh that follows failed, ::AMDSMI_STATUS_API_FAILED on any other
+ *          failure, ::AMDSMI_STATUS_NOT_SUPPORTED when built without CUID
+ *          support, or when no amdgpu device exposes cuid_seed and there
+ *          is no efivarfs
+ */
+amdsmi_status_t amdsmi_set_cuid_seed(const uint8_t seed[AMDSMI_CUID_SEED_SIZE]);
+
+/**
+ *  @brief Reports whether an administrator set the node key, and its fingerprint
+ *
+ *  @ingroup tagProcDiscovery
+ *
+ *  Never returns the key. See ::amdsmi_cuid_seed_info_t.
+ *
+ *  The key is read from an amdgpu device's cuid_seed, else from the
+ *  AmdCuidKey UEFI variable. Only root may read it.
+ *
+ *  @platform{gpu_bm_linux}
+ *
+ *  @param[out] info Pointer to an ::amdsmi_cuid_seed_info_t allocated by the
+ *              caller. Left zeroed on any failure.
+ *
+ *  @return ::amdsmi_status_t | ::AMDSMI_STATUS_SUCCESS on success,
+ *          ::AMDSMI_STATUS_INVAL when @p info is null,
+ *          ::AMDSMI_STATUS_NO_PERM when the caller is not root,
+ *          ::AMDSMI_STATUS_NOT_SUPPORTED when built without CUID support,
+ *          ::AMDSMI_STATUS_API_FAILED when there is no key or AmdCuidKey is
+ *          malformed
+ */
+amdsmi_status_t amdsmi_get_cuid_seed_info(amdsmi_cuid_seed_info_t* info);
 
 /**
  *  @brief One component of the node and its Component Unified ID.
@@ -3715,8 +3796,9 @@ typedef struct {
  *  so the functions of one card have distinct CUIDs even where they report
  *  one serial number.
  *
- *  Every derived CUID is temporary (::amdsmi_cuid_info_t::auxiliary is set).
- *  For a caller other than root the primary CUIDs are empty.
+ *  For root, CPU, NIC and platform CUIDs are derived with the node key. For
+ *  any other caller, or without a node key, they are temporary
+ *  (::amdsmi_cuid_info_t::auxiliary is set) and the primary CUIDs are empty.
  *
  *  @platform{gpu_bm_linux}
  *

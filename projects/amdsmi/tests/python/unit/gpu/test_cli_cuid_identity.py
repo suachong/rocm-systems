@@ -2,7 +2,7 @@
 # Copyright Advanced Micro Devices, Inc.
 # SPDX-License-Identifier: MIT
 
-"""Consumer identity semantics with real CLI renderers and API fixtures."""
+"""Consumer identity semantics with real CLI renderers and API/sysfs fixtures."""
 
 import argparse
 import csv
@@ -11,6 +11,7 @@ import io
 import itertools
 import json
 import sys
+import tempfile
 import types
 import unittest
 from contextlib import ExitStack, contextmanager, redirect_stderr, redirect_stdout
@@ -87,6 +88,9 @@ def make_cli(stack):
     api.amdsmi_get_gpu_kfd_info = Mock(
         return_value={"kfd_id": 1, "node_id": 0, "current_partition_id": "N/A"}
     )
+    api.amdsmi_get_cuid_seed_info = Mock(
+        return_value={"provisioned": True, "fingerprint": "0102030405060708"}
+    )
     api.amdsmi_get_gpu_asic_info = Mock(return_value={})
     errors = types.ModuleType("amdsmi.amdsmi_exception")
     errors.AmdSmiLibraryException = LibraryError
@@ -136,6 +140,24 @@ def make_cli(stack):
         static=static_module.StaticCommands,
         node=node_module.NodeCommands,
     )
+
+
+def make_sysfs(cli, stack):
+    tmp_path = Path(stack.enter_context(tempfile.TemporaryDirectory()))
+    device = tmp_path / "devices/pci0000:00/0000:03:00.0"
+    device.mkdir(parents=True)
+    render = tmp_path / "class/drm/renderD128"
+    render.mkdir(parents=True)
+    (render / "device").symlink_to(device, target_is_directory=True)
+    (device / "cuid_derived").write_text(CUID + "\n")
+    (device / "cuid_seed_state").write_text("provisioned\n")
+
+    def sysfs_path(path):
+        assert path.startswith("/sys/")
+        return tmp_path / path[len("/sys/") :]
+
+    stack.enter_context(mock.patch.object(cli.helpers_module, "Path", sysfs_path))
+    return device
 
 
 def capture_stdout(action):
@@ -254,30 +276,197 @@ class TestCliCuidIdentity(unittest.TestCase):
             raise unittest.SkipTest(f"amd-smi CLI not found at {CLI}")
 
     @contextmanager
-    def case(self, **params):
+    def case(self, sysfs=True, **params):
         with ExitStack() as outer:
             if params:
                 outer.enter_context(self.subTest(**params))
             with ExitStack() as stack:
-                yield make_cli(stack)
+                cli = make_cli(stack)
+                yield cli, make_sysfs(cli, stack) if sysfs else None
 
     def test_source_auxiliary_table(self):
         for source, auxiliary in itertools.product(
             ["DRIVER", "LIBRARY", "UNKNOWN"], [True, False, None]
         ):
-            with self.case(source=source, auxiliary=auxiliary) as cli:
+            with self.case(source=source, auxiliary=auxiliary) as (cli, sysfs):
                 cli.api.amdsmi_get_gpu_cuid_info.return_value.update(
                     source=source, auxiliary=auxiliary
                 )
                 result = cli.helpers.get_gpu_cuid_info(1)
                 self.assertEqual(result["source"], source)
                 self.assertEqual(result["auxiliary"], "unknown" if auxiliary is None else auxiliary)
+                expected = "temporary" if auxiliary is True else "unknown"
+                if source == "DRIVER" and auxiliary is False:
+                    expected = "provisioned"
+                else:
+                    cli.api.amdsmi_get_gpu_enumeration_info.assert_not_called()
+                self.assertEqual(result["effective_seed"], expected)
                 self.assertEqual(result["primary_cuid"], "N/A (not requested)")
-                self.assertNotIn("effective_seed", result)
+                cli.api.amdsmi_get_cuid_seed_info.assert_not_called()
+
+    def test_actual_reader_state(self):
+        for state, partition in itertools.product(
+            ["unprovisioned\n", "provisioned\n"], [None, 0, 1, 7]
+        ):
+            with self.case(state=state, partition=partition) as (cli, sysfs):
+                node = sysfs
+                if partition is not None:
+                    node = sysfs / "xcp"
+                    node.mkdir()
+                    (node / "cuid_derived").write_text(CUID + "\n")
+                    cli.api.amdsmi_get_gpu_kfd_info.return_value["current_partition_id"] = partition
+                    (sysfs / "cuid_derived").write_text(OTHER_CUID + "\n")
+                (node / "cuid_seed_state").write_text(state)
+                self.assertEqual(cli.helpers.get_gpu_cuid_info(1)["effective_seed"], state.strip())
+
+    def test_w6800_whole_device_with_kfd_zero(self):
+        for state, fmt in itertools.product(["unprovisioned\n", "provisioned\n"], ["json", "csv"]):
+            with self.case(state=state, fmt=fmt) as (cli, sysfs):
+                cli.api.amdsmi_get_gpu_kfd_info.return_value["current_partition_id"] = 0
+                (sysfs / "cuid_seed_state").write_text(state)
+                result = run_list(cli, fmt)
+                self.assertEqual(result["cuid"], CUID)
+                self.assertEqual(result["source"], "DRIVER")
+                self.assertEqual(result["auxiliary"], False if fmt == "json" else "False")
+                self.assertEqual(result["effective_seed"], state.strip())
+
+    def test_absent_or_malformed_state_is_unknown(self):
+        for state in [
+            None,
+            "",
+            "provisioned",
+            "custom \n",
+            "custom\r\n",
+            "PROVISIONED\n",
+            "unprovisioned\nprovisioned\n",
+            "secure\n",
+            "\xff\n",
+        ]:
+            with self.case(state=state) as (cli, sysfs):
+                path = sysfs / "cuid_seed_state"
+                if state is None:
+                    path.unlink()
+                else:
+                    path.write_bytes(state.encode("latin-1"))
+                result = cli.helpers.get_gpu_cuid_info(1)
+                self.assertEqual(result["derived_cuid"], CUID)
+                self.assertEqual(result["source"], "DRIVER")
+                self.assertIs(result["auxiliary"], False)
+                self.assertEqual(result["effective_seed"], "unknown")
+
+    def test_permission_failure_is_unknown(self):
+        for attribute in ["cuid_seed_state", "cuid_derived"]:
+            with self.case(attribute=attribute) as (cli, sysfs):
+                open_path = Path.open
+
+                def denied(path, *args, **kwargs):
+                    if path.name == attribute:
+                        raise PermissionError("denied")
+                    return open_path(path, *args, **kwargs)
+
+                with mock.patch.object(Path, "open", denied):
+                    self.assertEqual(cli.helpers.get_gpu_cuid_info(1)["effective_seed"], "unknown")
+
+    def test_partitions_never_fall_back_to_parent(self):
+        for partition, missing in itertools.product(
+            [0, 1, 7], ["xcp", "cuid_seed_state", "cuid_derived"]
+        ):
+            with self.case(partition=partition, missing=missing) as (cli, sysfs):
+                cli.api.amdsmi_get_gpu_kfd_info.return_value["current_partition_id"] = partition
+                if partition == 0:
+                    (sysfs / "current_compute_partition").write_text("CPX\n")
+                if missing != "xcp":
+                    node = sysfs / "xcp"
+                    node.mkdir()
+                    (node / "cuid_derived").write_text(CUID + "\n")
+                    (node / "cuid_seed_state").write_text("unprovisioned\n")
+                    (node / missing).unlink()
+                self.assertEqual(cli.helpers.get_gpu_cuid_info(1)["effective_seed"], "unknown")
+
+    def test_partition_interface_without_xcp_is_unknown(self):
+        for partition in [0, "N/A", 0xFFFFFFFF]:
+            with self.case(partition=partition) as (cli, sysfs):
+                cli.api.amdsmi_get_gpu_kfd_info.return_value["current_partition_id"] = partition
+                (sysfs / "current_compute_partition").write_text("CPX\n")
+                self.assertEqual(cli.helpers.get_gpu_cuid_info(1)["effective_seed"], "unknown")
+
+    def test_invalid_partition_id_is_unknown(self):
+        for partition in [None, False, True, 0.0, "0", -1, "", 0x100000000]:
+            with self.case(partition=partition) as (cli, sysfs):
+                cli.api.amdsmi_get_gpu_kfd_info.return_value["current_partition_id"] = partition
+                self.assertEqual(cli.helpers.get_gpu_cuid_info(1)["effective_seed"], "unknown")
+
+    def test_partition_interface_appearing_during_whole_device_read(self):
+        for attribute in ["xcp", "current_compute_partition"]:
+            with self.case(attribute=attribute) as (cli, sysfs):
+                cli.api.amdsmi_get_gpu_kfd_info.return_value["current_partition_id"] = 0
+                read_bytes = Path.read_bytes
+
+                def changed(path, *args, **kwargs):
+                    value = read_bytes(path, *args, **kwargs)
+                    if path.name == "cuid_seed_state":
+                        (sysfs / attribute).mkdir()
+                    return value
+
+                with mock.patch.object(Path, "read_bytes", changed):
+                    self.assertEqual(cli.helpers.get_gpu_cuid_info(1)["effective_seed"], "unknown")
+
+    def test_broken_xcp_link_is_not_a_whole_device(self):
+        with self.case() as (cli, sysfs):
+            (sysfs / "xcp").symlink_to(sysfs / "removed-partition")
+            self.assertEqual(cli.helpers.get_gpu_cuid_info(1)["effective_seed"], "unknown")
+
+    def test_render_node_selects_partition_instead_of_bdf(self):
+        with self.case() as (cli, sysfs):
+            other = sysfs.parent / "amdgpu_xcp.1"
+            (other / "xcp").mkdir(parents=True)
+            (other / "xcp/cuid_derived").write_text(CUID + "\n")
+            (other / "xcp/cuid_seed_state").write_text("unprovisioned\n")
+            render_link = sysfs.parents[2] / "class/drm/renderD128/device"
+            render_link.unlink()
+            render_link.symlink_to(other, target_is_directory=True)
+            self.assertEqual(cli.helpers.get_gpu_cuid_info(1)["effective_seed"], "unprovisioned")
+            cli.api.amdsmi_get_gpu_device_bdf.assert_not_called()
+
+    def test_invalid_render_is_unknown(self):
+        for render in [None, "N/A", "128", -1, 0, 0xFFFFFFFF]:
+            with self.case(render=render) as (cli, sysfs):
+                cli.api.amdsmi_get_gpu_enumeration_info.return_value = {"drm_render": render}
+                self.assertEqual(cli.helpers.get_gpu_cuid_info(1)["effective_seed"], "unknown")
+
+    def test_topology_error_is_unknown(self):
+        for api in ["amdsmi_get_gpu_enumeration_info", "amdsmi_get_gpu_kfd_info"]:
+            with self.case(api=api) as (cli, sysfs):
+                getattr(cli.api, api).side_effect = LibraryError()
+                self.assertEqual(cli.helpers.get_gpu_cuid_info(1)["effective_seed"], "unknown")
+
+    def test_missing_topology_is_unknown(self):
+        with self.case() as (cli, sysfs):
+            cli.api.amdsmi_get_gpu_kfd_info.return_value = {}
+            self.assertEqual(cli.helpers.get_gpu_cuid_info(1)["effective_seed"], "unknown")
+
+    def test_stale_or_changing_cuid_is_not_labeled(self):
+        for values, partition in itertools.product(
+            [(OTHER_CUID, OTHER_CUID), (CUID, OTHER_CUID), (OTHER_CUID, CUID)], [0, "N/A"]
+        ):
+            with self.case(values=values, partition=partition) as (cli, sysfs):
+                cli.api.amdsmi_get_gpu_kfd_info.return_value["current_partition_id"] = partition
+                read_text = Path.read_text
+                observed = iter(values)
+
+                def changed(path, *args, **kwargs):
+                    if path.name == "cuid_derived":
+                        return next(observed) + "\n"
+                    return read_text(path, *args, **kwargs)
+
+                with mock.patch.object(Path, "read_text", changed):
+                    result = cli.helpers.get_gpu_cuid_info(1)
+                self.assertEqual(result["derived_cuid"], CUID)
+                self.assertEqual(result["effective_seed"], "unknown")
 
     def test_enumeration_fields_still_precede_new_fields(self):
         for fmt in ["json", "csv"]:
-            with self.case(fmt=fmt) as cli:
+            with self.case(fmt=fmt) as (cli, sysfs):
                 cli.api.amdsmi_get_gpu_enumeration_info.return_value.update(
                     drm_card=0,
                     hsa_id=1,
@@ -296,7 +485,7 @@ class TestCliCuidIdentity(unittest.TestCase):
                 self.assertEqual(result["cuid"], CUID)
 
     def test_human_list_reports_kind_without_private_diagnostics(self):
-        with self.case() as cli:
+        with self.case() as (cli, sysfs):
 
             def list_gpu():
                 command = cli.list()
@@ -308,13 +497,48 @@ class TestCliCuidIdentity(unittest.TestCase):
             output = capture_stdout(list_gpu)
             self.assertIn(f"UUID: {CUID}", output)
             self.assertIn("IDENTIFIER_KIND: cuid", output)
-            self.assertNotIn("SEED", output)
+            self.assertIn("EFFECTIVE_SEED: provisioned", output)
             self.assertNotIn("FINGERPRINT", output)
             self.assertNotIn("PRIMARY", output)
 
+    def test_changing_render_device_is_unknown(self):
+        with self.case() as (cli, sysfs):
+            other = sysfs.parent / "replacement"
+            other.mkdir()
+            render_link = sysfs.parents[2] / "class/drm/renderD128/device"
+            read_bytes = Path.read_bytes
+
+            def changed(path, *args, **kwargs):
+                value = read_bytes(path, *args, **kwargs)
+                if path.name == "cuid_seed_state":
+                    render_link.unlink()
+                    render_link.symlink_to(other, target_is_directory=True)
+                return value
+
+            with mock.patch.object(Path, "read_bytes", changed):
+                self.assertEqual(cli.helpers.get_gpu_cuid_info(1)["effective_seed"], "unknown")
+
+    def test_inaccessible_partition_topology_has_no_parent_fallback(self):
+        for attribute in ["xcp", "current_compute_partition"]:
+            with self.case(attribute=attribute) as (cli, sysfs):
+                lstat = Path.lstat
+
+                def denied(path, *args, **kwargs):
+                    if path.name == attribute:
+                        raise PermissionError("denied")
+                    return lstat(path, *args, **kwargs)
+
+                with mock.patch.object(Path, "lstat", denied):
+                    self.assertEqual(cli.helpers.get_gpu_cuid_info(1)["effective_seed"], "unknown")
+
+    def test_missing_whole_device_cuid_is_unknown(self):
+        with self.case() as (cli, sysfs):
+            (sysfs / "cuid_derived").unlink()
+            self.assertEqual(cli.helpers.get_gpu_cuid_info(1)["effective_seed"], "unknown")
+
     def test_list_alias_compatibility(self):
         for fmt, kind in itertools.product(["json", "csv"], ["cuid", "legacy_uuid", "unknown"]):
-            with self.case(fmt=fmt, kind=kind) as cli:
+            with self.case(fmt=fmt, kind=kind) as (cli, sysfs):
                 if kind != "cuid":
                     cli.api.amdsmi_get_gpu_cuid_info.side_effect = LibraryError(2)
                     cli.api.amdsmi_get_gpu_device_cuid.side_effect = LibraryError(2)
@@ -337,14 +561,21 @@ class TestCliCuidIdentity(unittest.TestCase):
                     result["cuid_metadata_status"],
                     "available" if kind == "cuid" else "not_supported",
                 )
-                self.assertNotIn("effective_seed", result)
+                self.assertEqual(
+                    result["effective_seed"],
+                    {"cuid": "provisioned", "legacy_uuid": "not_applicable", "unknown": "N/A"}[
+                        kind
+                    ],
+                )
                 self.assertNotIn("primary_cuid", result)
+                self.assertNotIn("seed_fingerprint", result)
                 self.assertNotIn("ready", result)
                 self.assertNotIn(PRIMARY, str(result))
+                cli.api.amdsmi_get_cuid_seed_info.assert_not_called()
 
     def test_metadata_failure_keeps_available_cuid(self):
         for fmt, code in itertools.product(["json", "csv"], [2, 10, 34]):
-            with self.case(fmt=fmt, code=code) as cli:
+            with self.case(fmt=fmt, code=code) as (cli, sysfs):
                 cli.api.amdsmi_get_gpu_cuid_info.side_effect = LibraryError(code)
                 result = run_list(cli, fmt)
                 self.assertEqual(result["identifier_kind"], "cuid")
@@ -352,16 +583,18 @@ class TestCliCuidIdentity(unittest.TestCase):
                 if code == 2:
                     self.assertEqual(result["source"], "N/A")
                     self.assertEqual(result["auxiliary"], "N/A")
+                    self.assertEqual(result["effective_seed"], "N/A")
                     self.assertEqual(result["cuid_metadata_status"], "not_supported")
                 else:
                     self.assertEqual(result["source"], "UNKNOWN")
                     self.assertEqual(result["auxiliary"], "unknown")
+                    self.assertEqual(result["effective_seed"], "unknown")
                     self.assertEqual(result["cuid_metadata_status"], f"amdsmi_error_{code}")
                 cli.api.amdsmi_get_gpu_device_uuid.assert_not_called()
                 cli.api.amdsmi_get_gpu_enumeration_info.assert_not_called()
 
     def test_a_handle_without_a_cuid_reads_as_not_available(self):
-        with self.case() as cli:
+        with self.case() as (cli, sysfs):
             cli.api.amdsmi_get_gpu_cuid_info.side_effect = LibraryError(2)
             cli.api.amdsmi_get_gpu_device_cuid.side_effect = LibraryError(2)
             result = cli.helpers.get_gpu_cuid_info(1)
@@ -369,10 +602,11 @@ class TestCliCuidIdentity(unittest.TestCase):
                 {k: result[k] for k in ("derived_cuid", "component_type", "auxiliary", "source")},
                 dict.fromkeys(("derived_cuid", "component_type", "auxiliary", "source"), "N/A"),
             )
+            self.assertEqual(result["effective_seed"], "N/A")
             self.assertEqual(result["cuid_metadata_status"], "not_supported")
 
     def test_old_binding_without_snapshot_keeps_cuid(self):
-        with self.case() as cli:
+        with self.case() as (cli, sysfs):
             del cli.api.amdsmi_get_gpu_cuid_info
             result = cli.helpers.get_gpu_cuid_info(1)
             self.assertEqual(result["identifier_kind"], "cuid")
@@ -382,7 +616,7 @@ class TestCliCuidIdentity(unittest.TestCase):
 
     def test_auxiliary_serialization(self):
         for auxiliary, fmt in itertools.product([True, False, None], ["json", "csv"]):
-            with self.case(auxiliary=auxiliary, fmt=fmt) as cli:
+            with self.case(auxiliary=auxiliary, fmt=fmt) as (cli, sysfs):
                 cli.api.amdsmi_get_gpu_cuid_info.return_value["auxiliary"] = auxiliary
                 result = run_list(cli, fmt)
                 expected = "unknown" if auxiliary is None else auxiliary
@@ -390,9 +624,10 @@ class TestCliCuidIdentity(unittest.TestCase):
                     expected = str(expected)
                 self.assertEqual(result["auxiliary"], expected)
 
-    def test_static_reports_identity_without_node_state(self):
+    def test_static_separates_local_seed_and_driver(self):
         for auxiliary in [False, True]:
-            with self.case(auxiliary=auxiliary) as cli:
+            with self.case(auxiliary=auxiliary) as (cli, sysfs):
+                (sysfs / "cuid_seed_state").write_text("unprovisioned\n")
                 cli.api.amdsmi_get_gpu_cuid_info.return_value["auxiliary"] = auxiliary
 
                 def static_gpu():
@@ -400,18 +635,23 @@ class TestCliCuidIdentity(unittest.TestCase):
                     command.helpers = cli.helpers
                     command.logger = cli.logger(format="json", helpers=cli.helpers)
                     command.group_check_printed = True
+                    command._report_cuid_seed()
                     command.static_gpu(static_args(cuid=True))
                     command.logger.combine_arrays_to_json()
 
                 result = json.loads(capture_stdout(static_gpu))
-                self.assertEqual(list(result), ["gpu_data"])
+                self.assertIs(result["seed_provisioned"], True)
+                self.assertEqual(result["seed_fingerprint"], "0102030405060708")
+                self.assertNotIn("seed_info_scope", result)
                 gpu = result["gpu_data"][0]["cuid"]
-                self.assertIs(gpu["auxiliary"], auxiliary)
+                self.assertEqual(
+                    gpu["effective_seed"], "temporary" if auxiliary else "unprovisioned"
+                )
                 self.assertEqual(gpu["primary_cuid"], "N/A (not requested)")
-                self.assertNotIn("effective_seed", gpu)
+                self.assertNotIn("seed_fingerprint", gpu)
 
     def test_primary_requires_explicit_selection(self):
-        with self.case() as cli:
+        with self.case() as (cli, sysfs):
             self.assertEqual(
                 cli.helpers.get_gpu_cuid_info(1)["primary_cuid"], "N/A (not requested)"
             )
@@ -419,8 +659,8 @@ class TestCliCuidIdentity(unittest.TestCase):
                 cli.helpers.get_gpu_cuid_info(1, include_primary=True)["primary_cuid"], PRIMARY
             )
 
-    def test_static_without_cuid_does_not_query_identity(self):
-        with self.case() as cli:
+    def test_static_without_cuid_does_not_query_seed_or_identity(self):
+        with self.case(sysfs=False) as (cli, _):
 
             def static_gpu():
                 command = cli.static()
@@ -432,7 +672,9 @@ class TestCliCuidIdentity(unittest.TestCase):
 
             result = json.loads(capture_stdout(static_gpu))
             self.assertNotIn("cuid", result["gpu_data"][0])
+            self.assertNotIn("seed_fingerprint", result)
             cli.api.amdsmi_get_gpu_cuid_info.assert_not_called()
+            cli.api.amdsmi_get_cuid_seed_info.assert_not_called()
 
 
 class TestCliNodeCuid(unittest.TestCase):
@@ -449,7 +691,8 @@ class TestCliNodeCuid(unittest.TestCase):
     def test_every_component_is_named_by_type_and_position(self):
         with self.cli() as cli:
             cuid = run_node(cli, "json", cuid=True)["cuid"]
-        self.assertEqual(list(cuid), ["components"])
+        self.assertIs(cuid["seed_provisioned"], True)
+        self.assertEqual(cuid["seed_fingerprint"], "0102030405060708")
         self.assertEqual(list(cuid["components"]), ["PLATFORM", "GPU 0", "GPU 1"])
         platform = cuid["components"]["PLATFORM"]
         self.assertEqual(platform["derived_cuid"], OTHER_CUID)
@@ -472,13 +715,13 @@ class TestCliNodeCuid(unittest.TestCase):
         with self.cli() as cli:
             rows = run_node(cli, "csv", cuid=True)
         self.assertEqual([row["component"] for row in rows], ["PLATFORM", "GPU 0", "GPU 1"])
-        self.assertNotIn("seed_fingerprint", rows[0])
+        self.assertEqual({row["seed_fingerprint"] for row in rows}, {"0102030405060708"})
         self.assertEqual(rows[1]["derived_cuid"], CUID)
 
     def test_human_readable_lists_each_component(self):
         with self.cli() as cli:
             output = run_node(cli, "human_readable", cuid=True)
-        self.assertIn("    CUID:\n        PLATFORM:", output)
+        self.assertIn("    CUID:\n        SEED_PROVISIONED: True", output)
         self.assertIn("        GPU 1:\n            DERIVED_CUID: " + LEGACY_UUID, output)
 
     def test_a_library_failure_reports_no_components(self):
@@ -490,6 +733,7 @@ class TestCliNodeCuid(unittest.TestCase):
         with self.cli() as cli:
             node = run_node(cli, "json")
             cli.api.amdsmi_get_cuid_components.assert_not_called()
+            cli.api.amdsmi_get_cuid_seed_info.assert_not_called()
         self.assertNotIn("cuid", node)
 
 

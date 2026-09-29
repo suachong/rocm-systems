@@ -29,26 +29,33 @@ Full documentation for amd_smi_lib is available at [https://rocm.docs.amd.com/pr
   - Exposed under the same names in the Python `amdsmi_get_gpu_asic_info()` dictionary and in `amd-smi static --asic`. The C fields report `0xFFFFFFFF` when unsupported; Python and the CLI render that as `N/A`.
   - ABI-preserving: the fields take two `uint32_t` slots from `amdsmi_asic_info_t.reserved`, which shrinks from 17 to 15 entries. The structure size and all other field offsets are unchanged.
 
-- **Added Component Unified ID (CUID) reporting APIs**.  
+- **Added Component Unified ID (CUID) reporting and node key APIs**.  
   - `amdsmi_get_gpu_cuid_info()` returns a device's primary and derived CUIDs together with the Component Type, the lookup stage that answered, and whether the value is auxiliary (a temporary CUID), in the new `amdsmi_cuid_info_t`. The new `amdsmi_cuid_source_t` and `amdsmi_cuid_component_type_t` enums name the on-wire values.
   - `amdsmi_get_gpu_device_cuid()` now returns the device's derived CUID.
-  - `amdsmi_get_cuid_components()` lists every component on the node that has a CUID (platform, CPU packages, GPUs, one entry per NIC function; a NIC's UnitID is its PCI function number) in the new `amdsmi_cuid_component_t`, with its BDF and sysfs path. It needs no processor handle.
+  - `amdsmi_set_cuid_seed()` sets the node key, and `amdsmi_get_cuid_seed_info()` reports whether an administrator set it and its fingerprint, in the new `amdsmi_cuid_seed_info_t`. The key lives in the `AmdCuidKey` UEFI variable and is read through amdgpu's `cuid_seed`. The key itself is never returned.
+  - `amdsmi_get_cuid_components()` lists every component on the node that has a CUID (platform, CPU packages, GPUs and partitions, one entry per NIC function; a NIC's UnitID is its PCI function number) in the new `amdsmi_cuid_component_t`, with its BDF and sysfs path. It needs no processor handle.
   - The entry points are exported whether or not the build links `libamdcuid`; without it they return `AMDSMI_STATUS_NOT_SUPPORTED`.
-  - The primary CUID of a GPU or partition comes from amdgpu's `cuid_primary` where amdgpu also exposes `cuid_unit_id`. There is no node key yet, so every derived CUID is temporary, and a GPU partition has none. A GPU in SPX, whose one partition covers every XCC, reports the whole GPU's CUID for its handle; a partition in DPX and above reports `N/A`.
-  - CLI: `amd-smi static --cuid` reports the CUID block and `--cuid-primary` adds the serial-bearing primary CUID (requires elevation). `amd-smi node --cuid` (`--cuid-primary` for root) lists every component's CUID. `--cuid` is opt-in.
-  - `amd-smi list` adds `cuid`, `identifier_kind`, `source`, `auxiliary` and `cuid_metadata_status`. The existing `uuid`/`gpu_uuid` fields keep reporting the CUID when available and the legacy UUID otherwise.
-  - Build: `BUILD_CUID` takes `AUTO` (default), `ON` or `OFF`. Without an installed `libamdcuid` package, the in-tree `shared/cuid` sources are built and absorbed into `libamd_smi`.
+  - Driver-published CUIDs need an amdgpu that exposes `cuid_derived`, `cuid_seed` and `cuid_seed_state`. Without it, GPUs get temporary CUIDs.
+  - CLI: `amd-smi static --cuid` reports the CUID block, `--cuid-primary` adds the serial-bearing primary CUID (requires elevation), and `amd-smi set --cuid-seed <file|->` sets the node key. `amd-smi node --cuid` (`--cuid-primary` for root) lists every component's CUID and the node key's state. `--cuid` is opt-in. `seed_provisioned` and `seed_fingerprint` are reported once per invocation, beside the per-GPU blocks.
+  - A GPU that publishes a partition node in every compute mode, such as an MI300-series GPU, has only partition handles, and each reports its partition's CUID. Where the partition has none, a GPU in SPX, whose one partition covers every XCC, reports the whole GPU's CUID; a partition in DPX and above reports `N/A`.
+  - `amd-smi list` adds `cuid`, `identifier_kind`, `source`, `auxiliary`, `effective_seed` and `cuid_metadata_status`. The existing `uuid`/`gpu_uuid` fields keep reporting the CUID when available and the legacy UUID otherwise.
+  - `effective_seed` reports the driver's `unprovisioned` or `provisioned` key state for driver-published CUIDs, `temporary` for auxiliary CUIDs, and `unknown` when it cannot be observed, including on partitions without their own driver node.
+  - Build: `BUILD_CUID` takes `AUTO` (default), `ON` or `OFF`. Without an installed `libamdcuid` package, the in-tree `shared/cuid` sources are built and absorbed into `libamd_smi`, and the package ships `/usr/lib/tmpfiles.d/amdcuid.conf`, which makes the `AmdCuidKey` variable readable by root only.
 
   ```shell
-  $ amd-smi static --cuid
+  $ sudo amd-smi static --cuid
+      SEED_PROVISIONED: False
+      SEED_FINGERPRINT: XXXXXXXXXXXXXXXX
+
   GPU: 0
       CUID:
           DERIVED_CUID: XXXXXXXX-XXXX-8XXX-XXXX-XXXXXXXXXXXX
           PRIMARY_CUID: N/A (not requested)
           COMPONENT_TYPE: GPU
-          AUXILIARY: True
-          SOURCE: LIBRARY
+          AUXILIARY: False
+          SOURCE: DRIVER
           IDENTIFIER_KIND: cuid
+          EFFECTIVE_SEED: unprovisioned
           CUID_METADATA_STATUS: available
   ```
 

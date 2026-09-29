@@ -385,6 +385,24 @@ class AMDSMIHelpers:
         except amdsmi_exception.AmdSmiLibraryException:
             return "N/A"
 
+    @staticmethod
+    def get_cuid_seed_state():
+        """The node key's provisioning state and fingerprint."""
+        seed_dict = {"seed_provisioned": "N/A", "seed_fingerprint": "N/A"}
+        try:
+            seed_info = amdsmi_interface.amdsmi_get_cuid_seed_info()
+            seed_dict["seed_provisioned"] = seed_info["provisioned"]
+            seed_dict["seed_fingerprint"] = seed_info["fingerprint"]
+        except (amdsmi_exception.AmdSmiLibraryException, AttributeError) as e:
+            if isinstance(e, amdsmi_exception.AmdSmiLibraryException) and (
+                e.get_error_code() == amdsmi_interface.amdsmi_wrapper.AMDSMI_STATUS_NO_PERM
+            ):
+                seed_dict["seed_provisioned"] = "N/A (requires root)"
+                seed_dict["seed_fingerprint"] = "N/A (requires root)"
+            logging.debug("Failed to get cuid seed info | %s", e)
+
+        return seed_dict
+
     def get_gpu_cuid_info(self, device_handle, include_primary=False):
         """CUID presentation metadata; unavailable metadata does not imply a legacy UUID."""
         result = {
@@ -394,6 +412,7 @@ class AMDSMIHelpers:
             "auxiliary": "unknown",
             "source": "UNKNOWN",
             "identifier_kind": "unknown",
+            "effective_seed": "unknown",
             "cuid_metadata_status": "unknown",
         }
         try:
@@ -409,6 +428,7 @@ class AMDSMIHelpers:
                     component_type="N/A",
                     auxiliary="N/A",
                     source="N/A",
+                    effective_seed="N/A",
                     cuid_metadata_status="not_supported",
                 )
             else:
@@ -440,7 +460,67 @@ class AMDSMIHelpers:
             result["cuid_metadata_status"] = "partial"
         if include_primary:
             result["primary_cuid"] = info.get("primary") or "N/A (requires root)"
+        if auxiliary is True:
+            result["effective_seed"] = "temporary"
+        elif auxiliary is False and result["source"] == "DRIVER":
+            result["effective_seed"] = self._get_driver_cuid_seed_state(device_handle, cuid)
         return result
+
+    def _get_driver_cuid_seed_state(self, device_handle, cuid):
+        """Observe the selected reader's public state; separate reads are not a transaction."""
+        try:
+            render = amdsmi_interface.amdsmi_get_gpu_enumeration_info(device_handle)["drm_render"]
+            if type(render) is not int or not 128 <= render < 0xFFFFFFFF:
+                return "unknown"
+            device = Path(f"/sys/class/drm/renderD{render}/device")
+            node = device / "xcp"
+            try:
+                node.lstat()
+            except FileNotFoundError:
+                try:
+                    (device / "current_compute_partition").lstat()
+                except FileNotFoundError:
+                    pass
+                else:
+                    return "unknown"
+                partition = amdsmi_interface.amdsmi_get_gpu_kfd_info(device_handle)[
+                    "current_partition_id"
+                ]
+                # Nonpartitioned GPUs also report zero. With no partition
+                # interfaces, zero follows the CUID producer's whole-device path.
+                if not (
+                    partition == "N/A" or (type(partition) is int and partition in (0, 0xFFFFFFFF))
+                ):
+                    return "unknown"
+                node = device
+            reader = node
+            node = reader.resolve(strict=True)
+            before = (node / "cuid_derived").read_text(encoding="ascii").strip()
+            state = (node / "cuid_seed_state").read_bytes()
+            after = (node / "cuid_derived").read_text(encoding="ascii").strip()
+            if reader == device:
+                for attribute in ("xcp", "current_compute_partition"):
+                    try:
+                        (device / attribute).lstat()
+                    except FileNotFoundError:
+                        continue
+                    return "unknown"
+            if (
+                before.lower() == cuid.lower() == after.lower()
+                and state in (b"unprovisioned\n", b"provisioned\n")
+                and reader.resolve(strict=True) == node
+            ):
+                return state.decode("ascii").strip()
+        except (
+            amdsmi_exception.AmdSmiLibraryException,
+            AttributeError,
+            KeyError,
+            OSError,
+            UnicodeError,
+            RuntimeError,
+        ):
+            pass
+        return "unknown"
 
     def get_gpu_choices(self):
         """Return dictionary of possible GPU choices and string of the output:
