@@ -4686,10 +4686,9 @@ TEST(WrapMicrotestIsolated, SelectAllGather_PlainKernelFallbackReportsGetAlgoInf
 
 // ===========================================================================
 // rcclSelectReduceScatter in rccl_wrap.cc. Own priority order:
-// symmetric (op sum OR avg -- distinct from AllReduce's sum-only) -> CE 2-shot
-// when RCCL_CE_REDUCESCATTER=1 and staging exists -> enqueue CE while staging
-// is still null -> DDA -> Hierarchical -> Direct -> symmetric (reported)
-// -> plain kernel. With the flag at its default of 0, CE is not selected.
+// symmetric eligibility gates CE 2-shot/DDA/Hierarchical/Direct, then registered
+// CE with zero-CTA policy or force preempts symmetric -> symmetric (reported) ->
+// plain kernel. With RCCL_CE_REDUCESCATTER at its default of 0, CE is not selected.
 // ===========================================================================
 
 TEST(WrapMicrotestIsolated, SelectReduceScatter_SymmetricGatedOnSumOrAvgOpOnly) {
@@ -5234,15 +5233,15 @@ TEST(WrapMicrotestIsolated, SelectReduceScatter_CeOptInSelectsRegisteredThenTwoS
       });
 }
 
-// CE must not preempt a symmetric-kernel decision. This arms the registered CE
-// branch as well as symk so the priority ordering itself is covered.
-TEST(WrapMicrotestIsolated, SelectReduceScatter_SymmetricPreemptsCeRegistered) {
+// Primus uses registered symmetric buffers on a dedicated zero-CTA communicator.
+// Registered CE must therefore preempt symk when both paths are eligible.
+TEST(WrapMicrotestIsolated, SelectReduceScatter_CeRegisteredPreemptsSymmetric) {
   RUN_ISOLATED_TEST(
-      "Wrap_SelectReduceScatter_SymmetricPreemptsCeRegistered",
+      "Wrap_SelectReduceScatter_CeRegisteredPreemptsSymmetric",
       []() {
         g_loadParam = [](const char* env, int64_t defaultValue) {
           if (std::strcmp(env, "RCCL_CE_REDUCESCATTER") == 0) return (int64_t)1;
-          if (std::strcmp(env, "RCCL_FORCE_CE_REDUCESCATTER") == 0) return (int64_t)1;
+          if (std::strcmp(env, "RCCL_FORCE_CE_REDUCESCATTER") == 0) return (int64_t)0;
           if (std::strcmp(env, "RCCL_CE_AR_MAX_MSG_BYTES") == 0) return (int64_t)268435456;
           return defaultValue;
         };
@@ -5260,7 +5259,7 @@ TEST(WrapMicrotestIsolated, SelectReduceScatter_SymmetricPreemptsCeRegistered) {
         rcclCollDecision decision{};
         EXPECT_EQ(ncclSuccess, rcclSelectReduceScatter(comm, nullptr, nullptr, /*recvcount=*/8, ncclFloat32,
                                                         ncclSum, /*query=*/false, &decision));
-        EXPECT_EQ((int)rcclAddonAlgos_t::RCCL_SYMMETRIC, decision.algo);
+        EXPECT_EQ((int)rcclAddonAlgos_t::RCCL_CE_REGISTERED, decision.algo);
         DeleteCommWithArch(comm);
       });
 }

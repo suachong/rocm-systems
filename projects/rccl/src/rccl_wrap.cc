@@ -1924,7 +1924,7 @@ ncclResult_t rcclSelectReduceScatter(struct ncclComm* comm, const void* sendbuff
       datatype != ncclFloat8e4m3 && datatype != ncclFloat8e5m2;
     if (!ceReduceScatterOpSupported || !ceReduceScatterTypeSupported || !rcclParamCeReduceScatter())
       ceAvailable = false;
-    if (!symEligible && ceAvailable && ((comm->config.CTAPolicy & NCCL_CTA_POLICY_ZERO) || force)) {
+    if (ceAvailable && ((comm->config.CTAPolicy & NCCL_CTA_POLICY_ZERO) || force)) {
       decision->algo = RCCL_CE_REGISTERED;
       decision->nMaxChannels = ncclCeLocalReduceBlocks(datatype, recvcount);
       return ncclSuccess;
