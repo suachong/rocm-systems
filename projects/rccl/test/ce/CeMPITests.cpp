@@ -952,6 +952,46 @@ TEST_F(CeMPI_ReduceScatter, Bfloat16Average)
     assertCEPathTaken("CeMPI_ReduceScatter/Bfloat16Average");
 }
 
+// Primus batches gradient collectives between ncclGroupStart/End. Exercise the
+// queued CE dispatch path rather than only the eager public-API path above.
+TEST_F(CeMPI_ReduceScatter, GroupedBfloat16Average)
+{
+    if(!validateTestPrerequisites(kMinRanks8))
+        GTEST_SKIP() << "Need >= " << kMinRanks8 << " MPI ranks";
+
+    ASSERT_EQ(ncclSuccess, createTestCommunicator());
+
+    int rank{}, nRanks{};
+    ncclCommUserRank(getActiveCommunicator(), &rank);
+    ncclCommCount(getActiveCommunicator(), &nRanks);
+    const size_t recvcount = kSmallCount;
+    const size_t totalElem = recvcount * static_cast<size_t>(nRanks);
+
+    hip_bfloat16* sendBuf = nullptr;
+    hip_bfloat16* recvBuf = nullptr;
+    ASSERT_EQ(hipSuccess, hipMalloc(&sendBuf, totalElem * sizeof(hip_bfloat16)));
+    ASSERT_EQ(hipSuccess, hipMalloc(&recvBuf, recvcount * sizeof(hip_bfloat16)));
+    RCCLTestGuards::DeviceBufferAutoGuard sendGuard(sendBuf);
+    RCCLTestGuards::DeviceBufferAutoGuard recvGuard(recvBuf);
+    ASSERT_EQ(hipSuccess,
+              initializeBufferWithPattern<hip_bfloat16>(
+                  sendBuf, totalElem,
+                  [rank](size_t) { return hip_bfloat16(static_cast<float>(rank + 1)); }));
+
+    ASSERT_EQ(ncclSuccess, ncclGroupStart());
+    ASSERT_EQ(ncclSuccess,
+              ncclReduceScatter(sendBuf, recvBuf, recvcount, ncclBfloat16, ncclAvg,
+                                getActiveCommunicator(), getActiveStream()));
+    ASSERT_EQ(ncclSuccess, ncclGroupEnd());
+    ASSERT_EQ(hipSuccess, hipStreamSynchronize(getActiveStream()));
+
+    const hip_bfloat16 expected(static_cast<float>(nRanks + 1) / 2.0f);
+    ASSERT_TRUE(verifyBufferData<hip_bfloat16>(
+        recvBuf, recvcount, [expected](size_t) { return expected; }))
+        << "Rank " << rank << ": grouped CE ReduceScatter BF16 Avg verification failed";
+    assertCEPathTaken("CeMPI_ReduceScatter/GroupedBfloat16Average");
+}
+
 // ===========================================================================
 // CeMPI_Fallback – CE not taken for AllReduce when RCCL_CE_ALLREDUCE is off
 // ===========================================================================

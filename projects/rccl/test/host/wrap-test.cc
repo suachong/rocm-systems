@@ -5229,6 +5229,7 @@ TEST(WrapMicrotestIsolated, SelectReduceScatter_CeOptInSelectsRegisteredThenTwoS
         EXPECT_EQ(ncclSuccess, rcclSelectReduceScatter(comm, nullptr, nullptr, /*recvcount=*/8, ncclFloat32,
                                                         ncclSum, /*query=*/false, &decision));
         EXPECT_EQ((int)rcclAddonAlgos_t::RCCL_CE_2SHOT, decision.algo);
+
         DeleteCommWithArch(comm);
       });
 }
@@ -5269,6 +5270,16 @@ TEST(WrapMicrotestIsolated, SelectReduceScatter_ForcePipelinesPrimusBfloat16AvgA
                   rcclSelectReduceScatter(comm, nullptr, nullptr, kPrimusRecvCount, ncclBfloat16, ncclAvg,
                                           /*query=*/false, &decision));
         EXPECT_EQ((int)rcclAddonAlgos_t::RCCL_CE_2SHOT, decision.algo);
+
+        // Primus issues the same collective between ncclGroupStart/End. The
+        // grouped call must stay queued and use CE at group end rather than
+        // executing the eager 2-shot path or falling back to symk.
+        ncclGroupDepth = 1;
+        EXPECT_EQ(ncclSuccess,
+                  rcclSelectReduceScatter(comm, nullptr, nullptr, kPrimusRecvCount, ncclBfloat16, ncclAvg,
+                                          /*query=*/false, &decision));
+        EXPECT_EQ((int)rcclAddonAlgos_t::RCCL_CE_REGISTERED, decision.algo);
+        ncclGroupDepth = 0;
         DeleteCommWithArch(comm);
       });
 }

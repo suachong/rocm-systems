@@ -1836,14 +1836,15 @@ ncclResult_t rcclSelectReduceScatter(struct ncclComm* comm, const void* sendbuff
     const bool force = rcclParamForceCeReduceScatter() != 0;
     const bool symReg =
       ncclCeAvailable(comm, ncclFuncReduceScatter, (int)op, datatype, rsWinRegType, rsSendWin, rsRecvWin);
-    const bool ceReduceScatterAllowed = ncclGroupDepth == 0 && ceArGraphAllowed &&
+    const bool ceReduceScatterAllowed = ceArGraphAllowed &&
                                         rcclUseCeReduceScatter(comm, recvcount, datatype, op) && (force || symReg);
     // Explicit force mode must preempt symk and use the pipelined staging path,
     // including for messages above the tuned 2-shot cap. Without this, Primus'
     // registered gradient buffers silently select symk even though the user
     // requested CE. Non-force mode preserves the tuned symk precedence here;
     // registered CE still has its independent branch below.
-    if ((force || !symEligible) && ceReduceScatterAllowed && comm->ceColl.ceARTmpBuf != NULL) {
+    if ((force || !symEligible) && ceReduceScatterAllowed && ncclGroupDepth == 0 &&
+        comm->ceColl.ceARTmpBuf != NULL) {
       decision->algo = RCCL_CE_2SHOT;
       decision->nMaxChannels = ncclCeLocalReduceBlocks(datatype, recvcount);
       return ncclSuccess;
@@ -1852,7 +1853,12 @@ ncclResult_t rcclSelectReduceScatter(struct ncclComm* comm, const void* sendbuff
     // by the CE launch, which the 2-shot early-return never reaches. Hand this
     // call to enqueue so CE init runs and ncclLaunchCeColl allocates staging.
     // Otherwise DDA is suppressed below and the call stays on the ring kernel.
-    if ((force || !symEligible) && ceReduceScatterAllowed && comm->ceColl.ceARTmpBuf == NULL) {
+    // Grouped collectives cannot execute the eager 2-shot return above: they
+    // must remain queued until ncclGroupEnd. RCCL_CE_REGISTERED is the queued
+    // CE dispatch token even when force mode uses internal staging rather than
+    // registered user buffers. It also initializes staging on the first call.
+    if ((force || !symEligible) && ceReduceScatterAllowed &&
+        (ncclGroupDepth != 0 || comm->ceColl.ceARTmpBuf == NULL)) {
       decision->algo = RCCL_CE_REGISTERED;
       decision->nMaxChannels = ncclCeLocalReduceBlocks(datatype, recvcount);
       return ncclSuccess;
