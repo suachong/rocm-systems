@@ -24,7 +24,7 @@
 #endif
 
 #ifndef NCCL_CE_NUM_SLOTS
-#define NCCL_CE_NUM_SLOTS 2
+#define NCCL_CE_NUM_SLOTS 12
 #endif
 
 namespace cg = cooperative_groups;
@@ -270,7 +270,12 @@ __global__ __launch_bounds__(256) void ncclCeLocalReduceKernelVec(
     const size_t currentChunkElems = isTailChunk ? tailChunkElems : baseChunkElems;
     const size_t nVec = currentChunkElems / W;
     if (totalSteps > 1) {
-      if (blockIdx.x == 0 && threadIdx.x == 0) {
+      // With one slot per step, blocks are independent: each block can wait
+      // for this slot locally and advance without a grid-wide rendezvous.
+      // The grid barrier remains necessary when slots are reused, because the
+      // producer must not overwrite a slot until every block has consumed it.
+      if ((totalSteps <= NCCL_CE_NUM_SLOTS && threadIdx.x == 0) ||
+          (totalSteps > NCCL_CE_NUM_SLOTS && blockIdx.x == 0 && threadIdx.x == 0)) {
         while (true) {
           int ready = 0;
           for (int r = 0; r < nRanks; r++) {
@@ -286,7 +291,9 @@ __global__ __launch_bounds__(256) void ncclCeLocalReduceKernelVec(
           __builtin_amdgcn_s_sleep(1);
         }
       }
-      if (!coopLaunch) {
+      if (totalSteps <= NCCL_CE_NUM_SLOTS) {
+        __syncthreads();
+      } else if (!coopLaunch) {
         ncclCeBlockBarrier(blockIdx.x, &s_gen, d_barrierSync);
       } else {
         cg::this_grid().sync();
@@ -392,7 +399,7 @@ __global__ __launch_bounds__(256) void ncclCeLocalReduceKernelVec(
         chunkOut[globalIdx] = a;
       }
     }
-    if (totalSteps > 1) {
+    if (totalSteps > NCCL_CE_NUM_SLOTS) {
       if (!coopLaunch) {
         ncclCeBlockBarrier(blockIdx.x, &s_gen, d_barrierSync);
       } else {

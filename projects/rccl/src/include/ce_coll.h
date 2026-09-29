@@ -37,7 +37,7 @@
 #endif
 
 #ifndef NCCL_CE_NUM_SLOTS
-#define NCCL_CE_NUM_SLOTS 2
+#define NCCL_CE_NUM_SLOTS 12
 #endif
 
 // Per-rank staging capacity in ceARTmpBuf (fixed default; use ceArStagingBytes for runtime value).

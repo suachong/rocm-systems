@@ -2579,7 +2579,7 @@ ncclResult_t ncclCeReduceScatter(struct ncclComm* comm, const void* sendbuff, vo
                     ret, fail);
     }
   }
-  if (totalSteps > 1) {
+  if (totalSteps > (size_t)NUM_SLOTS) {
     if (startCh < 0) {
       startCh = 0;
     }
@@ -2596,12 +2596,23 @@ ncclResult_t ncclCeReduceScatter(struct ncclComm* comm, const void* sendbuff, vo
       }
       CUCHECKGOTO(hipStreamBatchMemOp(ceStream, comm->nRanks, waits.data(), 0), ret, fail);
     }
+  }
+  if (totalSteps > 1) {
     NCCLCHECKGOTO(ncclMemOpSync(comm, ceStream, &collArgs), ret, fail);
   }
 
   if (totalSteps > 1) {
     CUDACHECKGOTO(cudaEventRecord(ceColl->synceEvent, ceStream), ret, fail);
     CUDACHECKGOTO(cudaStreamWaitEvent(stream, ceColl->synceEvent, 0), ret, fail);
+    if (totalSteps <= (size_t)NUM_SLOTS) {
+      // No-reuse kernels deliberately leave readiness at 1 so every block can
+      // advance independently. Reset only after both the reduction kernel and
+      // scatter stream have completed; the next collective is ordered behind
+      // this memset on the caller stream.
+      CUDACHECKGOTO(cudaMemsetAsync(signalBuffer, 0,
+                                    NUM_SLOTS * (size_t)comm->nRanks * sizeof(uint32_t), stream),
+                    ret, fail);
+    }
   }
 exit:
   ncclCeFreeBatchOpsParams(&batchOpsParams);
