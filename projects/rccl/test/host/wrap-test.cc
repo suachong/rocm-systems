@@ -5233,6 +5233,46 @@ TEST(WrapMicrotestIsolated, SelectReduceScatter_CeOptInSelectsRegisteredThenTwoS
       });
 }
 
+// Primus coalesces the GPT-OSS gradient bucket into 139,370,448 BF16 values
+// per rank (2,229,927,168 bytes across eight ranks). That is intentionally
+// larger than the tuned 256 MiB 2-shot window, but CE ReduceScatter supports
+// it by chunking over the reusable staging slots. Explicit force mode must
+// therefore bypass both the tuning cap and an otherwise-eligible symk path.
+TEST(WrapMicrotestIsolated, SelectReduceScatter_ForcePipelinesPrimusBfloat16AvgAboveCap) {
+  RUN_ISOLATED_TEST(
+      "Wrap_SelectReduceScatter_ForcePipelinesPrimusBfloat16AvgAboveCap",
+      []() {
+        g_loadParam = [](const char* env, int64_t defaultValue) {
+          if (std::strcmp(env, "RCCL_CE_REDUCESCATTER") == 0) return (int64_t)1;
+          if (std::strcmp(env, "RCCL_FORCE_CE_REDUCESCATTER") == 0) return (int64_t)1;
+          if (std::strcmp(env, "RCCL_CE_AR_MAX_MSG_BYTES") == 0) return (int64_t)(256ULL * 1024 * 1024);
+          return defaultValue;
+        };
+        ScopedHook symRequested(g_isSymmetricKernelRequested, [](struct ncclComm*, ncclFunc_t, int, ncclDataType_t,
+                                                                  size_t, const void*, void*, bool) { return true; });
+        alignas(16) static uint8_t staging;
+        ncclComm* comm = MakeSelectComm();
+        comm->nRanks = 8;
+        comm->nNodes = 1;
+        comm->symmetricSupport = true;
+        comm->ceColl.graphModeSeen = false;
+        comm->ceColl.ceARTmpBuf = nullptr;
+        rcclCollDecision decision{};
+        constexpr size_t kPrimusRecvCount = 139370448;
+        EXPECT_EQ(ncclSuccess,
+                  rcclSelectReduceScatter(comm, nullptr, nullptr, kPrimusRecvCount, ncclBfloat16, ncclAvg,
+                                          /*query=*/false, &decision));
+        EXPECT_EQ((int)rcclAddonAlgos_t::RCCL_CE_REGISTERED, decision.algo);
+
+        comm->ceColl.ceARTmpBuf = &staging;
+        EXPECT_EQ(ncclSuccess,
+                  rcclSelectReduceScatter(comm, nullptr, nullptr, kPrimusRecvCount, ncclBfloat16, ncclAvg,
+                                          /*query=*/false, &decision));
+        EXPECT_EQ((int)rcclAddonAlgos_t::RCCL_CE_2SHOT, decision.algo);
+        DeleteCommWithArch(comm);
+      });
+}
+
 // Primus uses registered symmetric buffers on a dedicated zero-CTA communicator.
 // Registered CE must therefore preempt symk when both paths are eligible.
 TEST(WrapMicrotestIsolated, SelectReduceScatter_CeRegisteredPreemptsSymmetric) {

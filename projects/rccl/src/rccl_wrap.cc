@@ -1233,17 +1233,14 @@ bool rcclUseCeReduceScatter(struct ncclComm* comm, size_t recvcount, ncclDataTyp
     return false;
   }
 
-  // Same 2-shot window as CE AllReduce. 0 means 2-shot is tuned off.
+  // Same tuned 2-shot window as CE AllReduce.  Force mode deliberately
+  // bypasses this policy cap: ReduceScatter's staging implementation chunks
+  // and pipelines messages larger than ceArStagingBytes, so the cap is not an
+  // allocation or correctness limit.
   const size_t twoShotMax = rcclCeAr2ShotMax(comm);
-  if (twoShotMax == 0) return false;
   size_t msgBytes = recvcount * ncclTypeSize(datatype) * (size_t)comm->nRanks;
-  if (msgBytes > twoShotMax) {
-    if (force) {
-      WARN("Skipping CE ReduceScatter despite RCCL_FORCE_CE_REDUCESCATTER=1: msgBytes (%zu) > twoShotMax (%zu)",
-           msgBytes, twoShotMax);
-    } else {
-      WARN("Skipping CE ReduceScatter: msgBytes (%zu) > twoShotMax (%zu)", msgBytes, twoShotMax);
-    }
+  if (!force && (twoShotMax == 0 || msgBytes > twoShotMax)) {
+    WARN("Skipping CE ReduceScatter: msgBytes (%zu) exceeds tuned twoShotMax (%zu)", msgBytes, twoShotMax);
     return false;
   }
 
@@ -1841,7 +1838,12 @@ ncclResult_t rcclSelectReduceScatter(struct ncclComm* comm, const void* sendbuff
       ncclCeAvailable(comm, ncclFuncReduceScatter, (int)op, datatype, rsWinRegType, rsSendWin, rsRecvWin);
     const bool ceReduceScatterAllowed = ncclGroupDepth == 0 && ceArGraphAllowed &&
                                         rcclUseCeReduceScatter(comm, recvcount, datatype, op) && (force || symReg);
-    if (!symEligible && ceReduceScatterAllowed && comm->ceColl.ceARTmpBuf != NULL) {
+    // Explicit force mode must preempt symk and use the pipelined staging path,
+    // including for messages above the tuned 2-shot cap. Without this, Primus'
+    // registered gradient buffers silently select symk even though the user
+    // requested CE. Non-force mode preserves the tuned symk precedence here;
+    // registered CE still has its independent branch below.
+    if ((force || !symEligible) && ceReduceScatterAllowed && comm->ceColl.ceARTmpBuf != NULL) {
       decision->algo = RCCL_CE_2SHOT;
       decision->nMaxChannels = ncclCeLocalReduceBlocks(datatype, recvcount);
       return ncclSuccess;
@@ -1850,7 +1852,7 @@ ncclResult_t rcclSelectReduceScatter(struct ncclComm* comm, const void* sendbuff
     // by the CE launch, which the 2-shot early-return never reaches. Hand this
     // call to enqueue so CE init runs and ncclLaunchCeColl allocates staging.
     // Otherwise DDA is suppressed below and the call stays on the ring kernel.
-    if (!symEligible && ceReduceScatterAllowed && comm->ceColl.ceARTmpBuf == NULL) {
+    if ((force || !symEligible) && ceReduceScatterAllowed && comm->ceColl.ceARTmpBuf == NULL) {
       decision->algo = RCCL_CE_REGISTERED;
       decision->nMaxChannels = ncclCeLocalReduceBlocks(datatype, recvcount);
       return ncclSuccess;
