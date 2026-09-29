@@ -33,7 +33,7 @@
 #endif
 
 #ifndef NCCL_CE_REDUCE_MAX_BLOCKS
-#define NCCL_CE_REDUCE_MAX_BLOCKS 46
+#define NCCL_CE_REDUCE_MAX_BLOCKS 92
 #endif
 
 #ifndef NCCL_CE_NUM_SLOTS

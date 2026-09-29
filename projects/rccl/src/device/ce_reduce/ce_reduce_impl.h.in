@@ -20,7 +20,7 @@
 // uses to size the signal buffer and slot strides. The guards let a build
 // override both consistently from the command line.
 #ifndef NCCL_CE_REDUCE_MAX_BLOCKS
-#define NCCL_CE_REDUCE_MAX_BLOCKS 46
+#define NCCL_CE_REDUCE_MAX_BLOCKS 92
 #endif
 
 #ifndef NCCL_CE_NUM_SLOTS
