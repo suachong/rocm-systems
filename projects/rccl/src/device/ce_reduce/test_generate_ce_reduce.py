@@ -358,6 +358,11 @@ class CeReducePersistentContractTest(unittest.TestCase):
         self.assertNotIn("CeReducePreOp", self.impl)
         self.assertIn("CeReducePostOp<T, RedOp>::apply(a, nRanks)", self.impl)
 
+    def test_bf16_avg_uses_packed_pair_arithmetic(self) -> None:
+        self.assertIn("struct CeReducePackOp<hip_bfloat16, 4>", self.impl)
+        self.assertIn("__hadd2(acc2[k], value2[k])", self.impl)
+        self.assertIn("__hmul2(value2[k], scale.pair)", self.impl)
+
     def test_launch_bounds_matches_launcher_thread_count(self) -> None:
         bounds = re.search(r"__launch_bounds__\((\d+)\)", self.impl)
         threads = re.search(r"const int threads\s*=\s*(\d+);", self.launcher)

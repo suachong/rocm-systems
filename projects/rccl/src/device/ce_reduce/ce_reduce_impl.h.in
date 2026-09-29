@@ -12,6 +12,7 @@
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
 #include <hip/hip_bfloat16.h>
+#include <hip/hip_bf16.h>
 #include <hip/hip_cooperative_groups.h>
 #include <stdint.h>
 #include <algorithm>
@@ -218,6 +219,51 @@ struct CeReducePostOp<hip_bfloat16, 4> {
   }
 };
 
+template <typename T, int RedOp>
+struct CeReducePackOp {
+  template <int W>
+  __device__ __forceinline__ static void apply(T (&acc)[W], const T (&value)[W]) {
+    for (int k = 0; k < W; k++) acc[k] = ReduceOp<T, RedOp>::apply(acc[k], value[k]);
+  }
+};
+
+// MI355X executes two BF16 additions per __hadd2. The CE vector path is
+// 16-byte aligned and BF16 packs always have an even width, so reduce each
+// pair directly instead of lowering every lane through scalar operators.
+template <>
+struct CeReducePackOp<hip_bfloat16, 4> {
+  template <int W>
+  __device__ __forceinline__ static void apply(hip_bfloat16 (&acc)[W], const hip_bfloat16 (&value)[W]) {
+    static_assert(W % 2 == 0, "BF16 packed reduction requires an even vector width");
+    __hip_bfloat162* acc2 = reinterpret_cast<__hip_bfloat162*>(acc);
+    const __hip_bfloat162* value2 = reinterpret_cast<const __hip_bfloat162*>(value);
+    for (int k = 0; k < W / 2; k++) acc2[k] = __hadd2(acc2[k], value2[k]);
+  }
+};
+
+template <typename T, int RedOp>
+struct CeReducePackPostOp {
+  template <int W>
+  __device__ __forceinline__ static void apply(T (&value)[W], int nRanks) {
+    for (int k = 0; k < W; k++) value[k] = CeReducePostOp<T, RedOp>::apply(value[k], nRanks);
+  }
+};
+
+template <>
+struct CeReducePackPostOp<hip_bfloat16, 4> {
+  template <int W>
+  __device__ __forceinline__ static void apply(hip_bfloat16 (&value)[W], int nRanks) {
+    static_assert(W % 2 == 0, "BF16 packed post-op requires an even vector width");
+    union Bf16Pair {
+      __hip_bfloat162 pair;
+      hip_bfloat16 lane[2];
+    } scale;
+    scale.lane[0] = scale.lane[1] = (hip_bfloat16)(1.0f / (float)nRanks);
+    __hip_bfloat162* value2 = reinterpret_cast<__hip_bfloat162*>(value);
+    for (int k = 0; k < W / 2; k++) value2[k] = __hmul2(value2[k], scale.pair);
+  }
+};
+
 // *********************************************************************************
 // ncclCeLocalReduceKernelVec<T, RedOp, U>
 //
@@ -331,12 +377,7 @@ __global__ __launch_bounds__(256) void ncclCeLocalReduceKernelVec(
         }
 #pragma unroll
         for (int i = 0; i < U; i++) {
-          // Intentionally no unroll/vectorize pragma:
-          // W is small and a compile-time constant, and any
-          // pragma here regresses runtime performance.
-          for (int k = 0; k < W; k++) {
-            acc[i].v[k] = ReduceOp<T, RedOp>::apply(acc[i].v[k], tmp[i].v[k]);
-          }
+          CeReducePackOp<T, RedOp>::apply(acc[i].v, tmp[i].v);
         }
       }
 #pragma unroll
@@ -344,8 +385,7 @@ __global__ __launch_bounds__(256) void ncclCeLocalReduceKernelVec(
         size_t outOffset = (vi + (size_t)i * stride) * W;
         T* dst = chunkOut + outOffset;
         if constexpr (RedOp == 4) {
-#pragma unroll
-          for (int k = 0; k < W; k++) acc[i].v[k] = CeReducePostOp<T, RedOp>::apply(acc[i].v[k], nRanks);
+          CeReducePackPostOp<T, RedOp>::apply(acc[i].v, nRanks);
         }
         if ((reinterpret_cast<uintptr_t>(dst) & 15) == 0) {
           *reinterpret_cast<LT*>(dst) = acc[i].vec;
@@ -372,15 +412,11 @@ __global__ __launch_bounds__(256) void ncclCeLocalReduceKernelVec(
           Pack tmp;
           size_t rankOffset = (size_t)r * slotChunkElems + vIdx * W;
           tmp.vec = *reinterpret_cast<const LT*>(slotIn + rankOffset);
-          // no pragma here, same rationale as the twin loop in the strided-unroll section above.
-          for (int k = 0; k < W; k++) {
-            acc.v[k] = ReduceOp<T, RedOp>::apply(acc.v[k], tmp.v[k]);
-          }
+          CeReducePackOp<T, RedOp>::apply(acc.v, tmp.v);
         }
         T* dst = chunkOut + vIdx * W;
         if constexpr (RedOp == 4) {
-#pragma unroll
-          for (int k = 0; k < W; k++) acc.v[k] = CeReducePostOp<T, RedOp>::apply(acc.v[k], nRanks);
+          CeReducePackPostOp<T, RedOp>::apply(acc.v, nRanks);
         }
         if ((reinterpret_cast<uintptr_t>(dst) & 15) == 0) {
           *reinterpret_cast<LT*>(dst) = acc.vec;
