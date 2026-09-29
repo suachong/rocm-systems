@@ -243,7 +243,8 @@ BlendCopy fixed_blend_copy(uint32_t control, uint32_t write_mask,
 template <typename T>
 T blend_component(uint32_t control, uint32_t component, const std::array<T, 4> &source,
                   const std::array<T, 4> &destination, const std::array<T, 4> &constant,
-                  bool fp32 = false, bool reduced_precision = false) {
+                  raster::BlendPrecision precision) {
+  const bool fp32 = precision == raster::BlendPrecision::Float32;
   const uint32_t operation = (control >> 5) & 7;
   if (operation == kBlendMin)
     return fp32 ? raster::blend_minmax(source[component], destination[component], false)
@@ -261,7 +262,7 @@ T blend_component(uint32_t control, uint32_t component, const std::array<T, 4> &
       return raster::BlendFactorMode::Inverse;
     return raster::BlendFactorMode::Direct;
   };
-  if (fp32 || reduced_precision) {
+  if (precision != raster::BlendPrecision::Unaligned) {
     const auto resolve = [&](uint32_t factor) {
       if (factor != kBlendSrcAlphaSaturate)
         return factor;
@@ -279,7 +280,7 @@ T blend_component(uint32_t control, uint32_t component, const std::array<T, 4> &
                               destination, constant);
     return raster::blend_products(source[component], sf, sm, destination[component], df, dm,
                                   operation == kBlendReverseSubtract, operation == kBlendSubtract,
-                                  reduced_precision);
+                                  precision);
   }
   const T source_term =
       source[component] * blend_factor(src, component, source, destination, constant);
@@ -428,8 +429,9 @@ uint8_t srgb_color_byte(double value) {
       0x3b24, 0x3b34, 0x3b44, 0x3b58, 0x3b68, 0x3b7a, 0x3b8c, 0x3b9c, 0x3bb0, 0x3bc0, 0x3bd4,
       0x3be4, 0x3bf8,
   };
-  // Comparing the unrounded blend result avoids a float conversion rounding up
-  // across an FP16 boundary before the color buffer truncates toward zero.
+  // The color buffer truncates to FP16 before sRGB encoding. Each boundary is
+  // the first half encoding that produces the next byte value; blended inputs
+  // have already undergone accumulator rounding.
   return static_cast<uint8_t>(std::upper_bound(std::begin(boundaries), std::end(boundaries), value,
                                                [](double linear, uint16_t half) {
                                                  return linear < util::f16_to_f32(half);
@@ -2513,12 +2515,12 @@ void GraphicsDraw::write_output_fragment(const Memory &memory, const FragmentWav
                   blend_can_copy(from, opt >> (alpha ? 16 : 0), alpha ? 3 : 0, mask, flags));
         };
         // Destination-preserving pixels leave the quad first. The remaining
-        // covered pixels must all permit a source copy to bypass arithmetic.
+        // exports, including helper lanes, must all permit a source copy to
+        // bypass arithmetic. Coverage only controls attachment writes.
         copy_source = true;
         for (uint32_t neighbor = lane & ~3u; neighbor < (lane & ~3u) + 4; ++neighbor) {
-          const auto &fragment = batch.lanes[neighbor];
           const auto &other = fragment_export(batch, neighbor, color.export_index);
-          if (!fragment.covered || !other.mask)
+          if (!other.mask)
             continue;
           const auto decoded_neighbor = decode_export(color.export_format, other);
           const uint32_t mask = decoded_neighbor.mask;
@@ -2535,14 +2537,15 @@ void GraphicsDraw::write_output_fragment(const Memory &memory, const FragmentWav
             store_unorm(c, source[c]);
       }
       if (!copy_source) {
+        const auto precision = unorm_blend  ? raster::BlendPrecision::Unorm
+                               : fp16_blend ? raster::BlendPrecision::Float16
+                               : fp32_blend ? raster::BlendPrecision::Float32
+                                            : raster::BlendPrecision::Unaligned;
         for (uint32_t c = 0; c < 4; ++c) {
           const uint32_t control = c == 3 && (blend & kBlendSeparateAlpha) ? blend >> 16 : blend;
-          const double blended =
-              blend_component(control, c, widen(source), widen(destination), widen(constant),
-                              fp32_blend, unorm_blend || fp16_blend);
+          const double blended = blend_component(control, c, widen(source), widen(destination),
+                                                 widen(constant), precision);
           if (unorm_blend) {
-            // Keep blend precision through quantization. Rounding to FP32
-            // first can cross a UNORM midpoint, even with FP16 exports.
             store_unorm(c, blended);
             continue;
           }

@@ -6647,10 +6647,46 @@ TEST_P(GraphicsExportTest, NormalizedBlendingUsesHardwarePrecisionAndQuadBypass)
     std::array<uint32_t, 4> initial, expected;
     std::array<std::array<uint32_t, 2>, 4> exported;
     std::array<uint32_t, 4> constants{0xbf400000, 0x3e99999a, 0x3fa00000, 0x3f266666};
+    bool triangle = false;
+    uint32_t exported_lanes = 15;
   };
   // Raw physical RDNA3/4 quad captures. Epsilon is programmed state: run both
   // settings on each simulated architecture, including RDNA3.5.
   const Case cases[] = {
+      // Physical RDNA3/4 round the blend accumulator before the sRGB encoder
+      // truncates to FP16. Without that rounding, each RGB channel is one low.
+      {"srgb accumulator rounding",
+       true,
+       6,
+       0x60010501u,
+       0,
+       {0x6fb0b0b0u, 0x76b5b5b5u, 0x3b848484u, 0x357e7e7eu},
+       {0x09cfcfcfu, 0x02d4d4d4u, 0x2ad0d0d0u, 0x3bd2d2d2u},
+       {{{0x32753275u, 0x285b3275u},
+         {0x32433243u, 0x1fd83243u},
+         {0x36f436f4u, 0x315136f4u},
+         {0x37b037b0u, 0x336f37b0u}}}},
+      // Physical RDNA3/4 include an uncovered helper's export in the quad
+      // decision. Without that export, the near-one alpha bypasses blending.
+      {.name = "uncovered helper vetoes source copy",
+       .srgb = false,
+       .epsilon = 6,
+       .blend = 0x40000504u,
+       .opt = 0x01540154u,
+       .initial = {0x01bdc1bdu, 0x01bdc1bdu, 0x01bdc1bdu, 0x01bdc1bdu},
+       .expected = {0x01bdc1bdu, 0x01bdc1bdu, 0xfe000000u, 0x01bdc1bdu},
+       .exported = {{{0, 0}, {0, 0}, {0, 0x3bfd0000u}, {0, 0x3b750000u}}},
+       .triangle = true},
+      {.name = "unexported helper permits source copy",
+       .srgb = false,
+       .epsilon = 6,
+       .blend = 0x40000504u,
+       .opt = 0x01540154u,
+       .initial = {0x01bdc1bdu, 0x01bdc1bdu, 0x01bdc1bdu, 0x01bdc1bdu},
+       .expected = {0x01bdc1bdu, 0x01bdc1bdu, 0xff000000u, 0x01bdc1bdu},
+       .exported = {{{0, 0}, {0, 0}, {0, 0x3bfd0000u}, {0, 0x3b750000u}}},
+       .triangle = true,
+       .exported_lanes = 7},
       {"srgb add exact",
        true,
        0,
@@ -6872,6 +6908,11 @@ TEST_P(GraphicsExportTest, NormalizedBlendingUsesHardwarePrecisionAndQuadBypass)
     for (uint32_t c = 0; c < 4; ++c)
       ctx[0x105 + c] = test.constants[c];
     ctx[0x10f] = ctx[0x110] = ctx[0x111] = ctx[0x112] = std::bit_cast<uint32_t>(2.0f);
+    if (test.triangle) {
+      // The triangle covers x+y < 2.5, leaving only lane 3 as a helper.
+      state.uconfig_registers[0x242] = 4;
+      ctx[0x10f] = ctx[0x110] = ctx[0x111] = ctx[0x112] = std::bit_cast<uint32_t>(1.25f);
+    }
     ctx[0x91] = gfx12 ? 1 | (1 << 16) : 2 | (2 << 16);
     const auto address = [&](uint32_t pixel) {
       return gfx12 ? *amdgpu::gfx12_image_address(0x100000, pixel & 1, pixel >> 1, 4, 4, 3)
@@ -6883,9 +6924,13 @@ TEST_P(GraphicsExportTest, NormalizedBlendingUsesHardwarePrecisionAndQuadBypass)
     export_rectangle_vertices(*draw);
     ASSERT_TRUE(draw->advance(*access_));
     initialize_fragment(draw);
-    for (uint32_t pixel = 0; pixel < 4; ++pixel)
-      draw->export_lane(*wave_, pixel, 0, 3,
-                        {test.exported[pixel][0], test.exported[pixel][1], 0, 0});
+    for (uint32_t pixel = 0; pixel < 4; ++pixel) {
+      EXPECT_EQ(amdgpu::GraphicsDrawTestAccess::covered(*draw, 0, pixel),
+                !test.triangle || pixel != 3);
+      if (test.exported_lanes & (1u << pixel))
+        draw->export_lane(*wave_, pixel, 0, 3,
+                          {test.exported[pixel][0], test.exported[pixel][1], 0, 0});
+    }
     EXPECT_FALSE(draw->advance(*access_));
     for (uint32_t pixel = 0; pixel < 4; ++pixel)
       EXPECT_EQ(memory_.read32(address(pixel)), test.expected[pixel]) << pixel;
@@ -6906,6 +6951,26 @@ TEST_P(GraphicsExportTest, ColorBlendingPreservesMasksAndUsesSeparateAlpha) {
   };
   constexpr uint32_t enabled = 1u << 30, separate = 1u << 29;
   const Case cases[] = {
+      // Physical RDNA3/4 round the aligned UNORM blend sum to FP32. These
+      // premultiplied-over results straddle three different quantization ties.
+      {.blend = enabled | 1 | (5 << 8),
+       .mask = 15,
+       .expected = 0x8b6d7679,
+       .export_format = 4,
+       .initial = 0x6850575a,
+       .exported = {0x326f3289, 0x338631f0, 0, 0}},
+      {.blend = enabled | 1 | (5 << 8),
+       .mask = 15,
+       .expected = 0x52414341,
+       .export_format = 4,
+       .initial = 0x4e3d3f3e,
+       .exported = {0x24f824bc, 0x259b24dc, 0, 0}},
+      {.blend = enabled | 1 | (5 << 8),
+       .mask = 15,
+       .expected = 0x6a545b5d,
+       .export_format = 4,
+       .initial = 0x45353837,
+       .exported = {0x31cc3217, 0x326b312d, 0, 0}},
       // Physical RDNA3/4 give blending precedence over XOR, including ZERO/ZERO.
       {.blend = enabled, .mask = 15, .expected = 0, .color_control = 0x660010},
       {.blend = enabled | 1, .mask = 15, .expected = 0x80404080, .color_control = 0x660010},
@@ -6939,8 +7004,8 @@ TEST_P(GraphicsExportTest, ColorBlendingPreservesMasksAndUsesSeparateAlpha) {
        .expected = 0x8d5c155a,
        .initial = 0x20760005,
        .exported = {0x3f4bc000, 0x3e40c000, 0x3e60e000, 0x3edac000}},
-      // Physical HPP depth-peeling inputs: the red blend lies just above
-      // the 141/142 midpoint, but rounding it to FP32 first gives 141.
+      // Physical HPP depth-peeling inputs: alignment's sticky bit breaks the
+      // FP32 tie upward. Dropping it gives 141 instead of 142.
       {.blend = enabled | separate | 4 | (3 << 8) | (1 << 16),
        .mask = 15,
        .expected = 0xef02968e,
@@ -6993,6 +7058,7 @@ TEST_P(GraphicsExportTest, ColorBlendingPreservesMasksAndUsesSeparateAlpha) {
     SCOPED_TRACE(swap);
     for (const auto &test : cases) {
       SCOPED_TRACE(test.blend);
+      SCOPED_TRACE(test.expected);
       auto state = rectangle_state();
       auto &context = state.context_registers;
       context[gfx12 ? 0x3b0 : 0x31c] = 10 | (test.number_format << 8) | (swap << 11);
@@ -7023,7 +7089,7 @@ TEST_P(GraphicsExportTest, ColorBlendingPreservesMasksAndUsesSeparateAlpha) {
       ASSERT_TRUE(draw->advance(*access_));
       initialize_fragment(draw);
       for (uint32_t lane = 0; lane < wave_->wf_size(); ++lane)
-        draw->export_lane(*wave_, lane, 0, 15, test.exported);
+        draw->export_lane(*wave_, lane, 0, test.export_format == 4 ? 3 : 15, test.exported);
       EXPECT_FALSE(draw->advance(*access_));
       EXPECT_EQ(memory_.read32(0x100000), memory_word(test.expected));
     }
