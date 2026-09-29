@@ -872,7 +872,7 @@ protected:
         const size_t totalElem = recvcount * static_cast<size_t>(nRanks);
         void* sendBuf = nullptr;
         ASSERT_EQ(hipSuccess, hipMalloc(&sendBuf, totalElem * sizeof(float)));
-        DeviceBufferAutoGuard sendGuard(sendBuf);
+        RCCLTestGuards::DeviceBufferAutoGuard sendGuard(sendBuf);
         fillRankScalar(sendBuf, totalElem, rank);
 
         void* recvAllocation = nullptr;
@@ -886,7 +886,7 @@ protected:
             ASSERT_EQ(hipSuccess, hipMalloc(&recvAllocation, recvcount * sizeof(float)));
             recvBuf = static_cast<float*>(recvAllocation);
         }
-        DeviceBufferAutoGuard recvGuard(recvAllocation);
+        RCCLTestGuards::DeviceBufferAutoGuard recvGuard(recvAllocation);
 
         ASSERT_EQ(ncclSuccess,
                   ncclReduceScatter(sendBuf, recvBuf, recvcount, ncclFloat32, ncclSum,
