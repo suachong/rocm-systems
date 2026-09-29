@@ -11643,6 +11643,108 @@ TEST_P(GraphicsExportTest, AnisotropicDirectionMatchesPhysicalMatricesAndSignedT
   EXPECT_EQ(wave_->debug_read_vgpr(12, 31), 0xdeadbeefu);
 }
 
+TEST_P(GraphicsExportTest, AnisotropicOrientationMatchesPhysicalDiagonalTies) {
+  const bool gfx12 = GetParam() == ROCJITSU_CODE_ARCH_RDNA4;
+  const auto layout = amdgpu::image_mip_layout(gfx12, 0, 16, 64, 16, 1, 0);
+  ASSERT_TRUE(layout);
+  // Separable ramps are symmetric under a V sign change. Ramps kinked along
+  // both texel diagonals expose the footprint orientation.
+  for (uint32_t y = 0; y < 16; ++y)
+    for (uint32_t x = 0; x < 64; ++x) {
+      const auto address = gfx12
+                               ? amdgpu::gfx12_image_address(0x100000, x, y, layout->pitch, 16, 0)
+                               : amdgpu::gfx11_image_address(0x100000, x, y, layout->pitch, 16, 0);
+      ASSERT_TRUE(address);
+      const int sum = (int(x) - 32) + (int(y) - 8), difference = (int(x) - 32) - (int(y) - 8);
+      const float channels[] = {float(std::max(sum, 0)), float(std::max(-sum, 0)),
+                                float(std::max(difference, 0)), float(std::max(-difference, 0))};
+      for (uint32_t c = 0; c < 4; ++c)
+        memory_.write32(*address + 4 * c, std::bit_cast<uint32_t>(channels[c]));
+    }
+  const std::array<uint32_t, 8> descriptor{0x1000,
+                                           (63u << (gfx12 ? 17 : 20)) | (3u << 30),
+                                           15 | (15u << 14),
+                                           (9u << 28) | 0xfac,
+                                           0,
+                                           4u << 20,
+                                           0,
+                                           0};
+  for (uint32_t i = 0; i < descriptor.size(); ++i)
+    wave_->debug_write_sgpr(8 + i, descriptor[i]);
+  wave_->debug_write_sgpr(4, 0x92 | (1u << 9) | (1u << 27));
+  wave_->debug_write_sgpr(5, 0);
+  wave_->debug_write_sgpr(6, (3u << 20) | (3u << 22));
+  wave_->debug_write_sgpr(7, 0);
+  struct Witness {
+    std::array<uint32_t, 4> gradients;
+    int32_t phase;
+    std::array<uint32_t, 4> expected;
+  };
+  // Raw RGBA32F readbacks agree on physical GFX11 and GFX12. Screen rotations
+  // near 45 degrees with a nearly axis-aligned texture footprint cover L1
+  // diagonal ties, zero sign products, and antidiagonals chosen despite a
+  // larger X sum component. Each rejects the gradient covariance sign, the
+  // larger sum component, or both.
+  constexpr Witness witnesses[] = {
+      {{0x3ea79068u, 0xbf9d4219u, 0x3ea63db2u, 0x3f9d78adu},
+       16,
+       {0x3e810000u, 0x3e800000u, 0x3e808000u, 0x3e7f0000u}},
+      {{0x3fa5f573u, 0x3f20fd9bu, 0x3fa5cdacu, 0xbf21a9fbu},
+       -19,
+       {0x3e7f0000u, 0x3e818000u, 0x3e810000u, 0x3e810000u}},
+      {{0x403639a4u, 0xc08e0fcdu, 0x4035a22du, 0x408e1a42u},
+       10,
+       {0x3f808000u, 0x3f800000u, 0x3f800000u, 0x3f800000u}},
+      {{0x3ebd64d5u, 0xbf960f73u, 0x3ebc4ec3u, 0x3f9655fau},
+       -18,
+       {0x3e800000u, 0x3e820000u, 0x3e807f00u, 0x3e807f00u}},
+      {{0x3ee7436eu, 0x3f8a4a3fu, 0xbee9c552u, 0x3f897ab6u},
+       18,
+       {0x3e810000u, 0x3e7e0000u, 0x3e7f0000u, 0x3e7f0000u}},
+      {{0x40356da6u, 0x409c53ccu, 0xc0353cf8u, 0x409cb8bbu},
+       4,
+       {0x3f804000u, 0x3f7f8000u, 0x3f7f8000u, 0x3f7f8000u}},
+      {{0xbf22e166u, 0x3f9def9eu, 0xbf212f43u, 0xbf9f33bcu},
+       -20,
+       {0x3e7e0000u, 0x3e820000u, 0x3e807f00u, 0x3e7efe00u}},
+      {{0x3f10097eu, 0xbf9a8bc8u, 0xbf0edfb5u, 0xbf9b3cd4u},
+       -18,
+       {0x3e7e0000u, 0x3e810000u, 0x3e7f0000u, 0x3e7f0000u}},
+      {{0xbea160cau, 0xbf8b1e24u, 0xbea1c82cu, 0x3f8bcbc4u},
+       -13,
+       {0x3e800000u, 0x3e810000u, 0x3e7f0000u, 0x3e808000u}},
+      {{0xbf8c39dau, 0x3f20182fu, 0x3f8be7fbu, 0x3f20aa04u},
+       20,
+       {0x3e818100u, 0x3e7d0200u, 0x3e810000u, 0x3e800000u}},
+      {{0xbf032ea9u, 0x3f9a35b7u, 0xbf033dd3u, 0xbf99f253u},
+       -14,
+       {0x3e7d0200u, 0x3e808100u, 0x3e800000u, 0x3e800000u}},
+      {{0xbfa4eea5u, 0x3f1ee1f0u, 0x3fa58748u, 0x3f1de46cu},
+       -19,
+       {0x3e7e0000u, 0x3e810000u, 0x3e7f0000u, 0x3e7f0000u}},
+  };
+  wave_->set_exec((1u << std::size(witnesses)) - 1);
+  for (uint32_t lane = 0; lane < std::size(witnesses); ++lane) {
+    const auto &witness = witnesses[lane];
+    const float shift = witness.phase / 8192.0f;
+    const float values[] = {std::bit_cast<float>(witness.gradients[0]) / 64,
+                            std::bit_cast<float>(witness.gradients[1]) / 16,
+                            std::bit_cast<float>(witness.gradients[2]) / 64,
+                            std::bit_cast<float>(witness.gradients[3]) / 16,
+                            (32.5f + shift) / 64,
+                            (8.5f + shift) / 16};
+    for (uint32_t i = 0; i < std::size(values); ++i)
+      wave_->debug_write_vgpr(i, lane, std::bit_cast<uint32_t>(values[i]));
+  }
+  wave_->debug_write_vgpr(12, 31, 0xdeadbeef);
+  ASSERT_NO_FATAL_FAILURE(sample(28, 1));
+  for (uint32_t lane = 0; lane < std::size(witnesses); ++lane)
+    for (uint32_t c = 0; c < 4; ++c)
+      EXPECT_EQ(wave_->debug_read_vgpr(12 + c, lane), witnesses[lane].expected[c])
+          << lane << ',' << c;
+  EXPECT_EQ(wave_->debug_read_vgpr(12, 31), 0xdeadbeefu);
+}
+
 TEST_P(GraphicsExportTest, AnisotropicCoordinatesMatchPhysicalExtentsAndAlignment) {
   struct Witness {
     uint32_t width, height;

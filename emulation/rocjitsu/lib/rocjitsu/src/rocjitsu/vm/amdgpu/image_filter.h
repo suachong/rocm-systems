@@ -181,11 +181,20 @@ struct ImageFootprint {
         norm = (norm >> (bits - 11)) << (bits - 11);
       return std::ldexp(double(norm), exponent + reciprocal_exponent - 12);
     };
-    const double u = component(products[0] + products[2], products[1] + products[3], width);
-    const double v = component(products[0] - products[2], products[1] - products[3], height);
-    const int64_t covariance =
-        int64_t(gradients[0]) * gradients[1] + int64_t(gradients[2]) * gradients[3];
-    return {u, covariance < 0 ? -v : v};
+    const std::array sum{products[0] + products[2], products[1] + products[3]};
+    const std::array difference{products[0] - products[2], products[1] - products[3]};
+    const double u = component(sum[0], sum[1], width);
+    const double v = component(difference[0], difference[1], height);
+    // The V sign is the sign of -det[sum, difference], taken from the diagonal
+    // with the larger L1 magnitude; ties use the antidiagonal. Near 45 degrees,
+    // the quantized vectors are not perpendicular, so the larger sum component
+    // or the exact determinant selects a different sign. A zero product is
+    // positive.
+    const bool diagonal =
+        std::abs(sum[0]) + std::abs(difference[1]) > std::abs(sum[1]) + std::abs(difference[0]);
+    const int64_t orientation =
+        diagonal ? -int64_t(sum[0]) * difference[1] : int64_t(sum[1]) * difference[0];
+    return {u, orientation < 0 ? -v : v};
   }
 };
 

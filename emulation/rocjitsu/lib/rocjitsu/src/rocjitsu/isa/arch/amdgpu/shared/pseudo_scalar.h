@@ -5,14 +5,14 @@
 
 /// @file Shared pseudo-scalar transcendental implementations.
 ///
-/// @details Architectural numeric behavior follows the AMD RDNA4 Instruction Set Architecture
-/// Reference Guide: section 7.10 requires the usual DENORMAL and ROUND mode bits, and section
-/// 7.2.3.1 requires nonzero OMOD to flush output denormals and map negative zero to positive zero.
-/// The functional examples for the vector V_LOG_F32, V_RSQ_F32, and V_SQRT_F32 equivalents specify
-/// negative quiet NaNs for invalid domains. F32 reciprocal, RSQ and SQRT follow their vector
-/// equivalents' approximation and unconditional denormal flushing, as observed on physical GFX12.
-/// Other operations use host standard-library approximations with the mode handling below.
+/// @details RDNA4 ISA section 7.10 describes DENORMAL and ROUND modes; F16 follows them.
+/// Physical gfx1201 F32 operations instead match their vector equivalents: fixed rounding
+/// and unconditional denormal flushing. Section 7.2.3.1 requires nonzero OMOD to flush
+/// output denormals and map negative zero to positive zero. Vector LOG, RSQ and SQRT
+/// functional examples specify negative quiet NaNs for invalid domains.
 
+#include "util/amdgpu_exp.h"
+#include "util/amdgpu_log.h"
 #include "util/amdgpu_rcp.h"
 #include "util/amdgpu_rsq.h"
 #include "util/amdgpu_sqrt.h"
@@ -302,48 +302,52 @@ inline uint16_t round_f16_result(double value, uint32_t round_mode, uint32_t omo
 }
 
 /// @brief Execute a pseudo-scalar F32 transcendental operation.
-/// @details Source absolute value and negation are applied before input-denormal handling and
-/// operation evaluation. OMOD is then applied before CLAMP, result rounding, and output-denormal
-/// handling. Round modes are 0 for nearest-even, 1 for positive infinity, 2 for negative infinity,
-/// and 3 for zero. Denormal mode bit 0 allows input denormals and bit 1 allows output denormals.
-/// RCP, RSQ and SQRT ignore these mode fields and use the hardware approximations with flushed
-/// subnormals. RCP rounds output-modifier overflow to infinity.
+/// @details Apply source modifiers and quiet NaNs before the hardware mapping, then apply
+/// OMOD and CLAMP before nearest-even narrowing and unconditional output-denormal flushing.
+/// All F32 operations ignore MODE rounding and denormal fields, matching their vector
+/// equivalents. Output-modifier overflow rounds to infinity.
 /// @param operation Transcendental operation to execute.
 /// @param source Raw F32 source value.
 /// @param absolute Whether to clear the source sign bit before evaluation.
 /// @param negate Whether to toggle the source sign bit after applying absolute value.
-/// @param round_mode Numeric MODE.FP_ROUND encoding for F32.
-/// @param denorm_mode Numeric MODE.FP_DENORM encoding for F32.
+/// @param round_mode Ignored F32 rounding mode; retained for the shared instruction interface.
+/// @param denorm_mode Ignored F32 denormal mode; retained for the shared instruction interface.
 /// @param omod Numeric VOP3 OMOD encoding: 0 unchanged, 1 multiply by 2, 2 multiply by 4, and 3
 /// multiply by 0.5.
 /// @param clamp Whether to clamp NaN and negative results to zero and results above one to one.
 /// @returns Raw 32-bit F32 result encoding.
 inline uint32_t execute_f32(Operation operation, float source, bool absolute, bool negate,
-                            uint32_t round_mode, uint32_t denorm_mode, uint32_t omod, bool clamp) {
+                            [[maybe_unused]] uint32_t round_mode,
+                            [[maybe_unused]] uint32_t denorm_mode, uint32_t omod, bool clamp) {
   source = detail::apply_source_modifiers(source, absolute, negate);
-  source = detail::flush_input_f32(source, denorm_mode);
   source = detail::quiet_nan(source);
-  // Physical GFX12 F32 RCP/RSQ/SQRT match their vector equivalents in every MODE.
-  detail::EvaluationResult evaluated;
-  if (operation == Operation::RCP)
-    evaluated = {util::amdgpu_rcp_f32(source), detail::ResultProvenance::VALUE};
-  else if (operation == Operation::RSQ)
-    evaluated = {util::amdgpu_rsq_f32(source), detail::ResultProvenance::VALUE};
-  else if (operation == Operation::SQRT)
-    evaluated = {util::amdgpu_sqrt_f32(source), detail::ResultProvenance::VALUE};
-  else
-    evaluated = detail::evaluate(operation, static_cast<double>(source));
+  // Physical GFX12 scalar and vector mappings agree in every FP MODE.
+  float mapped = 0.0f;
+  switch (operation) {
+  case Operation::EXP2:
+    mapped = util::amdgpu_exp_f32(source);
+    break;
+  case Operation::LOG2:
+    mapped = util::amdgpu_log_f32(source);
+    break;
+  case Operation::RCP:
+    mapped = util::amdgpu_rcp_f32(source);
+    break;
+  case Operation::RSQ:
+    mapped = util::amdgpu_rsq_f32(source);
+    break;
+  case Operation::SQRT:
+    mapped = util::amdgpu_sqrt_f32(source);
+    break;
+  }
+  const detail::EvaluationResult evaluated{mapped, detail::ResultProvenance::VALUE};
   detail::EvaluationResult value = detail::apply_output_modifiers(evaluated, omod, clamp);
-  // RCP output scaling is exact in F64. Detect F32 overflow before narrowing,
+  // Output scaling is exact in F64. Detect F32 overflow before narrowing,
   // so directed host rounding cannot replace the required infinity with a finite value.
-  if (operation == Operation::RCP && std::isfinite(value.value) &&
-      std::abs(value.value) > std::numeric_limits<float>::max())
+  if (std::isfinite(value.value) && std::abs(value.value) > std::numeric_limits<float>::max())
     value.provenance = detail::ResultProvenance::FINITE_OVERFLOW;
-  const bool fixed_rounding =
-      operation == Operation::RCP || operation == Operation::RSQ || operation == Operation::SQRT;
-  uint32_t result = detail::round_f64_to_f32(value, fixed_rounding ? 0 : round_mode);
-  if (((denorm_mode & 2u) == 0 || omod != 0) && (result & 0x7f800000u) == 0 &&
-      (result & 0x007fffffu) != 0)
+  uint32_t result = detail::round_f64_to_f32(value, 0);
+  if ((result & 0x7f800000u) == 0 && (result & 0x007fffffu) != 0)
     result &= 0x80000000u;
   return result;
 }

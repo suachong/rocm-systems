@@ -166,7 +166,7 @@ struct PseudoScalarSpecialCase {
   uint32_t mode = 0;
 };
 
-constexpr std::array<PseudoScalarSpecialCase, 85> kSpecialCases{{
+constexpr std::array<PseudoScalarSpecialCase, 87> kSpecialCases{{
     {"literal_f32",
      "v_s_sqrt_f32",
      0,
@@ -190,9 +190,24 @@ constexpr std::array<PseudoScalarSpecialCase, 85> kSpecialCases{{
      "",
      {.source_opsel = true},
      amdgpu::Wavefront::FP16_OVFL_BIT},
+    // Physical gfx1201 scalar instructions match the vector hardware mappings.
+    {"f32_exp_approximation", "v_s_exp_f32", 0xB6128C18u, 0x3F7FFFE6u, "", {}},
+    {"f32_log_approximation", "v_s_log_f32", 0x266D35EFu, 0xC248709Eu, "", {}},
     {"f32_input_denorm_flush", "v_s_log_f32", 0x00000001u, 0xFF800000u, "", {}},
-    {"f32_input_denorm_allow", "v_s_log_f32", 0x00000001u, f32_bits(-149.0f), "", {}, 1u << 4},
-    {"f32_output_denorm_allow", "v_s_exp_f32", f32_bits(-149.0f), 0x00000001u, "", {}, 1u << 5},
+    {"f32_log_flushes_allowed_input_denorm",
+     "v_s_log_f32",
+     0x00000001u,
+     0xFF800000u,
+     "",
+     {},
+     1u << 4},
+    {"f32_exp_flushes_allowed_output_denorm",
+     "v_s_exp_f32",
+     f32_bits(-149.0f),
+     0x00000000u,
+     "",
+     {},
+     1u << 5},
     {"f32_ignores_f16_output_denorm_mode",
      "v_s_exp_f32",
      f32_bits(-149.0f),
@@ -214,7 +229,7 @@ constexpr std::array<PseudoScalarSpecialCase, 85> kSpecialCases{{
      "",
      {.source_opsel = true},
      1u << 7},
-    {"f32_round_toward_positive", "v_s_exp_f32", f32_bits(0.5f), 0x3FB504F4u, "", {}, 1u},
+    {"f32_round_toward_positive", "v_s_exp_f32", f32_bits(0.5f), 0x3FB504F3u, "", {}, 1u},
     {"f16_round_toward_positive",
      "v_s_exp_f16",
      0xCAFE3800u,
@@ -257,14 +272,14 @@ constexpr std::array<PseudoScalarSpecialCase, 85> kSpecialCases{{
     {"f32_finite_overflow_round_toward_negative",
      "v_s_exp_f32",
      f32_bits(1024.0f),
-     0x7F7FFFFFu,
+     0x7F800000u,
      "",
      {},
      2u},
     {"f32_finite_overflow_round_toward_zero",
      "v_s_exp_f32",
      f32_bits(2000.0f),
-     0x7F7FFFFFu,
+     0x7F800000u,
      "",
      {},
      3u},
@@ -279,7 +294,7 @@ constexpr std::array<PseudoScalarSpecialCase, 85> kSpecialCases{{
     {"f32_finite_underflow_round_toward_positive",
      "v_s_exp_f32",
      f32_bits(-2000.0f),
-     0x00000001u,
+     0x00000000u,
      "",
      {},
      1u | (1u << 5)},
@@ -320,14 +335,14 @@ constexpr std::array<PseudoScalarSpecialCase, 85> kSpecialCases{{
     {"f32_destination_overflow_round_toward_negative",
      "v_s_exp_f32",
      f32_bits(128.0f),
-     0x7F7FFFFFu,
+     0x7F800000u,
      "",
      {},
      2u},
     {"f32_destination_overflow_round_toward_zero",
      "v_s_exp_f32",
      f32_bits(128.0f),
-     0x7F7FFFFFu,
+     0x7F800000u,
      "",
      {},
      3u},
@@ -341,7 +356,7 @@ constexpr std::array<PseudoScalarSpecialCase, 85> kSpecialCases{{
     {"f32_destination_underflow_round_toward_positive",
      "v_s_exp_f32",
      f32_bits(-150.0f),
-     0x00000001u,
+     0x00000000u,
      "",
      {},
      1u | (1u << 5)},
@@ -1069,7 +1084,7 @@ TEST(PseudoScalarModeIntegrationTest, SetregInstructionsUpdateModesConsumedByPse
     EXPECT_TRUE(
         fixture.compute_unit->execute_instruction(exp.get(), *fixture.wavefront).succeeded());
     EXPECT_EQ(fixture.wavefront->mode_raw(), 1u);
-    EXPECT_EQ(fixture.compute_unit->read_sgpr(fixture.sgpr_base() + kDestinationSgpr), 0x3FB504F4u);
+    EXPECT_EQ(fixture.compute_unit->read_sgpr(fixture.sgpr_base() + kDestinationSgpr), 0x3FB504F3u);
 
     const BaseEncodingWords set_denorm_words =
         encode_sopk(profile.setreg_imm_op, 0, encode_hwreg(kModeHwreg, 6, 2), 1u);
