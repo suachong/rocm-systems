@@ -81,16 +81,16 @@ the host's; it gets a temporary CUID.
 
 Resolved in the library, so the amd-smi sysfs fallback originally proposed is
 unnecessary. With driver-published attributes, cold handle lookup enumerates before
-attempting privileged single-device discovery, and `AMDCUID_QUERY_SOURCE`
-reports the answering stage. Without a node key every caller gets temporary
-CUIDs, and the auxiliary flag comes from the derived value rather than the
-privileged primary.
+attempting privileged single-device discovery, `get_derived_cuid()` reads the
+driver's derived value first, and `AMDCUID_QUERY_SOURCE` reports the answering
+stage. Without them, an unprivileged caller gets temporary CUIDs, and the
+auxiliary flag comes from the derived value rather than the privileged primary.
 
 ### O3: restoring the persisted seed after module load — superseded
 
-Superseded by `changes/split-identity-from-key-store/`: the library holds no
-seed, so there is nothing to restore. The key store that follows it,
-`adopt-uefi-key-store`, keeps the key where the driver reads it at load.
+Superseded by `changes/adopt-uefi-key-store/`: the key persists in the
+`AmdCuidKey` UEFI variable, which the driver reads at load, so nothing in user
+space restores it.
 
 ### O4: what the library is supposed to enumerate — resolved for GPUs
 

@@ -1,11 +1,9 @@
-> **Superseded in part by `split-identity-from-key-store`.** The daemon and
-> record-store sources, the public placeholder key, and seed drift and repair
-> described in this change and in its `amdsmi-identity-api` and
-> `amdsmi-seed-provisioning` specs do not exist, and amd-smi reports the
-> sources `UNKNOWN`, `DRIVER` and `LIBRARY`. Seed provisioning and seed state
-> (`amdsmi-seed-provisioning`, the `set --cuid-seed` requirement of
-> `amdsmi-cli`, and tasks 1.4, 1.5, 2.5, 2.6, 4.4, 4.5 and 5.5 to 5.7) are
-> withdrawn until the key store, `adopt-uefi-key-store`, restores them.
+> **Superseded in part by `split-identity-from-key-store` and
+> `adopt-uefi-key-store`.** The daemon and record-store sources, the public
+> placeholder key, and seed drift and repair described in this change and in
+> its `amdsmi-identity-api` and `amdsmi-seed-provisioning` specs do not exist:
+> the node key is the `AmdCuidKey` UEFI variable, and amd-smi reports the
+> sources `UNKNOWN`, `DRIVER` and `LIBRARY`.
 
 ## Why
 

@@ -12,16 +12,20 @@
 
 ## Lookup configurations
 
-**Driver-published:** the driver publishes `cuid_primary` and `cuid_unit_id`.
-Root reads the driver's primary CUID.
+**Driver-published:** the driver publishes CUID attributes. The library reads
+the driver's derived value and amd-smi reports source `DRIVER`. A driver that
+publishes only `cuid_primary` and `cuid_unit_id` leaves a whole GPU keyed like
+a CPU and a partition without a CUID.
 
-**Library-computed:** the driver publishes nothing. A whole GPU gets a
-temporary CUID built by the library.
+**Library-computed:** the driver publishes nothing. A whole GPU gets a temporary CUID and a
+partition gets none. CPU, NIC, NPU and platform CUIDs are derived by root with
+the node key, and are temporary for everyone else. The reported source is
+`LIBRARY`.
 
-There is no node key, so in both configurations every derived CUID is
-temporary, with source `LIBRARY`, and a partition gets none. Test both
-configurations. See `../tests/QA_PLAN.md` for current counts and untested
-configurations.
+Test both configurations. See `../tests/QA_PLAN.md` for current counts and
+untested configurations. The node key lives in the `AmdCuidKey` UEFI variable,
+so a driver reload or a reinstallation keeps derived values; temporary values
+depend on node-local inputs instead.
 
 ## Change status
 
@@ -30,8 +34,9 @@ configurations.
 | `amend-published-cuid-spec` | Published pages | Specified; not yet applied to the published document |
 | `add-cuid-kernel-interface` | `amdgpu` driver | Implemented; whole-GPU testing on two W6800s |
 | `pin-cuid-cross-layer-contract` | Format, keys, vectors | Implemented in both trees |
-| `integrate-cuid-into-amdsmi` | API, CLI, bindings | Implemented; its daemon and record-store key sources are superseded by `split-identity-from-key-store`, and seed provisioning waits for the key store; release artifact checks remain in the QA plan |
+| `integrate-cuid-into-amdsmi` | API, CLI, bindings | Implemented; its daemon and record-store key sources are superseded by `split-identity-from-key-store` and `adopt-uefi-key-store`; release artifact checks remain in the QA plan |
 | `split-identity-from-key-store` | Driver identity without a key, partition UnitID, temporary CUIDs | Library and amd-smi implemented; kernel and partition hardware testing remain |
+| `adopt-uefi-key-store` | UEFI node key, efivarfs secret table | Library and amd-smi implemented; the efivarfs table, its OVMF test and the amdgpu GUID switch remain |
 
 `amend-published-cuid-spec` contains documentation corrections, not code.
 `pin-cuid-cross-layer-contract` defines shared constants and format values.
