@@ -121,6 +121,11 @@ main()
     diag::print_system_info();
     diag::print_gpu_info(0);
 
+    // Workaround for MI325 memory access fault: Add explicit device selection and sync
+    // to ensure GPU context is fully initialized before profiler intercepts queues
+    HIP_CHECK(hipSetDevice(0));
+    HIP_CHECK(hipDeviceSynchronize());
+
     int* replayed = nullptr;
     int* opted    = nullptr;
 
@@ -133,9 +138,15 @@ main()
 
     diag::checkpoint("after hipMalloc");
 
+    // Ensure GPU can access these buffers before profiler instruments them
+    HIP_CHECK(hipDeviceSynchronize());
+
     HIP_CHECK(hipMemset(replayed, 0, sizeof(int)));
     HIP_CHECK(hipMemset(opted, 0, sizeof(int)));
     diag::checkpoint("after hipMemset");
+
+    // Additional sync after memset to ensure memory is ready
+    HIP_CHECK(hipDeviceSynchronize());
 
     if(diag::is_enabled()) {
         fprintf(stderr, "[DIAG] Launching bump kernel (replayed, block=%d)\n", kReplayBlock);
