@@ -115,13 +115,16 @@ function(add_kernel_replay_sample NAME CLIENT_SRC)
                    "${ROCPROFILER_DEFAULT_FAIL_REGEX}"
                    SKIP_REGULAR_EXPRESSION
                    "PC sampling unavailable|SPM unavailable|ATT unavailable"
+                   RESOURCE_LOCK
+                   "rocprofiler_kernel_replay"
                    DISABLED
                    "${_disabled}")
 endfunction()
 
 add_kernel_replay_sample(kernel-replay-basic basic_client.cpp)
 add_kernel_replay_sample(kernel-replay-basic-user-data basic_client_with_user_data.cpp)
-add_kernel_replay_sample(kernel-replay-counters counters_client.cpp)
+add_kernel_replay_sample(kernel-replay-counters counters_client.cpp
+                         ENVIRONMENT "ROCPROF_DIAGNOSTIC=1")
 add_kernel_replay_sample(kernel-replay-counters-then-pc-sampling
                          counters_then_pc_sampling_client.cpp PC_SAMPLING)
 add_kernel_replay_sample(kernel-replay-att att_client.cpp ATT)
