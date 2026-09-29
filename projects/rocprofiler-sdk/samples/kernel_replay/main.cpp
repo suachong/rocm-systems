@@ -172,6 +172,9 @@ main()
     HIP_CHECK(hipFree(replayed));
     HIP_CHECK(hipFree(opted));
 
+    // Ensure complete cleanup before test exit to free GPU resources
+    HIP_CHECK(hipDeviceSynchronize());
+
     printf("[app] replayed_bump=%d opted_nudge=%d\n", replayed_h, opted_h);
     if(replayed_h != 1)
     {

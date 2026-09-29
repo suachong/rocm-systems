@@ -58,7 +58,7 @@ find_package_handle_standard_args(attdecoder REQUIRED_VARS attdecoder_LIB_DIR
 set(KR_PC_SAMPLING_PASS_PARTITION_UNSUPPORTED ON)
 
 function(add_kernel_replay_sample NAME CLIENT_SRC)
-    cmake_parse_arguments(arg "PC_SAMPLING;SPM;ATT" "" "ENVIRONMENT" ${ARGN})
+    cmake_parse_arguments(arg "PC_SAMPLING;SPM;ATT;NO_RESOURCE_LOCK" "" "ENVIRONMENT" ${ARGN})
 
     add_library(${NAME}-client SHARED)
     target_sources(${NAME}-client PRIVATE ${CLIENT_SRC} client.hpp)
@@ -103,22 +103,20 @@ function(add_kernel_replay_sample NAME CLIENT_SRC)
     if(arg_ATT AND NOT attdecoder_FOUND)
         set(_disabled ON)
     endif()
-    set_tests_properties(
-        ${NAME}
-        PROPERTIES TIMEOUT
-                   120
-                   LABELS
-                   "samples;kernel-replay"
-                   ENVIRONMENT
-                   "${_env}"
-                   FAIL_REGULAR_EXPRESSION
-                   "${ROCPROFILER_DEFAULT_FAIL_REGEX}"
-                   SKIP_REGULAR_EXPRESSION
-                   "PC sampling unavailable|SPM unavailable|ATT unavailable"
-                   RESOURCE_LOCK
-                   "rocprofiler_kernel_replay"
-                   DISABLED
-                   "${_disabled}")
+    # Only add resource lock for counter collection tests to prevent hardware conflicts
+    # Memory-heavy tests (ATT, SPM) should run without lock to avoid resource exhaustion
+    set(_properties TIMEOUT 120
+                    LABELS "samples;kernel-replay"
+                    ENVIRONMENT "${_env}"
+                    FAIL_REGULAR_EXPRESSION "${ROCPROFILER_DEFAULT_FAIL_REGEX}"
+                    SKIP_REGULAR_EXPRESSION "PC sampling unavailable|SPM unavailable|ATT unavailable"
+                    DISABLED "${_disabled}")
+
+    if(NOT arg_NO_RESOURCE_LOCK AND NOT arg_ATT AND NOT arg_SPM)
+        list(APPEND _properties RESOURCE_LOCK "rocprofiler_kernel_replay")
+    endif()
+
+    set_tests_properties(${NAME} PROPERTIES ${_properties})
 endfunction()
 
 add_kernel_replay_sample(kernel-replay-basic basic_client.cpp)
