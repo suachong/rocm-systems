@@ -346,6 +346,13 @@ class CeReducePersistentContractTest(unittest.TestCase):
                 assert kernel_side is not None and host_side is not None
                 self.assertEqual(kernel_side.group(1), host_side.group(1))
 
+    def test_block_geometry_uses_runtime_occupancy_cap(self) -> None:
+        with open(CE_REDUCE_CC) as f:
+            dispatcher = f.read()
+        self.assertIn('RCCL_PARAM(CeReduceMaxBlocks, "CE_REDUCE_MAX_BLOCKS"', dispatcher)
+        self.assertIn("int ncclCeLocalReduceMaxBlocks()", dispatcher)
+        self.assertIn("(size_t)ncclCeLocalReduceMaxBlocks()", self.impl)
+
     def test_launch_bounds_matches_launcher_thread_count(self) -> None:
         bounds = re.search(r"__launch_bounds__\((\d+)\)", self.impl)
         threads = re.search(r"const int threads\s*=\s*(\d+);", self.launcher)

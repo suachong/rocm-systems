@@ -33,8 +33,17 @@ THE SOFTWARE.
 // enough that they used to dominate the entire build's wall-clock time).
 #include <hip/hip_runtime.h>
 #include <stdint.h>
+#include <algorithm>
 
 #include "nccl.h"
+#include "param.h"
+#include "ce_coll.h"
+
+RCCL_PARAM(CeReduceMaxBlocks, "CE_REDUCE_MAX_BLOCKS", NCCL_CE_REDUCE_MAX_BLOCKS);
+
+int ncclCeLocalReduceMaxBlocks() {
+  return (int)std::clamp<int64_t>(rcclParamCeReduceMaxBlocks(), 1, NCCL_CE_REDUCE_MAX_BLOCKS);
+}
 
 // Every generated launcher takes ncclCeLaunchPersistentReduce's argument list
 // minus (datatype, op), which is what this file resolves to a symbol name.

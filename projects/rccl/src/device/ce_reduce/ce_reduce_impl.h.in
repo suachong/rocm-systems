@@ -29,6 +29,11 @@
 
 namespace cg = cooperative_groups;
 
+// Runtime occupancy cap, clamped by the host implementation to the compiled
+// kernel maximum. This lets applications trade reduction latency for CU
+// headroom without rebuilding RCCL.
+int ncclCeLocalReduceMaxBlocks();
+
 // Global atomic-counter barrier for regular launch (avoids CTA scheduling deadlock).
 __device__ __forceinline__ void ncclCeGlobalBlockBarrier(uint32_t* d_barrierSync, int numBlocks, uint32_t gen) {
   if (numBlocks <= 1) {
@@ -143,7 +148,7 @@ struct VecTrait<uint8_t> {
 // *********************************************************************************
 // ncclCeLocalReduceBlocksT<T> -- launch block count for the reduce kernel.
 // Single source of the geometry: 1-D grid over the vectorized element space,
-// clamped to [1, NCCL_CE_REDUCE_MAX_BLOCKS] for CE DMA headroom. Redop-independent
+// clamped to [1, the configured runtime maximum] for CE DMA headroom. Redop-independent
 // (depends only on the per-type VecTrait W/GpuUnroll). Used by both the generated
 // launcher and the host-side reporting wrapper so live dispatch and reporting
 // never drift.
@@ -154,7 +159,7 @@ static inline int ncclCeLocalReduceBlocksT(size_t chunkElems) {
   constexpr int UnrollFactor = VecTrait<T>::GpuUnroll;
   return (int)std::clamp<size_t>((chunkElems / VecTrait<T>::W + (size_t)threads * UnrollFactor - 1) /
                                    ((size_t)threads * UnrollFactor),
-                                 (size_t)1, (size_t)NCCL_CE_REDUCE_MAX_BLOCKS);
+                                 (size_t)1, (size_t)ncclCeLocalReduceMaxBlocks());
 }
 
 // *********************************************************************************
