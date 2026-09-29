@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Unit tests for src/device/ce_reduce/generate.py.
 
-generate.py splits the 40 (type, redop) instantiations of
+generate.py splits the supported (type, redop) instantiations of
 ncclCeLocalReduceKernelVec into separate TUs (see generate.py's module
 docstring for why) by combining two on-disk templates -- ce_reduce_impl.h.in
 (copied verbatim) and ce_reduce_launcher.cpp.in (expanded per-instantiation via
@@ -40,12 +40,16 @@ TYPES = [
     ("u8", "uint8_t"),
 ]
 
-REDOPS = [
+BASE_REDOPS = [
     ("Sum", 0),
     ("Prod", 1),
     ("Min", 2),
     ("Max", 3),
 ]
+
+
+def redops_for_type(tag: str) -> list[tuple[str, int]]:
+    return BASE_REDOPS + ([("Avg", 4)] if tag == "bf16" else [])
 
 VECTORIZE_OK = {
     ("i8", "Min"),
@@ -85,7 +89,7 @@ class CeReduceGenerationTest(unittest.TestCase):
             cls.impl_header = f.read()
         cls.launchers = {}
         for tag, _ in TYPES:
-            for redname, _ in REDOPS:
+            for redname, _ in redops_for_type(tag):
                 fname = "ce_reduce_%s_%s.cpp" % (tag, redname)
                 with open(os.path.join(cls._dir, fname)) as f:
                     cls.launchers[(tag, redname)] = f.read()
@@ -103,9 +107,15 @@ class CeReduceGenerationTest(unittest.TestCase):
     def test_generates_one_file_per_instantiation_plus_header(self) -> None:
         produced = set(os.listdir(self._dir))
         expected = {"ce_reduce_impl.h"}
-        expected.update("ce_reduce_%s_%s.cpp" % (tag, redname) for tag, _ in TYPES for redname, _ in REDOPS)
+        expected.update(
+            "ce_reduce_%s_%s.cpp" % (tag, redname)
+            for tag, _ in TYPES
+            for redname, _ in redops_for_type(tag)
+        )
         self.assertEqual(produced, expected)
-        self.assertEqual(len(self.launchers), len(TYPES) * len(REDOPS))
+        self.assertEqual(
+            len(self.launchers), sum(len(redops_for_type(tag)) for tag, _ in TYPES)
+        )
 
     def test_impl_header_has_shared_definitions(self) -> None:
         self.assertIn("#pragma once", self.impl_header)
@@ -125,7 +135,7 @@ class CeReduceGenerationTest(unittest.TestCase):
 
     def test_launcher_uses_correct_type_and_redop(self) -> None:
         for tag, ctype in TYPES:
-            for redname, redval in REDOPS:
+            for redname, redval in redops_for_type(tag):
                 with self.subTest(tag=tag, redname=redname):
                     text = self.launchers[(tag, redname)]
                     self.assertIn("using T = %s;" % ctype, text)
@@ -136,7 +146,7 @@ class CeReduceGenerationTest(unittest.TestCase):
 
     def test_vectorize_ok_define_matches_table(self) -> None:
         for tag, _ in TYPES:
-            for redname, _ in REDOPS:
+            for redname, _ in redops_for_type(tag):
                 with self.subTest(tag=tag, redname=redname):
                     text = self.launchers[(tag, redname)]
                     has_define = "#define CE_REDUCE_VECTORIZE_OK" in text

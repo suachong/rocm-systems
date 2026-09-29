@@ -1251,7 +1251,9 @@ bool rcclUseCeReduceScatter(struct ncclComm* comm, size_t recvcount, ncclDataTyp
     WARN("Skipping CE ReduceScatter: CTA policy is not ZERO");
     return false;
   }
-  if (op != ncclSum && op != ncclProd && op != ncclMin && op != ncclMax) {
+  const bool opSupported = op == ncclSum || op == ncclProd || op == ncclMin || op == ncclMax ||
+                           (op == ncclAvg && datatype == ncclBfloat16);
+  if (!opSupported) {
     WARN("Skipping CE ReduceScatter: unsupported reduction operation");
     return false;
   }
@@ -1919,7 +1921,8 @@ ncclResult_t rcclSelectReduceScatter(struct ncclComm* comm, const void* sendbuff
     // (5) CE via registered symmetric windows / force (enqueue finishes the launch).
     bool ceAvailable = ceArGraphAllowed && !hasSysmemSegment && symReg;
     const bool ceReduceScatterOpSupported =
-      (op == ncclSum || op == ncclProd || op == ncclMin || op == ncclMax);
+      (op == ncclSum || op == ncclProd || op == ncclMin || op == ncclMax ||
+       (op == ncclAvg && datatype == ncclBfloat16));
     const bool ceReduceScatterTypeSupported =
       datatype != ncclFloat8e4m3 && datatype != ncclFloat8e5m2;
     if (!ceReduceScatterOpSupported || !ceReduceScatterTypeSupported || !rcclParamCeReduceScatter())

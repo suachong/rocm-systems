@@ -247,7 +247,8 @@ TEST(RcclCeReduceScatterEligibility, RcclUseCeReduceScatter_Isolated)
         // staging layout the chunk-layout tests above cover.
         {"EligibleSixRanks_Isolated", 6, 1, true, NCCL_CTA_POLICY_ZERO, 683, ncclSum, ncclFloat32, true, baseEnv},
         {"ZeroCountRejected_Isolated", 4, 1, true, NCCL_CTA_POLICY_ZERO, 0, ncclSum, ncclFloat32, false, baseEnv},
-        {"UnsupportedOpRejected_Isolated", 4, 1, true, NCCL_CTA_POLICY_ZERO, 1024, ncclAvg, ncclFloat32, false, baseEnv},
+        {"Bfloat16AvgEligible_Isolated", 4, 1, true, NCCL_CTA_POLICY_ZERO, 1024, ncclAvg, ncclBfloat16, true, baseEnv},
+        {"AvgOtherDatatypeRejected_Isolated", 4, 1, true, NCCL_CTA_POLICY_ZERO, 1024, ncclAvg, ncclFloat32, false, baseEnv},
         {"Float8Rejected_Isolated", 4, 1, true, NCCL_CTA_POLICY_ZERO, 1024, ncclSum, ncclFloat8e4m3, false, baseEnv},
         // msgBytes is recvcount * sizeof(datatype) * nRanks, not recvcount alone.
         {"MessageTooLargeRejected_Isolated", 4, 1, true, NCCL_CTA_POLICY_ZERO,

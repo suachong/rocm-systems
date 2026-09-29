@@ -146,7 +146,7 @@ struct alignas(16) ncclCeCollArgs {
   void*
     ddaUserRecvBuff; // user recvbuff (using DDA staging) or NULL otherwise (if recvbuffer is using symmetric windows)
   size_t ddaCopyBackBytes; // bytes to copy scratch -> user recvbuff
-  ncclRedOp_t redOp; // Only used for AllReduce
+  ncclRedOp_t redOp; // Used for AllReduce and ReduceScatter
 };
 
 struct ncclCeBatchOpsParams {

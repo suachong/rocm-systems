@@ -5264,6 +5264,34 @@ TEST(WrapMicrotestIsolated, SelectReduceScatter_CeRegisteredPreemptsSymmetric) {
       });
 }
 
+// Primus' default gradient collective is BF16 Avg. CE implements that as the
+// same PreMulSum lowering used by the native RCCL kernels.
+TEST(WrapMicrotestIsolated, SelectReduceScatter_Bfloat16AvgSelectsCeRegistered) {
+  RUN_ISOLATED_TEST(
+      "Wrap_SelectReduceScatter_Bfloat16AvgSelectsCeRegistered",
+      []() {
+        g_loadParam = [](const char* env, int64_t defaultValue) {
+          if (std::strcmp(env, "RCCL_CE_REDUCESCATTER") == 0) return (int64_t)1;
+          if (std::strcmp(env, "RCCL_FORCE_CE_REDUCESCATTER") == 0) return (int64_t)1;
+          return defaultValue;
+        };
+        ScopedHook ceAvailable(
+            g_ceAvailable,
+            [](struct ncclComm*, ncclFunc_t, int, ncclDataType_t, ncclSymRegType_t,
+               struct ncclDevrWindow*, struct ncclDevrWindow*) { return true; });
+        ncclComm* comm = MakeSelectComm();
+        comm->nRanks = 8;
+        comm->nNodes = 1;
+        comm->symmetricSupport = true;
+        comm->config.CTAPolicy = NCCL_CTA_POLICY_ZERO;
+        rcclCollDecision decision{};
+        EXPECT_EQ(ncclSuccess, rcclSelectReduceScatter(comm, nullptr, nullptr, /*recvcount=*/8, ncclBfloat16,
+                                                        ncclAvg, /*query=*/false, &decision));
+        EXPECT_EQ((int)rcclAddonAlgos_t::RCCL_CE_REGISTERED, decision.algo);
+        DeleteCommWithArch(comm);
+      });
+}
+
 // ncclCeAvailable does not filter datatypes, so the registered-window branch
 // must reject Float8 itself instead of dispatching to an unsupported CE kernel.
 TEST(WrapMicrotestIsolated, SelectReduceScatter_Float8FallsBackWhenCeRegistered) {
