@@ -562,10 +562,16 @@ private:
     VmAccessOutcome outcome;
   };
 
+  /// @brief Initialize private storage for compute and graphics waves.
+  [[nodiscard]] VmAccessOutcome init_wavefront_scratch(ComputeUnitCore *cu, Wavefront *wf,
+                                                       const DispatchEntry &pkt,
+                                                       uint32_t global_wg_id,
+                                                       uint32_t wf_index_in_wg,
+                                                       int flat_scratch_init_sgpr);
   /// @brief Initialize a wavefront's registers per the AMDHSA ABI.
   [[nodiscard]] VmAccessOutcome init_wavefront_regs(ComputeUnitCore *cu, Wavefront *wf,
-                                                    const DispatchEntry &entry,
-                                                    uint32_t global_wg_id, uint32_t wf_index_in_wg);
+                                                    const DispatchEntry &pkt, uint32_t global_wg_id,
+                                                    uint32_t wf_index_in_wg);
 
   void handle_doorbell(simdojo::Tick timestamp);
 
@@ -601,6 +607,7 @@ private:
                                                            uint64_t packet_index, uint64_t status);
   void draw_pm4(const Pm4SubmitQueue &queue, Pm4DispatchState &qs, uint32_t vertices,
                 std::vector<uint32_t> indices = {});
+  void init_pm4_scratch(DispatchEntry &dp, uint32_t ring_size, uint32_t base_lo, uint32_t base_hi);
   void dispatch_graphics_pm4(const Pm4SubmitQueue &queue, Pm4DispatchState &qs, DispatchEntry dp);
 
   /// @brief Advertise and maintain ROCr's amd_queue_v2_t scratch-reclaim contract.

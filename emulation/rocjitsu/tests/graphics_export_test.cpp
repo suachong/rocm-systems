@@ -6487,42 +6487,45 @@ TEST_P(GraphicsExportTest, VolumeTransfersUseDepthBoundsAndIgnoreSrvBaseArray) {
   for (uint32_t i = 0; i < descriptor.size(); ++i)
     wave_->debug_write_sgpr(8 + i, descriptor[i]);
   wave_->set_exec(3);
-  for (bool a16 : {false, true}) {
-    for (uint32_t lane = 0; lane < 2; ++lane) {
-      wave_->debug_write_vgpr(0, lane, 21 | (a16 ? 59u << 16 : 0));
-      wave_->debug_write_vgpr(1, lane, a16 ? (lane ? 37 : 12) : 59);
-      wave_->debug_write_vgpr(2, lane, lane ? 37 : 12);
-      wave_->debug_write_vgpr(4, lane, 0x12345678);
-    }
-    for (bool load : {false, true}) {
-      amdgpu::VectorMemState data(amdgpu::GLOBAL_MEM);
-      data.is_load = load;
-      ASSERT_TRUE(amdgpu::prepare_image_transfer(*wave_, data, 8, 4, {0, 1, 2}, 2, 1, false, false,
-                                                 ~0u, amdgpu::ImageSampleMode::Implicit, a16));
-      EXPECT_EQ(data.lane_mask, 1u);
-      // 256KB 3D AddrLib address for (21,59,12), without mipmaps.
-      EXPECT_EQ(data.per_lane_addr[0], 0x100000u + (gfx12 ? 192076u : 189004u));
-      if (!load) {
-        ASSERT_GE(data.store_data.size(), 4u);
-        uint32_t value;
-        std::memcpy(&value, data.store_data.data(), 4);
-        EXPECT_EQ(value, 0x12345678u);
+  for (uint32_t dim : {2u, 5u})
+    for (bool a16 : {false, true}) {
+      for (uint32_t lane = 0; lane < 2; ++lane) {
+        wave_->debug_write_vgpr(0, lane, 21 | (a16 ? 59u << 16 : 0));
+        wave_->debug_write_vgpr(1, lane, a16 ? (lane ? 37 : 12) : 59);
+        wave_->debug_write_vgpr(2, lane, lane ? 37 : 12);
+        wave_->debug_write_vgpr(4, lane, 0x12345678);
+      }
+      for (bool load : {false, true}) {
+        amdgpu::VectorMemState data(amdgpu::GLOBAL_MEM);
+        data.is_load = load;
+        ASSERT_TRUE(amdgpu::prepare_image_transfer(*wave_, data, 8, 4, {0, 1, 2}, dim, 1, false,
+                                                   false, ~0u, amdgpu::ImageSampleMode::Implicit,
+                                                   a16));
+        EXPECT_EQ(data.lane_mask, 1u);
+        // 256KB 3D AddrLib address for (21,59,12), without mipmaps.
+        EXPECT_EQ(data.per_lane_addr[0], 0x100000u + (gfx12 ? 192076u : 189004u));
+        if (!load) {
+          ASSERT_GE(data.store_data.size(), 4u);
+          uint32_t value;
+          std::memcpy(&value, data.store_data.data(), 4);
+          EXPECT_EQ(value, 0x12345678u);
+        }
       }
     }
-  }
 }
 
 TEST_P(GraphicsExportTest, TiledMipTransfersUseViewBoundsAndIndependentBackingOffsets) {
   const bool gfx12 = GetParam() == ROCJITSU_CODE_ARCH_RDNA4;
   constexpr uint32_t base = 0x400000;
-  for (bool volume : {false, true})
+  for (uint8_t dim : {1, 2, 5})
     for (bool compressed : {false, true}) {
+      const bool volume = dim != 1;
       if (gfx12 && compressed)
         continue;
       for (bool explicit_mip : {false, true})
         for (uint32_t level = 0; level < 8; ++level) {
           SCOPED_TRACE(testing::Message() << "level=" << level << " explicit=" << explicit_mip
-                                          << " volume=" << volume);
+                                          << " dim=" << unsigned(dim));
           const uint32_t width = std::max(1u, 200u >> level), height = std::max(1u, 180u >> level);
           const uint32_t layer = volume && level < 7 ? 1 : 0;
           const auto pixels =
@@ -6584,7 +6587,7 @@ TEST_P(GraphicsExportTest, TiledMipTransfersUseViewBoundsAndIndependentBackingOf
             const uint8_t opcode = (store ? 6 : 0) + explicit_mip;
             std::array<uint32_t, 4> words{};
             if (gfx12) {
-              const auto inst = rdna4::build_vimage(opcode, {.dim = uint8_t(volume ? 2 : 1),
+              const auto inst = rdna4::build_vimage(opcode, {.dim = dim,
                                                              .dmask = 15,
                                                              .vdata = 8,
                                                              .rsrc = 8,
@@ -6594,11 +6597,8 @@ TEST_P(GraphicsExportTest, TiledMipTransfersUseViewBoundsAndIndependentBackingOf
                                                              .vaddr3 = 5});
               std::copy(inst.begin(), inst.end(), words.begin());
             } else {
-              const auto inst = rdna3::build_mimg(opcode, {.dim = uint8_t(volume ? 2 : 1),
-                                                           .dmask = 15,
-                                                           .vaddr = 2,
-                                                           .vdata = 8,
-                                                           .srsrc = 2});
+              const auto inst = rdna3::build_mimg(
+                  opcode, {.dim = dim, .dmask = 15, .vaddr = 2, .vdata = 8, .srsrc = 2});
               std::copy(inst.begin(), inst.end(), words.begin());
             }
             auto decoded = decoder_->decode(words.data());

@@ -66,6 +66,7 @@ enum class Pm4Opcode : uint32_t {
   IndirectBuffer = 0x3f,
   CopyData = 0x40,
   EventWrite = 0x46,
+  EventWriteZpass = 0xb1,
   StreamoutStatsQuery = 0xc3,
   ReleaseMem = 0x49,
   DmaData = 0x50,

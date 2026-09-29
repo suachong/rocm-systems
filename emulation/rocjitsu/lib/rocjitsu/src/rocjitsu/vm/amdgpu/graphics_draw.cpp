@@ -795,8 +795,8 @@ DispatchEntry GraphicsDraw::vertex_dispatch() const {
   const bool gfx12 = arch_ == ROCJITSU_CODE_ARCH_RDNA4;
   const uint32_t rsrc1 = sh_[0x8a], rsrc2 = sh_[0x8b];
   dp.kernel_wave_size = (context_[gfx12 ? 0x2a6 : 0x2d5] & (1u << 22)) ? 32 : 64;
-  if (vertex_groups_.empty() || vertex_groups_.front().count > dp.kernel_wave_size || (rsrc2 & 1))
-    throw std::runtime_error("unsupported graphics wave count or scratch allocation");
+  if (vertex_groups_.empty() || vertex_groups_.front().count > dp.kernel_wave_size)
+    throw std::runtime_error("unsupported graphics wave count");
   uint64_t pc = (uint64_t{sh_[gfx12 ? 0x86 : 0xc9]} << 32) | sh_[gfx12 ? 0x89 : 0xc8];
   pc <<= 8;
   dp.kernel_entry_pc = static_cast<uint64_t>(static_cast<int64_t>(pc << 16) >> 16);
@@ -1536,8 +1536,6 @@ void GraphicsDraw::rasterize(const GpuVmAccess &memory, const VertexGroup &group
     return;
   if (clip_control & (0x3fu | (1u << 28)))
     throw std::runtime_error("graphics user clip planes are not implemented");
-  if (sh_[0xb] & 1) // SPI_SHADER_PGM_RSRC2_PS.SCRATCH_EN
-    throw std::runtime_error("fragment scratch is not implemented");
   if (context_[0x1b] & (1u << 12)) // DB_SHADER_CONTROL.DEPTH_BEFORE_SHADER
     throw std::runtime_error("graphics early fragment tests are not implemented");
   const uint32_t polygon_mode = (context_[0x207] >> 3) & 3;

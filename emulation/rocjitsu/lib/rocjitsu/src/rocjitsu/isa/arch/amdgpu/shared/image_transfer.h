@@ -104,7 +104,10 @@ inline bool prepare_image_transfer(Wavefront &wf, VectorMemState &d, uint32_t re
   const bool is_array = type == 11 || type == 12 || type == 13;
   const bool volume = type == 10;
 
-  if ((dim == 2) != volume || (volume && (sampler != ~0u || (r[5] & 16))))
+  // Non-sampling 2D-array instructions also address 3D resources: their third
+  // coordinate is Z, with the resource's volume layout and depth bounds.
+  if ((dim == 2 && !volume) ||
+      (volume && ((dim != 2 && dim != 5) || sampler != ~0u || (r[5] & 16))))
     return unsupported();
   const uint32_t swizzle = (r[3] >> 20) & 31;
   uint32_t width = ((r[1] >> 30) | ((r[2] & (gfx12 ? 0x3fff : 0xfff)) << 2)) + 1;
@@ -152,7 +155,7 @@ inline bool prepare_image_transfer(Wavefront &wf, VectorMemState &d, uint32_t re
   const bool sample = sampler != ~0u;
   const bool one_dimensional = dim == 0 || dim == 4;
   const uint32_t spatial_components = one_dimensional ? 1 : volume ? 3 : 2;
-  const bool layer_coordinate = dim == 3 || dim == 4 || dim == 5;
+  const bool layer_coordinate = !volume && (dim == 3 || dim == 4 || dim == 5);
   d.image_sampling = sample;
   const uint32_t first_layer = (r[4] >> 16) & (gfx12 ? 0x3fff : 0x1fff);
   const uint32_t last_layer = is_array ? r[4] & (gfx12 ? 0x3fff : 0x1fff) : 0;
@@ -808,7 +811,7 @@ inline bool prepare_image_transfer(Wavefront &wf, VectorMemState &d, uint32_t re
     const uint32_t relative_layer = dim == 5 || dim == 3 ? load_coordinate(2)
                                     : dim == 4           ? load_coordinate(1)
                                                          : 0;
-    if (!is_array && relative_layer)
+    if (!is_array && !volume && relative_layer)
       return unsupported();
     // Explicit mip transfers supply an unsigned, view-relative LOD per lane.
     // Reject it before adding the base level, including values that would wrap.

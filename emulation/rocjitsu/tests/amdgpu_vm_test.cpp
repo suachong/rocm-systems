@@ -8316,7 +8316,7 @@ TEST(Pm4DispatchTest, CancellationFailsPendingSubmissionAndReleasesVmBinding) {
   EXPECT_FALSE(f.cp()->has_registered_queues());
 }
 
-std::vector<uint32_t> graphics_ring_program(bool gfx12, bool fragment) {
+std::vector<uint32_t> graphics_ring_program(bool gfx12, bool fragment, bool scratch = false) {
   std::vector<uint32_t> words;
   const auto append = [&](const auto &instruction) {
     words.insert(words.end(), instruction.begin(), instruction.end());
@@ -8349,6 +8349,25 @@ std::vector<uint32_t> graphics_ring_program(bool gfx12, bool fragment) {
                                .vsrc2 = uint8_t(first + 2),
                                .vsrc3 = uint8_t(first + 3)}));
   };
+  const auto spill_reload = [&] {
+    if (!scratch)
+      return;
+    // Spill different lane values, clear the registers and restore them before
+    // export. A small ring also forces resident slots to be recycled.
+    if (gfx12)
+      append(rdna4::build_vscratch(29, {.saddr = 124, .vsrc = 8}));
+    else
+      append(rdna3::build_flat(29, {.seg = 1, .data = 8, .saddr = 124}));
+    wait();
+    for (uint8_t reg = 8; reg < 12; ++reg)
+      append(gfx12 ? rdna4::build_vop1(1, {.src0 = 128, .vdst = reg})
+                   : rdna3::build_vop1(1, {.src0 = 128, .vdst = reg}));
+    if (gfx12)
+      append(rdna4::build_vscratch(23, {.saddr = 124, .vdst = 8}));
+    else
+      append(rdna3::build_flat(23, {.seg = 1, .saddr = 124, .vdst = 8}));
+    wait();
+  };
   if (fragment) {
     // Ordinary DS loads add the placement-selected LDS base to this local offset.
     append(gfx12 ? rdna4::build_vop1(1, {.src0 = 128, .vdst = 0})
@@ -8362,6 +8381,7 @@ std::vector<uint32_t> graphics_ring_program(bool gfx12, bool fragment) {
             54, {.offset0 = uint8_t(component * 12), .addr = 0, .vdst = uint8_t(8 + component)}));
     }
     wait();
+    spill_reload();
     export_values(0, 15, 8, true);
   } else {
     const auto scalar = [&](uint16_t opcode, uint8_t dst, uint8_t src0, uint8_t src1) {
@@ -8406,6 +8426,7 @@ std::vector<uint32_t> graphics_ring_program(bool gfx12, bool fragment) {
       append(
           rdna3::build_mubuf(29, {.vaddr = 7, .vdata = 12, .srsrc = 2, .idxen = 1, .soffset = 5}));
     wait();
+    spill_reload();
     export_values(12, 15, 8, false);
     append(gfx12 ? rdna4::build_vopc(204, {.src0 = 17, .vsrc1 = 7})
                  : rdna3::build_vopc(204, {.src0 = 17, .vsrc1 = 7}));
@@ -8423,23 +8444,24 @@ TEST(Pm4DispatchTest, GraphicsSpiPlacementPreservesAttributeRingAndBlendedExport
         SCOPED_TRACE(testing::Message() << gfx12 << ',' << wave_size << ',' << mode);
         constexpr uint32_t pid = 7, vertices = 1080, width = 8;
         constexpr uint64_t code = 0x8000, ps = 0x8400, ib = 0x4000, ring = 0x10000,
-                           output = 0x30000, inputs = 0x40000;
+                           output = 0x30000, inputs = 0x40000, scratch = 0x60000;
         KfdProcess process(pid);
-        std::array<uint8_t, 4096> code_backing{}, ib_backing{}, output_backing{};
+        std::array<uint8_t, 4096> code_backing{}, ib_backing{}, output_backing{}, scratch_backing{};
         std::vector<uint8_t> ring_backing(65536), input_backing(vertices * 32);
         process.map_pages(code, code_backing.data(), code_backing.size());
         process.map_pages(ib, ib_backing.data(), ib_backing.size());
         process.map_pages(output, output_backing.data(), output_backing.size());
         process.map_pages(ring, ring_backing.data(), ring_backing.size());
         process.map_pages(inputs, input_backing.data(), input_backing.size());
+        process.map_pages(scratch, scratch_backing.data(), scratch_backing.size());
         for (uint32_t vertex = 0; vertex < vertices; ++vertex) {
           const std::array<float, 8> data{
               vertex % 3 == 2 ? 1.0f : -1.0f,  vertex % 3 == 1 ? 1.0f : -1.0f,   0,    1,
               float((vertex / 3) % 7 + 1) / 8, float((vertex / 30) % 3 + 1) / 4, 0.5f, 0.25f};
           std::memcpy(input_backing.data() + vertex * 32, data.data(), sizeof(data));
         }
-        const auto vs_words = graphics_ring_program(gfx12, false);
-        const auto ps_words = graphics_ring_program(gfx12, true);
+        const auto vs_words = graphics_ring_program(gfx12, false, mode != 0);
+        const auto ps_words = graphics_ring_program(gfx12, true, mode != 0);
         ASSERT_LT(vs_words.size() * 4, ps - code);
         std::memcpy(code_backing.data(), vs_words.data(), vs_words.size() * 4);
         std::memcpy(code_backing.data() + ps - code, ps_words.data(), ps_words.size() * 4);
@@ -8463,7 +8485,8 @@ TEST(Pm4DispatchTest, GraphicsSpiPlacementPreservesAttributeRingAndBlendedExport
         sh[gfx12 ? 0x89 : 0xc8] = code >> 8;
         sh[0x8] = ps >> 8;
         sh[0x8a] = sh[0xa] = wave_size == 32 ? 2 : 5; // 24 VGPRs.
-        sh[0x8b] = 8 << 1; // Ring and vertex-input descriptors at s8 and s12.
+        sh[0x8b] = (8 << 1) | 1; // Ring and vertex-input descriptors; scratch enabled.
+        sh[0xb] = 1;
         const std::array<uint32_t, 8> descriptors{uint32_t(ring),
                                                   (16u << 16) | (3u << 30),
                                                   65536,
@@ -8474,6 +8497,11 @@ TEST(Pm4DispatchTest, GraphicsSpiPlacementPreservesAttributeRingAndBlendedExport
                                                   0};
         std::copy(descriptors.begin(), descriptors.end(), sh.begin() + 0x8c);
         auto &ctx = state->context_registers;
+        // The reference shader enables scratch but does not use any storage,
+        // as PAL does for shaders without spills. Other modes share four slots
+        // across two SEs and use both vertex and fragment scratch.
+        ctx[0x1ba] = 2 | (mode == 0 ? 0 : 4u << 12);
+        ctx[0x1bb] = mode == 0 ? 0 : scratch >> 8;
         ctx[gfx12 ? 0x2a6 : 0x2d5] = wave_size == 32 ? 1u << 22 : 0;
         ctx[gfx12 ? 0x190 : 0x1b6] = (wave_size == 32 ? 1u << 15 : 0) | (gfx12 ? 0u : 1u);
         if (gfx12)

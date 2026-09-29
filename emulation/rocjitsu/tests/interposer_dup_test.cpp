@@ -1364,9 +1364,21 @@ TEST_F(InterposerPm4Test, ComputeTranslationPrefetchIgnoresPfpSelector) {
 TEST_F(InterposerPm4Test, OcclusionQuerySamplesOnlyEnabledInstances) {
   const uint64_t destination = kAddress + 6144;
   const uint32_t packets[]{
-      0xc0024600, 56 | (1u << 8), (5u << 11) | (2u << 9),    0,
-      0xc0024600, 57 | (1u << 8), uint32_t(destination),     uint32_t(destination >> 32),
-      0xc0024600, 57 | (1u << 8), uint32_t(destination + 8), uint32_t(destination >> 32)};
+      // Enable instances 0 and 2 with a 128-bit stride.
+      0xc0024600,
+      56 | (1u << 8),
+      (5u << 11) | (2u << 9),
+      0,
+      // Begin sample: full PIXEL_PIPE_STAT_DUMP encoding.
+      0xc0024600,
+      57 | (1u << 8),
+      uint32_t(destination),
+      uint32_t(destination >> 32),
+      // End sample: compact EVENT_WRITE_ZPASS encoding.
+      0xc001b100,
+      uint32_t(destination + 8),
+      uint32_t(destination >> 32),
+  };
   std::fill_n(memory_ + 1536, 14, 0xdeadbeef);
   std::memcpy(memory_, packets, sizeof(packets));
   uint64_t sequence = 0;
