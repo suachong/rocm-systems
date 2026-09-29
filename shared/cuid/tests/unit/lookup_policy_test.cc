@@ -190,8 +190,8 @@ TEST(cuidtstUnprivileged, NicUnitIdIsItsPciFunction) {
   }
 }
 
-// A property query answers from the handle's device alone: it does not
-// re-derive every other device. Compared against a cold
+// A property query answers from the handle's device alone: it neither re-reads
+// the node key nor re-derives every other device. Compared against a cold
 // enumeration, and bounded outright, since a warm one can read almost nothing.
 TEST(cuidtstUnprivileged, PropertyQueryDoesNotReenumerate) {
   if (ThreadReadCalls() < 0) GTEST_SKIP() << "no /proc/thread-self/io";

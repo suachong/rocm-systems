@@ -166,7 +166,7 @@ Derived CUID
 
 For typical day-to-day operations, the derived CUID is used. It is derived by hashing the primary CUID using HMAC-SHA2-256 (keyed hash) using a 256-bit key. The derived CUID obscures hardware details from lower-privilege software and prevents precomputed table attacks.
 
-The key is the node key, a 256-bit HMAC key as described in FIPS 198-1, The Keyed-Hash Message Authentication Code (HMAC). Anyone holding the key can confirm a guessed serial number, so it must be random, unique per deployment, and readable only by root. This version of the library holds no node key, so every derived CUID it returns is temporary; see :ref:`read-cuids`.
+The key is the node key, a 256-bit HMAC key as described in FIPS 198-1, The Keyed-Hash Message Authentication Code (HMAC). amdgpu creates a random node key on its first load and stores it in the ``AmdCuidKey`` UEFI variable; see :ref:`manage-node-key`. Anyone holding the key can confirm a guessed serial number, so it must be random, unique per deployment, and readable only by root.
 
 If the node key changes, every derived CUID computed with it changes. Primary CUIDs do not change, so they still trace each derived CUID back to its device.
 

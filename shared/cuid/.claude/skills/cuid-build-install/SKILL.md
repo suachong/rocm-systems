@@ -48,7 +48,8 @@ sudo make install
 ```bash
 ls /opt/rocm/core/lib/libamdcuid_static.a \
    /opt/rocm/core/include/amdcuid/amd_cuid.h \
-   /opt/rocm/core/lib/cmake/amdcuid/amdcuid-config.cmake
+   /opt/rocm/core/lib/cmake/amdcuid/amdcuid-config.cmake \
+   /usr/lib/tmpfiles.d/amdcuid.conf
 ```
 
 ## One-Shot Command
@@ -70,7 +71,7 @@ ls /opt/rocm/core/lib/libamdcuid_static.a
 
 On success, capture and report:
 - **Build time** (cmake + make duration)
-- **Installed files** (the archive, header and CMake package under `/opt/rocm/core`)
+- **Installed files** (the archive, header and CMake package under `/opt/rocm/core`, and the tmpfiles.d rule)
 - **Any warnings** from cmake or make (even if build succeeded)
 
 On failure, capture and report:

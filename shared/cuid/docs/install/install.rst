@@ -51,6 +51,25 @@ To build and install the CUID library from source, follow these steps:
       The default install directory is ``/opt/rocm/core``. However, you can choose a different directory using the ``-DCMAKE_INSTALL_PREFIX`` option.
 
 Installation ships the static library ``libamdcuid_static.a``, its header
-``amd_cuid.h`` (under ``include/amdcuid``) and a CMake package
-(``find_package(amdcuid)``, target ``amdcuid::amdcuid``). Nothing needs
-configuring. See :ref:`read-cuids` for reading CUIDs.
+``amd_cuid.h`` (under ``include/amdcuid``), a CMake package (``find_package(amdcuid)``, target
+``amdcuid::amdcuid``) and ``/usr/lib/tmpfiles.d/amdcuid.conf`` (``-DAMDCUID_TMPFILES_DIR`` to change
+it), which makes the ``AmdCuidKey`` efivarfs variable mode 0600 at every boot
+on a kernel whose efivarfs does not already create it 0600. Nothing else needs configuring: root
+reads the node key from an amdgpu device's ``cuid_seed``, or the
+``AmdCuidKey`` variable directly, once per enumeration or device lookup.
+
+Provisioning the node key
+==========================
+
+A freshly installed node has no key of its own until either an amdgpu device
+generates one on first module load, or an administrator sets one explicitly:
+
+.. code-block:: shell
+
+   head -c 32 /dev/urandom | sudo amd-smi set --cuid-seed -
+   # or, to share one key across a fleet:
+   sudo amd-smi set --cuid-seed /path/to/fleet-key.bin
+
+Without a key, and for every non-root caller, CPU, NIC, NPU and platform CUIDs
+are temporary. See :ref:`manage-node-key` for the full provisioning flow,
+refusal rules and failure modes.

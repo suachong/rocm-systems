@@ -6,12 +6,13 @@
 #include <gtest/gtest.h>
 
 #include <cstdio>
+#include <cstdlib>
 
 TestHMAC::TestHMAC() {
   SetTitle("HMAC Key Operations");
   SetDescription(
-      "Verify amdcuid_generate_hash_key produces a non-zero key, and that "
-      "amdcuid_set_hash_key is unsupported.");
+      "Verify amdcuid_generate_hash_key produces a non-zero key. "
+      "amdcuid_set_hash_key requires root.");
 }
 
 // No device enumeration needed for HMAC key operations.
@@ -36,7 +37,14 @@ void TestHMAC::Run() {
            generated_key[1], generated_key[2], generated_key[3]);
   }
 
-  EXPECT_EQ(amdcuid_set_hash_key(generated_key), AMDCUID_STATUS_UNSUPPORTED);
-  amdcuid_key_info_t info{};
-  EXPECT_EQ(amdcuid_get_key_info(&info), AMDCUID_STATUS_UNSUPPORTED);
+  // This replaces the host's real key, in firmware.
+  if (!std::getenv("AMDCUID_TEST_ALLOW_SET_KEY")) {
+    GTEST_SKIP() << "amdcuid_set_hash_key() would provision this host's real node key; "
+                    "set AMDCUID_TEST_ALLOW_SET_KEY=1 to run it.";
+  }
+
+  status = amdcuid_set_hash_key(generated_key);
+  CHK_ERR_ASRT(status);
+
+  IF_VERB(1) { printf("  amdcuid_set_hash_key: %s\n", amdcuid_status_to_string(status)); }
 }

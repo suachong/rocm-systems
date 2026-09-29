@@ -3,6 +3,8 @@
 
 #include <dirent.h>
 #include <fcntl.h>
+#include <linux/fs.h>
+#include <sys/ioctl.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -15,6 +17,7 @@
 #include <vector>
 
 #include "include/amd_cuid.h"
+#include "rocm/sha2/sha256.h"
 #include "src/cuid_cpu.h"
 #include "src/cuid_device.h"
 #include "src/cuid_device_manager.h"
@@ -28,16 +31,185 @@
 
 namespace {
 
+// Static instance for API
+cuid_hmac global_hmac = cuid_hmac();
 CuidDeviceManager& mgr = CuidDeviceManager::instance();
+
+// Share global_hmac with mgr so build_cuid_index() derives CUIDs with the
+// key reload_key() last read.
+struct HmacWiring {
+  HmacWiring() { mgr.set_hmac(&global_hmac); }
+} hmac_wiring;
+
+// Root with a node key gets it. Anyone else gets nullptr, which puts a
+// key-gated component (CPU, NIC, NPU, Platform) on its temporary CUID.
+cuid_hmac* derivation_key() {
+  return (geteuid() == 0 && global_hmac.is_valid()) ? &global_hmac : nullptr;
+}
 
 amdcuid_status_t current_handle(const DevicePtr& device, amdcuid_id_t* handle) {
   amdcuid_derived_id derived{};
-  const auto status = device->get_derived_cuid(derived);
+  const auto status = device->get_derived_cuid(derived, derivation_key());
   if (status != AMDCUID_STATUS_SUCCESS) return status;
   const auto indexed = mgr.index_handle(device, derived.UUIDv8_representation);
   if (indexed != AMDCUID_STATUS_SUCCESS) return indexed;
   *handle = derived.UUIDv8_representation;
   return AMDCUID_STATUS_SUCCESS;
+}
+
+// The driver persists the seed to AmdCuidKey and re-keys every component.
+// cuid_seed accepts exactly 32 raw bytes in one write, with no trailing newline.
+// Retrying a short write would submit an invalid length.
+//
+// Returns SUCCESS when the seed was accepted, UNSUPPORTED when the attribute is
+// absent, so there is no kernel-published value to go stale, and
+// PERMISSION_DENIED or FILE_ERROR when it exists and the write did not land.
+amdcuid_status_t write_driver_seed(const std::string& bdf, const uint8_t key[key_length]) {
+  const std::string path = "/sys/bus/pci/devices/" + bdf + "/cuid_seed";
+
+  const int fd = open(path.c_str(), O_WRONLY | O_CLOEXEC);
+  if (fd < 0) {
+    if (errno == ENOENT) return AMDCUID_STATUS_UNSUPPORTED;
+    const int err = errno;
+    LOG(ERROR,
+        "amdcuid_set_hash_key: cannot open " << path << ": " << CuidUtilities::errno_string(err));
+    return (err == EACCES || err == EPERM) ? AMDCUID_STATUS_PERMISSION_DENIED
+                                           : AMDCUID_STATUS_FILE_ERROR;
+  }
+
+  const ssize_t written = write(fd, key, key_length);
+  const int err = errno;
+  close(fd);
+
+  if (written == static_cast<ssize_t>(key_length)) return AMDCUID_STATUS_SUCCESS;
+
+  LOG(ERROR,
+      "amdcuid_set_hash_key: cannot write " << path << ": " << CuidUtilities::errno_string(err));
+  return (err == EACCES || err == EPERM) ? AMDCUID_STATUS_PERMISSION_DENIED
+                                         : AMDCUID_STATUS_FILE_ERROR;
+}
+
+// efivarfs marks the variable immutable, which refuses both opening it for
+// writing and chmod. Sets `cleared` when the flag was set and is now clear.
+bool clear_immutable(int fd, bool& cleared) {
+  cleared = false;
+  int flags = 0;
+  if (ioctl(fd, FS_IOC_GETFLAGS, &flags) != 0) return false;
+  if (!(flags & FS_IMMUTABLE_FL)) return true;
+  flags &= ~FS_IMMUTABLE_FL;
+  if (ioctl(fd, FS_IOC_SETFLAGS, &flags) != 0) return false;
+  cleared = true;
+  return true;
+}
+
+// Put back what clear_immutable() took off, so the variable is not left
+// deletable.
+void restore_immutable(int fd) {
+  int flags = 0;
+  if (ioctl(fd, FS_IOC_GETFLAGS, &flags) == 0) {
+    flags |= FS_IMMUTABLE_FL;
+    if (ioctl(fd, FS_IOC_SETFLAGS, &flags) == 0) return;
+  }
+  const int err = errno;
+  LOG(WARN, "amdcuid_set_hash_key: cannot restore the immutable flag on "
+                << kKeyVariablePath << ": " << CuidUtilities::errno_string(err));
+}
+
+// Without amdgpu the key goes straight to AmdCuidKey, flagged as set by an
+// administrator. UNSUPPORTED when there is no efivarfs to write it to.
+amdcuid_status_t write_key_variable(const uint8_t key[key_length]) {
+  struct stat st{};
+  if (stat(kEfivarsDir, &st) != 0) return AMDCUID_STATUS_UNSUPPORTED;
+
+  uint8_t buf[4 + kKeyVariablePayloadLen];
+  CuidUtilities::build_key_variable(key, buf);
+
+  bool cleared = false;
+  bool clear_failed = false;
+  int fd = -1;
+  const int ro_fd = open(kKeyVariablePath, O_RDONLY | O_CLOEXEC);
+  if (ro_fd >= 0) {
+    if (!clear_immutable(ro_fd, cleared)) {
+      const int err = errno;
+      clear_failed = true;
+      LOG(WARN, "amdcuid_set_hash_key: cannot clear the immutable flag on "
+                    << kKeyVariablePath << ": " << CuidUtilities::errno_string(err));
+    }
+    fd = open(kKeyVariablePath, O_WRONLY | O_CLOEXEC);
+  } else if (errno == ENOENT) {
+    fd = open(kKeyVariablePath, O_WRONLY | O_CREAT | O_CLOEXEC, 0600);
+  }
+  const int open_err = errno;
+
+  ssize_t written = -1;
+  int err = open_err;
+  if (fd >= 0) {
+    written = write(fd, buf, sizeof(buf));
+    err = errno;
+    close(fd);
+  }
+  rocm::sha2::secure_zero(buf, sizeof(buf));
+  if (ro_fd >= 0) {
+    if (cleared) restore_immutable(ro_fd);
+    close(ro_fd);
+  }
+
+  if (fd < 0) {
+    LOG(ERROR, "amdcuid_set_hash_key: cannot open " << kKeyVariablePath << ": "
+                                                    << CuidUtilities::errno_string(open_err));
+    // With the immutable flag still set, EPERM says nothing about privilege.
+    if (clear_failed) return AMDCUID_STATUS_FILE_ERROR;
+    return (open_err == EACCES || open_err == EPERM) ? AMDCUID_STATUS_PERMISSION_DENIED
+                                                     : AMDCUID_STATUS_FILE_ERROR;
+  }
+  if (written == static_cast<ssize_t>(sizeof(buf))) return AMDCUID_STATUS_SUCCESS;
+  LOG(ERROR, "amdcuid_set_hash_key: cannot write " << kKeyVariablePath << ": "
+                                                   << CuidUtilities::errno_string(err));
+  return AMDCUID_STATUS_FILE_ERROR;
+}
+
+// A variable created through efivarfs is already 0600: write_key_variable()
+// asks for it, and an efivarfs that lists AmdCuidKey as secret forces it.
+// Otherwise efivarfs lists the variable 0644, and immutable, so fchmod()
+// fails with EPERM until the flag is cleared. efivarfs lists a variable only
+// as it was at mount time, so one the driver created this boot is absent
+// until the next boot or a resume from hibernation.
+void restrict_key_variable() {
+  const int fd = open(kKeyVariablePath, O_RDONLY | O_CLOEXEC);
+  if (fd < 0) return;
+  struct stat st{};
+  if (fstat(fd, &st) == 0 && (st.st_mode & 077) == 0) {
+    close(fd);
+    return;
+  }
+  bool cleared = false;
+  if (!clear_immutable(fd, cleared) || fchmod(fd, 0600) != 0)
+    LOG(WARN, "amdcuid_set_hash_key: cannot make " << kKeyVariablePath << " mode 0600 ("
+                                                   << CuidUtilities::errno_string(errno)
+                                                   << "); every local user can read the key");
+  if (cleared) restore_immutable(fd);
+  close(fd);
+}
+
+bool find_cuid_seed_device(std::string& bdf) {
+  DIR* dir = opendir("/sys/bus/pci/devices");
+  if (!dir) return false;
+  bool found = false;
+  struct dirent* entry;
+  // This call site owns its DIR*, which is all POSIX requires; readdir_r is
+  // deprecated and must not be adopted.
+  // NOLINTNEXTLINE(concurrency-mt-unsafe)
+  while (!found && (entry = readdir(dir)) != nullptr) {
+    if (entry->d_name[0] == '.') continue;
+    struct stat st{};
+    const std::string path = std::string("/sys/bus/pci/devices/") + entry->d_name + "/cuid_seed";
+    if (stat(path.c_str(), &st) == 0) {
+      bdf = entry->d_name;
+      found = true;
+    }
+  }
+  closedir(dir);
+  return found;
 }
 
 }  // namespace
@@ -115,6 +287,7 @@ amdcuid_status_t amdcuid_get_all_handles(amdcuid_id_t* handles, uint32_t* count)
   }
 
   amdcuid_status_t status;
+  if (geteuid() == 0) global_hmac.reload_key();
   // get all the devices on the system first
   if (mgr.devices().empty()) {
     status = mgr.discover_devices();
@@ -292,6 +465,7 @@ amdcuid_status_t amdcuid_get_handle_by_dev_path(const char* dev_path,
   if (!dev_path || !handle) {
     return AMDCUID_STATUS_INVALID_ARGUMENT;
   }
+  if (geteuid() == 0) global_hmac.reload_key();
 
   std::string input_dev_path(dev_path);
   CuidGpuRoute gpu_route;
@@ -390,6 +564,7 @@ amdcuid_status_t amdcuid_get_handle_by_bdf(const char* bdf, amdcuid_device_type_
   if (device_type == AMDCUID_DEVICE_TYPE_CPU || device_type == AMDCUID_DEVICE_TYPE_PLATFORM) {
     return AMDCUID_STATUS_WRONG_DEVICE_TYPE;
   }
+  if (geteuid() == 0) global_hmac.reload_key();
 
   // check mgr first to see if device is already known
   for (const auto& device : mgr.devices()) {
@@ -462,6 +637,7 @@ amdcuid_status_t amdcuid_get_handle_by_fd(int fd, amdcuid_device_type_t device_t
 
 amdcuid_status_t amdcuid_refresh() {
   std::lock_guard<std::recursive_mutex> operation(cuid_operation_mutex());
+  if (geteuid() == 0) global_hmac.reload_key();
   mgr.shutdown();
   return mgr.discover_devices();
 }
@@ -477,7 +653,7 @@ amdcuid_status_t amdcuid_query_device_property(amdcuid_id_t handle, amdcuid_quer
     return AMDCUID_STATUS_DEVICE_NOT_FOUND;
   }
   amdcuid_derived_id derived{};
-  const auto identity_status = device->get_derived_cuid(derived);
+  const auto identity_status = device->get_derived_cuid(derived, derivation_key());
   if (identity_status != AMDCUID_STATUS_SUCCESS) return identity_status;
   const amdcuid_id_t current = derived.UUIDv8_representation;
   if (std::memcmp(current.bytes, handle.bytes, sizeof(current.bytes)) != 0)
@@ -689,7 +865,7 @@ amdcuid_status_t amdcuid_query_device_property(amdcuid_id_t handle, amdcuid_quer
       }
       if (data != nullptr) {
         bool is_temporary = false;
-        status = device->is_temporary_cuid(&is_temporary);
+        status = device->is_temporary_cuid(&is_temporary, derivation_key());
         *(bool*)data = is_temporary;
       }
       *length = sizeof(bool);
@@ -703,14 +879,33 @@ amdcuid_status_t amdcuid_query_device_property(amdcuid_id_t handle, amdcuid_quer
 }
 
 amdcuid_status_t amdcuid_set_hash_key(const uint8_t key[32]) {
-  (void)key;
-  return AMDCUID_STATUS_UNSUPPORTED;
+  std::lock_guard<std::recursive_mutex> operation(cuid_operation_mutex());
+  if (geteuid() != 0) {
+    return AMDCUID_STATUS_PERMISSION_DENIED;
+  }
+  if (!key) {
+    return AMDCUID_STATUS_INVALID_ARGUMENT;
+  }
+
+  if (CuidUtilities::is_rejected_key(key)) return AMDCUID_STATUS_INVALID_ARGUMENT;
+
+  std::string bdf;
+  const auto status =
+      find_cuid_seed_device(bdf) ? write_driver_seed(bdf, key) : write_key_variable(key);
+  if (status != AMDCUID_STATUS_SUCCESS) return status;
+  restrict_key_variable();
+  return amdcuid_refresh();
 }
 
 amdcuid_status_t amdcuid_get_key_info(amdcuid_key_info_t* info) {
+  std::lock_guard<std::recursive_mutex> operation(cuid_operation_mutex());
   if (!info) return AMDCUID_STATUS_INVALID_ARGUMENT;
+
   std::memset(info, 0, sizeof(*info));
-  return AMDCUID_STATUS_UNSUPPORTED;
+  if (geteuid() != 0) return AMDCUID_STATUS_PERMISSION_DENIED;
+
+  const auto status = global_hmac.reload_key();
+  return status == AMDCUID_STATUS_SUCCESS ? global_hmac.get_key_info(info) : status;
 }
 
 amdcuid_status_t amdcuid_generate_hash_key(uint8_t key[32]) {
@@ -719,6 +914,5 @@ amdcuid_status_t amdcuid_generate_hash_key(uint8_t key[32]) {
   }
   if (!key) return AMDCUID_STATUS_INVALID_ARGUMENT;
 
-  cuid_hmac hmac;
-  return hmac.generate_key(key);
+  return global_hmac.generate_key(key);
 }

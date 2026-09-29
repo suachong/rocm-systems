@@ -16,25 +16,31 @@ tests use fixtures; they do not establish CPX/DPX or guest behavior on hardware.
 
 ## Lookup configurations
 
-* **Tier 1:** the driver publishes `cuid_primary` and `cuid_unit_id`. Root
-  reads the driver's primary; the derived CUID of a whole GPU is temporary
-  with source `LIBRARY`, and a partition has none.
+* **Tier 1:** the driver publishes CUIDs. amd-smi reports the derived value
+  verbatim with source `DRIVER`, for root and ordinary users alike. A driver
+  that publishes `cuid_primary` and `cuid_unit_id` but no `cuid_derived`
+  leaves a whole GPU keyed like a CPU and a partition without a CUID.
 * **Tier 2:** the driver publishes nothing. A whole GPU gets a temporary CUID
   with source `LIBRARY`; a partition gets none.
 
-The library holds no node key, so every CPU, NIC, NPU, Platform and GPU
-derived CUID is temporary, for root and ordinary users alike.
+CPU, NIC, NPU and Platform CUIDs are derived with the node key for root when
+one exists (any amdgpu `cuid_seed`, else the `AmdCuidKey` UEFI variable) and
+are temporary otherwise.
 
 | Axis | Cases to distinguish |
 |---|---|
 | Privilege | Root and ordinary user; primary identity is privileged |
 | Driver support | CUID attributes present and absent |
+| Node key | None, driver-generated (`unprovisioned`), administrator-set (`provisioned`), only in efivarfs |
+| efivarfs | Creates `AmdCuidKey` 0600, or lists it 0644 and immutable |
 | Firmware identity | Adopted system UUID and constructed Platform identity |
 | Hardware | Whole GPU, no readable serial, spatial partition, SR-IOV VF |
 
 A constructed primary encodes component identity. An adopted firmware primary
-is opaque and need not be UUIDv8. Auxiliary values use the machine-id
-application key (K_app). Do not decode adopted UUIDs as constructed payloads.
+is opaque and need not be UUIDv8. Canonical derived CUIDs depend on the node
+key; auxiliary values use the machine-id application key (K_app) and do not
+change on node re-key. Do not decode adopted UUIDs as constructed payloads or
+expect every derived value to move after provisioning.
 
 ## Builds
 
@@ -86,18 +92,26 @@ export AMDCUID_VECTORS_PATH="$PWD/shared/cuid/tests/vectors/cuid_vectors.txt"
 ctest --test-dir "$W/build-cuid" --output-on-failure -V
 "$W/build-amdsmi/tests/amd_smi_test/amdsmitst" \
   --gtest_filter='*Cuid*:*CUID*:*cuid*'
-python3 -m pytest projects/amdsmi/tests/python/unit/gpu/test_cli_cuid_*.py -q
+python3 -m pytest projects/amdsmi/tests/python/unit/gpu/test_cli_cuid_seed.py -q
 ```
+
+**Setting the key writes firmware.** A `cuid_seed` write makes amdgpu rewrite
+the `AmdCuidKey` UEFI variable, and without amdgpu `amdcuid_set_hash_key()` writes it directly.
+On the host, only `cuidtstPrivileged.HMAC` sets a key, and only with
+`AMDCUID_TEST_ALLOW_SET_KEY=1`; run it only on a host whose key may change.
+`cuid_gpu_paths` also sets keys (the rotate probe and the efivarfs fallback),
+but only into its fixture `/sys` inside a private mount namespace.
 
 `AMDCUID_BUILD_LIFECYCLE_TESTS=ON` adds `cuid_gpu_paths`, which runs GPU
 discovery against a synthetic `/sys` in a private mount namespace as root. Its
 build directory must be outside `/tmp`, which the namespace replaces. Run it
 with `sudo ctest --test-dir <build> -R cuid_gpu_paths --output-on-failure`.
-Besides GPU path resolution it covers partitions that get no handle, a
-non-AMD display device, and a whole GPU that stays temporary before and after
-the driver publishes `cuid_primary` and `cuid_unit_id`. A fixture that opts in
-also discovers a CPU (from the host's `/proc/cpuinfo`), a NIC and the Platform
-against synthetic SMBIOS and PCI data, all temporary.
+Besides GPU path resolution it covers node-key loading (`cuid_seed` over
+`AmdCuidKey`, a malformed variable, the provisioned flag), the
+`amdcuid_set_hash_key()` efivarfs fallback, a non-AMD display device, and a
+whole GPU before and after the driver publishes `cuid_derived`. A fixture that
+opts in also discovers a CPU (from the host's `/proc/cpuinfo`), a NIC and the
+Platform against synthetic SMBIOS and PCI data.
 
 For tier 2 use a host without CUID support, or a separately authorized
 maintenance run with `amdgpu.cuid=0` set at module load. Verify attributes are
@@ -118,16 +132,20 @@ change without a hardware-specific plan.
   `(xcc_count << 6) | first_xcc`, published by the driver; an SR-IOV VF's is
   its one-based index. Values above `0x1fff` are refused, not masked. The suite checks unchanged output on refusal
   and propagation through GPU reconstruction.
-* A partition in DPX and above must report no value, never its parent's; in
-  SPX amd-smi reports the whole GPU's for its one partition. Hardware
-  qualification remains outstanding.
+* Compare every driver-published GPU derived CUID against both libamdcuid and
+  amd-smi. A partition must report its own driver value or no value, never its
+  parent's, except that amd-smi reports the whole GPU's for the one partition
+  of a GPU in SPX that has none. Hardware qualification remains outstanding.
 * Handle tests require success for discovered devices and reject absent ones.
   `ColdLookupEnvironment` starts before the test fixtures enumerate, but later
   calls in that environment share the manager warmed by the first lookup; it
   does not independently cold-start each API.
-* CLI checks: derived/primary/type/auxiliary/source fields per GPU; primary
-  only when explicitly requested and permitted; consistent JSON/CSV field
-  names.
+* CLI checks: seed metadata once per invocation; derived/primary/type/auxiliary/
+  source fields per GPU; primary only when explicitly requested and permitted;
+  consistent JSON/CSV field names. Python seed tests simulate provisioning and
+  do not establish real driver behavior.
+* `AmdCuidKey` is read end to end only from a fixture file in
+  `cuid_gpu_paths`; no harness reads one a real driver created in efivarfs.
 * GPU discovery lists AMD GPUs (Vendor ID `0x1002`) only. `cuid_gpu_paths`
   checks this with a synthetic `0x1a03` display device; on a host with a BMC
   display device, `amdcuid_get_all_handles()` must not return it either.
@@ -141,7 +159,8 @@ symbol alone does not establish compiled-in support.
 * Confirm configure selected in-tree CUID or the intended installed package.
 * Load the artifact's library, not a system copy, and check CUID entry points.
 * For the in-tree build, confirm CUID objects are absorbed without installing a
-  separate amdcuid header, archive or CMake package.
+  separate amdcuid header, archive or CMake package, and that
+  `/usr/lib/tmpfiles.d/amdcuid.conf` is installed.
 * Link a consumer of `amd_smi_static` through `find_package(amd_smi CONFIG)`.
   An installed-CUID build must resolve its exported amdcuid/Threads dependencies;
   an in-tree build must not require an external amdcuid package.

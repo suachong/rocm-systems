@@ -105,6 +105,18 @@ if(BUILD_TESTS)
     add_subdirectory(tests)
 endif()
 
+# Unless efivarfs creates it 0600, efivarfs shows AmdCuidKey world-readable and
+# immutable. systemd-tmpfiles only reads fixed directories, never ones under an
+# install prefix.
+if(AMDCUID_INSTALL AND UNIX AND NOT APPLE)
+    set(AMDCUID_TMPFILES_DIR "/usr/lib/tmpfiles.d" CACHE PATH "Directory systemd-tmpfiles reads amdcuid.conf from")
+    install(
+        FILES ${CMAKE_CURRENT_SOURCE_DIR}/scripts/tmpfiles.d/amdcuid.conf
+        DESTINATION ${AMDCUID_TMPFILES_DIR}
+        COMPONENT ${LIB_COMPONENT}
+    )
+endif()
+
 # Uninstall target
 if(NOT TARGET uninstall)
     configure_file(
