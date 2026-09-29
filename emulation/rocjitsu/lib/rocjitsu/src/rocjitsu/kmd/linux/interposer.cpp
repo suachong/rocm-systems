@@ -3580,6 +3580,7 @@ extern "C" {
 static std::string redirect_sysfs_path(const char *path);
 static std::string redirect_sys_dev_char(const char *path);
 static std::optional<Sysfs::GpuInfo> interposer_gpu_info(uint32_t render_minor);
+static std::optional<dev_t> synthetic_alias_for_host_drm(dev_t device);
 static std::optional<Sysfs::GpuInfo>
 interposer_gpu_info_for(const InterposerContext::DrmFileToken &file);
 
@@ -4752,6 +4753,17 @@ RJ_INTERPOSER_EXPORT int rj_ioctl(int fd, unsigned long request, ...) {
     }
   }
 
+  // A display server can lend us a real render fd through SCM_RIGHTS. Its
+  // discovery identity is aliased below, but it must never submit to hardware.
+  if (_IOC_TYPE(request) == kDrmIoctlType) {
+    struct stat info {};
+    if (InterposerContext::real().fstat_fn(fd, &info) == 0 && S_ISCHR(info.st_mode) &&
+        synthetic_alias_for_host_drm(info.st_rdev)) {
+      errno = ENODEV;
+      return -1;
+    }
+  }
+
   // Every tracked KFD primary/dup is routed above by its recorded backend
   // (remote_lookup / kfd_backend_of). Deliberately NO local-driver fallback for
   // tracked dups here: a Remote-tagged dup observed during a remote teardown
@@ -5677,7 +5689,58 @@ RJ_INTERPOSER_EXPORT DIR *opendir(const char *name) {
   return InterposerContext::real().opendir(name);
 }
 
-// -- fstat interposition (DRM memfd → synthetic st_rdev) --
+// -- fstat interposition (DRM descriptors → synthetic device identity) --
+
+// Keep borrowed display render descriptors in the same device namespace as
+// /dev/dri and sysfs. libdrm matches fstat(fd).st_rdev against enumerated nodes;
+// the host display GPU's minor need not exist in the simulated topology.
+// Primary nodes retain their real identity for host display control, as do
+// hardware-backed guests, which have no synthetic DRM enumeration tree.
+static std::optional<dev_t> synthetic_alias_for_host_drm(dev_t device) {
+  if (major(device) != 226 || minor(device) < 128 || InterposerContext::in_construction)
+    return std::nullopt;
+  if (!InterposerContext::ctx.initialized())
+    InterposerContext::ctx.get_or_create();
+  std::string drm_base;
+  if (auto driver = InterposerContext::ctx.driver())
+    drm_base = driver->drm_path();
+  else
+    drm_base = InterposerContext::ctx.remote_drm_path();
+  if (drm_base.empty())
+    return std::nullopt;
+  // Use the render node published for card0, independently of host numbering
+  // and of which simulated GPU the caller will eventually use for rendering.
+  DIR *nodes = InterposerContext::real().opendir((drm_base + "/card0/device/drm").c_str());
+  if (!nodes)
+    return std::nullopt;
+  std::optional<uint32_t> render_minor;
+  while (const dirent *entry = InterposerContext::real().readdir(nodes)) {
+    const std::string_view name(entry->d_name);
+    uint32_t parsed = 0;
+    if (name.starts_with("renderD") &&
+        parse_render_minor_suffix(name.data() + 7, name.data() + name.size(), &parsed)) {
+      render_minor = parsed;
+      break;
+    }
+  }
+  InterposerContext::real().closedir(nodes);
+  if (!render_minor)
+    return std::nullopt;
+  const std::string node = drm_base + "/dev_dri/renderD" + std::to_string(*render_minor);
+  if (InterposerContext::real().access(node.c_str(), F_OK) != 0)
+    return std::nullopt;
+  return makedev(226, *render_minor);
+}
+
+static void finish_drm_fd_stat(int fd, mode_t *mode, dev_t *device) {
+  if (InterposerContext::ctx.is_drm(fd)) {
+    *device = makedev(226, InterposerContext::ctx.drm_render_minor(fd));
+    *mode = (*mode & ~S_IFMT) | S_IFCHR;
+  } else if (S_ISCHR(*mode)) {
+    if (auto alias = synthetic_alias_for_host_drm(*device))
+      *device = *alias;
+  }
+}
 
 RJ_INTERPOSER_EXPORT int fstat(int fd, struct stat *buf) {
   if (!InterposerContext::real().ready()) {
@@ -5687,11 +5750,8 @@ RJ_INTERPOSER_EXPORT int fstat(int fd, struct stat *buf) {
   if (!rj_owns_interposer_state())
     return InterposerContext::real().fstat_fn(fd, buf);
   int rc = InterposerContext::real().fstat_fn(fd, buf);
-  if (rc == 0 && InterposerContext::ctx.is_drm(fd)) {
-    uint32_t render_minor = InterposerContext::ctx.drm_render_minor(fd);
-    buf->st_rdev = makedev(226, render_minor);
-    buf->st_mode = (buf->st_mode & ~S_IFMT) | S_IFCHR;
-  }
+  if (rc == 0)
+    finish_drm_fd_stat(fd, &buf->st_mode, &buf->st_rdev);
   return rc;
 }
 
@@ -5704,16 +5764,12 @@ RJ_INTERPOSER_EXPORT int fstat64(int fd, struct stat64 *buf) {
     errno = ENOSYS;
     return -1;
   }
-  int rc = real.fstat64_fn(fd, reinterpret_cast<void *>(buf));
+  int rc = real.fstat64_fn(fd, buf);
   // Gate BEFORE is_drm(), which takes fd_mutex_. No lazy static above this point:
   // its initialization guard could be inherited mid-init by a forked child.
   if (rc != 0 || !real.ready() || !rj_owns_interposer_state())
     return rc;
-  if (InterposerContext::ctx.is_drm(fd)) {
-    uint32_t render_minor = InterposerContext::ctx.drm_render_minor(fd);
-    buf->st_rdev = makedev(226, render_minor);
-    buf->st_mode = (buf->st_mode & ~S_IFMT) | S_IFCHR;
-  }
+  finish_drm_fd_stat(fd, &buf->st_mode, &buf->st_rdev);
   return rc;
 }
 
@@ -5731,11 +5787,7 @@ RJ_INTERPOSER_EXPORT int __fxstat(int ver, int fd, struct stat *buf) {
   // its initialization guard could be inherited mid-init by a forked child.
   if (rc != 0 || !real.ready() || !rj_owns_interposer_state())
     return rc;
-  if (InterposerContext::ctx.is_drm(fd)) {
-    uint32_t render_minor = InterposerContext::ctx.drm_render_minor(fd);
-    buf->st_rdev = makedev(226, render_minor);
-    buf->st_mode = (buf->st_mode & ~S_IFMT) | S_IFCHR;
-  }
+  finish_drm_fd_stat(fd, &buf->st_mode, &buf->st_rdev);
   return rc;
 }
 
@@ -5748,16 +5800,12 @@ RJ_INTERPOSER_EXPORT int __fxstat64(int ver, int fd, struct stat64 *buf) {
     errno = ENOSYS;
     return -1;
   }
-  int rc = real.fxstat64_fn(ver, fd, reinterpret_cast<void *>(buf));
+  int rc = real.fxstat64_fn(ver, fd, buf);
   // Gate BEFORE is_drm(), which takes fd_mutex_. No lazy static above this point:
   // its initialization guard could be inherited mid-init by a forked child.
   if (rc != 0 || !real.ready() || !rj_owns_interposer_state())
     return rc;
-  if (InterposerContext::ctx.is_drm(fd)) {
-    uint32_t render_minor = InterposerContext::ctx.drm_render_minor(fd);
-    buf->st_rdev = makedev(226, render_minor);
-    buf->st_mode = (buf->st_mode & ~S_IFMT) | S_IFCHR;
-  }
+  finish_drm_fd_stat(fd, &buf->st_mode, &buf->st_rdev);
   return rc;
 }
 
@@ -5832,14 +5880,14 @@ RJ_INTERPOSER_EXPORT int stat64(const char *path, struct stat64 *buf) {
   // Gate BEFORE redirect_sysfs_path(), which reaches published driver and fd state.
   // No lazy static above this point (see LibcPassthrough for why).
   if (!real.ready() || !rj_owns_interposer_state())
-    return real.stat64_fn(path, reinterpret_cast<void *>(buf));
+    return real.stat64_fn(path, buf);
   auto redirected = redirect_sysfs_path(path);
   if (redirected.empty())
     redirected = redirect_sys_dev_char(path);
   if (redirected.empty())
     redirected = redirect_dev_dri(path);
   const char *actual = redirected.empty() ? path : redirected.c_str();
-  int result = real.stat64_fn(actual, reinterpret_cast<void *>(buf));
+  int result = real.stat64_fn(actual, buf);
   return result == 0 ? finish_drm_node_stat(actual, result, &buf->st_mode, &buf->st_rdev) : result;
 }
 
@@ -5855,14 +5903,14 @@ RJ_INTERPOSER_EXPORT int lstat64(const char *path, struct stat64 *buf) {
   // Gate BEFORE redirect_sysfs_path(), which reaches published driver and fd state.
   // No lazy static above this point (see LibcPassthrough for why).
   if (!real.ready() || !rj_owns_interposer_state())
-    return real.lstat64_fn(path, reinterpret_cast<void *>(buf));
+    return real.lstat64_fn(path, buf);
   auto redirected = redirect_sysfs_path(path);
   if (redirected.empty())
     redirected = redirect_sys_dev_char(path);
   if (redirected.empty())
     redirected = redirect_dev_dri(path);
   const char *actual = redirected.empty() ? path : redirected.c_str();
-  int result = real.lstat64_fn(actual, reinterpret_cast<void *>(buf));
+  int result = real.lstat64_fn(actual, buf);
   return result == 0 ? finish_drm_node_stat(actual, result, &buf->st_mode, &buf->st_rdev) : result;
 }
 
@@ -5901,14 +5949,14 @@ RJ_INTERPOSER_EXPORT int __xstat64(int ver, const char *path, struct stat64 *buf
   // Gate BEFORE redirect_sysfs_path(), which reaches published driver and fd state.
   // No lazy static above this point (see LibcPassthrough for why).
   if (!real.ready() || !rj_owns_interposer_state())
-    return real.xstat64_fn(ver, path, reinterpret_cast<void *>(buf));
+    return real.xstat64_fn(ver, path, buf);
   auto redirected = redirect_sysfs_path(path);
   if (redirected.empty())
     redirected = redirect_sys_dev_char(path);
   if (redirected.empty())
     redirected = redirect_dev_dri(path);
   const char *actual = redirected.empty() ? path : redirected.c_str();
-  int result = real.xstat64_fn(ver, actual, reinterpret_cast<void *>(buf));
+  int result = real.xstat64_fn(ver, actual, buf);
   return result == 0 ? finish_drm_node_stat(actual, result, &buf->st_mode, &buf->st_rdev) : result;
 }
 
@@ -5947,14 +5995,14 @@ RJ_INTERPOSER_EXPORT int __lxstat64(int ver, const char *path, struct stat64 *bu
   // Gate BEFORE redirect_sysfs_path(), which reaches published driver and fd state.
   // No lazy static above this point (see LibcPassthrough for why).
   if (!real.ready() || !rj_owns_interposer_state())
-    return real.lxstat64_fn(ver, path, reinterpret_cast<void *>(buf));
+    return real.lxstat64_fn(ver, path, buf);
   auto redirected = redirect_sysfs_path(path);
   if (redirected.empty())
     redirected = redirect_sys_dev_char(path);
   if (redirected.empty())
     redirected = redirect_dev_dri(path);
   const char *actual = redirected.empty() ? path : redirected.c_str();
-  int result = real.lxstat64_fn(ver, actual, reinterpret_cast<void *>(buf));
+  int result = real.lxstat64_fn(ver, actual, buf);
   return result == 0 ? finish_drm_node_stat(actual, result, &buf->st_mode, &buf->st_rdev) : result;
 }
 

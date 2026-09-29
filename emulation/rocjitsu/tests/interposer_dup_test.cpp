@@ -39,6 +39,7 @@ RJ_DIAGNOSTIC_POP
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <dirent.h>
 #include <dlfcn.h>
 #include <fcntl.h>
 #include <fstream>
@@ -2622,6 +2623,76 @@ TEST(InterposerDrmTest, RenderNodePathMetadataMatchesDescriptor) {
   }
   EXPECT_EQ(close(drm), 0);
   EXPECT_EQ(close(kfd), 0);
+}
+
+TEST(InterposerDrmTest, BorrowedDisplayDescriptorUsesSimulatedIdentity) {
+  auto report_host =
+      reinterpret_cast<void (*)(int, dev_t)>(dlsym(RTLD_DEFAULT, "rj_test_host_drm"));
+  ASSERT_NE(report_host, nullptr) << "host DRM identity preload is required";
+  int imported = make_sized_memfd(4096);
+  ASSERT_GE(imported, 0);
+  // Discover through the borrowed descriptor before any GPU open or enumeration.
+  // This descriptor bypasses open() just like one received from X11. Neither
+  // host minor is required to exist in the configured simulated topology.
+  dev_t presentation_device = 0;
+  for (dev_t host : {makedev(226, 128), makedev(226, 197)}) {
+    SCOPED_TRACE(minor(host));
+    report_host(imported, host);
+    struct stat info {};
+    ASSERT_EQ(fstat(imported, &info), 0);
+    ASSERT_TRUE(S_ISCHR(info.st_mode));
+    if (presentation_device == 0)
+      presentation_device = info.st_rdev;
+    EXPECT_EQ(info.st_rdev, presentation_device);
+    const std::string sys = "/sys/dev/char/226:" + std::to_string(minor(info.st_rdev));
+    struct stat node {};
+    EXPECT_EQ(stat((sys + "/device/drm").c_str(), &node), 0);
+    DIR *dir = opendir("/dev/dri");
+    ASSERT_NE(dir, nullptr);
+    bool matched = false;
+    while (const dirent *entry = readdir(dir)) {
+      const std::string path = std::string("/dev/dri/") + entry->d_name;
+      if (stat(path.c_str(), &node) == 0 && S_ISCHR(node.st_mode) && node.st_rdev == info.st_rdev)
+        matched = true;
+    }
+    EXPECT_EQ(closedir(dir), 0);
+    EXPECT_TRUE(matched) << "libdrm must find the fd in the enumerated DRM nodes";
+
+    struct stat64 large {};
+    ASSERT_EQ(fstat64(imported, &large), 0);
+    EXPECT_EQ(large.st_rdev, info.st_rdev);
+    auto fxstat =
+        reinterpret_cast<int (*)(int, int, struct stat *)>(dlsym(RTLD_DEFAULT, "__fxstat"));
+    auto fxstat64 =
+        reinterpret_cast<int (*)(int, int, struct stat64 *)>(dlsym(RTLD_DEFAULT, "__fxstat64"));
+    ASSERT_NE(fxstat, nullptr);
+    ASSERT_NE(fxstat64, nullptr);
+    ASSERT_EQ(fxstat(1, imported, &node), 0);
+    EXPECT_EQ(node.st_rdev, info.st_rdev);
+    ASSERT_EQ(fxstat64(1, imported, &large), 0);
+    EXPECT_EQ(large.st_rdev, info.st_rdev);
+
+    // An aliased display descriptor is metadata-only, not a physical execution
+    // endpoint. Passing this ioctl through would produce ENOTTY on our memfd.
+    drm_version version{};
+    EXPECT_EQ(ioctl(imported, DRM_IOCTL_VERSION, &version), -1);
+    EXPECT_EQ(errno, ENODEV);
+  }
+  // Primary DRM nodes and unrelated character devices keep their host identity.
+  for (dev_t host : {makedev(226, 0), makedev(1, 3)}) {
+    report_host(imported, host);
+    struct stat info {};
+    ASSERT_EQ(fstat(imported, &info), 0);
+    EXPECT_EQ(info.st_rdev, host);
+    drm_version version{};
+    EXPECT_EQ(ioctl(imported, DRM_IOCTL_VERSION, &version), -1);
+    EXPECT_EQ(errno, ENOTTY);
+  }
+  report_host(-1, 0);
+  struct stat info {};
+  ASSERT_EQ(fstat(imported, &info), 0);
+  EXPECT_TRUE(S_ISREG(info.st_mode));
+  EXPECT_EQ(close(imported), 0);
 }
 
 TEST(InterposerSyncobjTest, VmTimelineWaitObservesSynchronousMapAndUnmap) {
