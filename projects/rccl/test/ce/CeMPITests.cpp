@@ -812,6 +812,109 @@ TEST_F(CeMPI_AllReduce, PipelinedMultiChunk)
 }
 
 // ===========================================================================
+// CeMPI_ReduceScatter – forced CE correctness, including rank-varying in-place
+// output alignment.
+// ===========================================================================
+
+class CeMPI_ReduceScatter : public CeMPITest
+{
+protected:
+    std::unique_ptr<MPIHelpers::MpiEnvGuard> ceReduceScatterGuard_;
+    std::unique_ptr<MPIHelpers::MpiEnvGuard> forceCeReduceScatterGuard_;
+
+    void SetUp() override
+    {
+        CeMPITest::SetUp();
+        ceReduceScatterGuard_ =
+            std::make_unique<MPIHelpers::MpiEnvGuard>("RCCL_CE_REDUCESCATTER", "1");
+        forceCeReduceScatterGuard_ =
+            std::make_unique<MPIHelpers::MpiEnvGuard>("RCCL_FORCE_CE_REDUCESCATTER", "1");
+    }
+
+    void TearDown() override
+    {
+        forceCeReduceScatterGuard_.reset();
+        ceReduceScatterGuard_.reset();
+        CeMPITest::TearDown();
+    }
+
+    bool isCeReduceScatterExpected() const
+    {
+        return isCeReduceScatterDispatchConfigured() && !isMultiNodeTest();
+    }
+
+    void assertCEPathTaken(const char* context)
+    {
+        const std::string log = readAllLogs();
+        if(isCeReduceScatterExpected())
+        {
+            EXPECT_TRUE(ceLogShowsReduceScatterPath(log))
+                << context << ": CE ReduceScatter log marker absent";
+        }
+        else
+        {
+            EXPECT_FALSE(ceLogShowsReduceScatterPath(log))
+                << context << ": CE ReduceScatter ran without its prerequisites";
+        }
+    }
+
+    void runReduceScatter(size_t recvcount, bool inPlace, const char* testId)
+    {
+        if(!validateTestPrerequisites(kMinRanks2))
+            GTEST_SKIP() << "Need >= " << kMinRanks2 << " MPI ranks";
+
+        ASSERT_EQ(ncclSuccess, createTestCommunicator());
+
+        int rank{}, nRanks{};
+        ncclCommUserRank(getActiveCommunicator(), &rank);
+        ncclCommCount(getActiveCommunicator(), &nRanks);
+
+        const size_t totalElem = recvcount * static_cast<size_t>(nRanks);
+        void* sendBuf = nullptr;
+        ASSERT_EQ(hipSuccess, hipMalloc(&sendBuf, totalElem * sizeof(float)));
+        DeviceBufferAutoGuard sendGuard(sendBuf);
+        fillRankScalar(sendBuf, totalElem, rank);
+
+        void* recvAllocation = nullptr;
+        float* recvBuf = nullptr;
+        if(inPlace)
+        {
+            recvBuf = static_cast<float*>(sendBuf) + static_cast<size_t>(rank) * recvcount;
+        }
+        else
+        {
+            ASSERT_EQ(hipSuccess, hipMalloc(&recvAllocation, recvcount * sizeof(float)));
+            recvBuf = static_cast<float*>(recvAllocation);
+        }
+        DeviceBufferAutoGuard recvGuard(recvAllocation);
+
+        ASSERT_EQ(ncclSuccess,
+                  ncclReduceScatter(sendBuf, recvBuf, recvcount, ncclFloat32, ncclSum,
+                                    getActiveCommunicator(), getActiveStream()));
+        ASSERT_EQ(hipSuccess, hipStreamSynchronize(getActiveStream()));
+
+        const float expectedSum = static_cast<float>(nRanks * (nRanks + 1) / 2);
+        ASSERT_TRUE(verifyBufferData<float>(recvBuf, recvcount,
+                                            [expectedSum](size_t) { return expectedSum; }))
+            << "Rank " << rank << ": CE ReduceScatter Sum verification failed";
+        assertCEPathTaken(testId);
+    }
+};
+
+TEST_F(CeMPI_ReduceScatter, OutOfPlace)
+{
+    runReduceScatter(kSmallCount, false, "CeMPI_ReduceScatter/OutOfPlace");
+}
+
+// recvcount=4097 floats makes recvbuff = sendbuff + rank*recvcount have a
+// different 16-byte alignment on adjacent ranks. All ranks must still select
+// CE, and the kernel must use scalar stores for the unaligned shards.
+TEST_F(CeMPI_ReduceScatter, InPlaceRankVaryingAlignment)
+{
+    runReduceScatter(4097, true, "CeMPI_ReduceScatter/InPlaceRankVaryingAlignment");
+}
+
+// ===========================================================================
 // CeMPI_Fallback – CE not taken for AllReduce when RCCL_CE_ALLREDUCE is off
 // ===========================================================================
 

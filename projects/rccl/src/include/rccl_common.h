@@ -236,10 +236,7 @@ bool rcclUseAlltoAllGda(struct ncclComm* comm);
 bool rcclUseCeAr2Shot(struct ncclComm* comm, size_t count, ncclDataType_t datatype, ncclRedOp_t op, const void* acc);
 // Opt-in CE ReduceScatter 2-shot gate (RCCL_CE_REDUCESCATTER=1). Size cap is the
 // same 2-shot window as CE AllReduce (rcclCeAr2ShotMax).
-// recvbuff may be nullptr when the caller has no buffer yet. A non-null buffer
-// must be 16-byte aligned: the reduce kernel stores through a 16-byte vector.
-bool rcclUseCeReduceScatter(struct ncclComm* comm, size_t recvcount, ncclDataType_t datatype, ncclRedOp_t op,
-                            const void* recvbuff);
+bool rcclUseCeReduceScatter(struct ncclComm* comm, size_t recvcount, ncclDataType_t datatype, ncclRedOp_t op);
 // Updates the CE AllReduce graph latch from this call's capture state.
 // Invoke once per collective (any type) at each CE AR decision point.
 void rcclCeAllReduceGraphLatchTick(struct ncclComm* comm, bool ceCapturing);

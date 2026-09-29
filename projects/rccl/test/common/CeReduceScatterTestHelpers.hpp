@@ -13,19 +13,10 @@
 #include "comm.h"
 #include "ce_coll.h"
 #include "nccl.h"
+#include "CeRuntimeTestHelpers.hpp"
 
 namespace RcclUnitTesting
 {
-
-// Runtime driver-version gate mirroring ncclCeImplemented().
-inline bool isCeRuntimeDriverSupported()
-{
-    int driverVer = 0;
-    if(hipDriverGetVersion(&driverVer) != hipSuccess)
-        return false;
-    return (driverVer >= 71200000) ||
-           (driverVer >= 70051831 && driverVer < 70060000);
-}
 
 // The chunk-size helpers live in ce_coll.h (ncclCeAllReduceMaxChunkBytes,
 // ncclCeAllReduceSlotChunkBytes, ncclCeAllReduceChooseChunkBytes). CE ReduceScatter
@@ -51,6 +42,10 @@ struct CeReduceScatterMockComm
         comm.rank             = 0;
         comm.symmetricSupport = true;
         comm.config.CTAPolicy = NCCL_CTA_POLICY_ZERO;
+        // Exercise the initialized-LSA branch used by a real communicator.
+        comm.devrState.bigSize = 1;
+        comm.devrState.lsaSize = comm.nRanks;
+        comm.devrState.lsaSelf = comm.rank;
     }
 
     ncclComm* get() { return &comm; }

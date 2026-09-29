@@ -12,23 +12,12 @@
 #include <hip/hip_runtime.h>
 
 #include "alltoallv_meta.h"
+#include "CeRuntimeTestHelpers.hpp"
 #include "comm.h"
 #include "nccl.h"
 
 namespace RcclUnitTesting
 {
-
-// Runtime driver-version gate mirroring ncclCeImplemented().
-inline bool isCeRuntimeDriverSupported()
-{
-    int driverVer = 0;
-    if (hipDriverGetVersion(&driverVer) != hipSuccess)
-    {
-        return false;
-    }
-    return (driverVer >= 71200000) ||
-           (driverVer >= 70051831 && driverVer < 70060000);
-}
 
 // Minimal ncclComm stand-in for CE AlltoAllv eligibility unit tests.
 struct CeAlltoAllvMockComm

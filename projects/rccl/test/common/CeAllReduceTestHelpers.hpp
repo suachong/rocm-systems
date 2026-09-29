@@ -14,19 +14,10 @@
 #include "comm.h"
 #include "ce_coll.h"
 #include "nccl.h"
+#include "CeRuntimeTestHelpers.hpp"
 
 namespace RcclUnitTesting
 {
-
-// Runtime driver-version gate mirroring ncclCeImplemented().
-inline bool isCeRuntimeDriverSupported()
-{
-    int driverVer = 0;
-    if(hipDriverGetVersion(&driverVer) != hipSuccess)
-        return false;
-    return (driverVer >= 71200000) ||
-           (driverVer >= 70051831 && driverVer < 70060000);
-}
 
 // Default ceARTmpBuf capacity. Matches NCCL_CE_AR_TMPBUF_DEFAULT_BYTES.
 // Per-rank chunk capacity is that size / nRanks, same as ncclCeInit.
@@ -73,4 +64,3 @@ struct CeAllReduceMockComm
 };
 
 } // namespace RcclUnitTesting
-

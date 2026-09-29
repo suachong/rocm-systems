@@ -1206,8 +1206,7 @@ bool rcclUseCeAr2Shot(struct ncclComm* comm, size_t count, ncclDataType_t dataty
   return true;
 }
 
-bool rcclUseCeReduceScatter(struct ncclComm* comm, size_t recvcount, ncclDataType_t datatype, ncclRedOp_t op,
-                            const void* recvbuff) {
+bool rcclUseCeReduceScatter(struct ncclComm* comm, size_t recvcount, ncclDataType_t datatype, ncclRedOp_t op) {
   // Re-read every call. A function-local static latches the first value and
   // ignores the host-test param seam.
   const int enabled = rcclParamCeReduceScatter();
@@ -1258,13 +1257,6 @@ bool rcclUseCeReduceScatter(struct ncclComm* comm, size_t recvcount, ncclDataTyp
   }
   if (datatype == ncclFloat8e4m3 || datatype == ncclFloat8e5m2) {
     WARN("Skipping CE ReduceScatter: unsupported datatype: Float8");
-    return false;
-  }
-  // In-place ReduceScatter is recvbuff == sendbuff + rank * recvcount, which is
-  // not 16-byte aligned for every legal count. The reduce kernel stores a
-  // 16-byte vector, so reject here and let the caller fall back.
-  if (recvbuff != nullptr && ((uintptr_t)recvbuff & 15) != 0) {
-    WARN("Skipping CE ReduceScatter: recvbuff %p is not 16-byte aligned", recvbuff);
     return false;
   }
   return true;
@@ -1846,7 +1838,7 @@ ncclResult_t rcclSelectReduceScatter(struct ncclComm* comm, const void* sendbuff
     const bool symReg =
       ncclCeAvailable(comm, ncclFuncReduceScatter, (int)op, datatype, rsWinRegType, rsSendWin, rsRecvWin);
     const bool ceReduceScatterAllowed = ncclGroupDepth == 0 && ceArGraphAllowed &&
-                                        rcclUseCeReduceScatter(comm, recvcount, datatype, op, recvbuff) && (force || symReg);
+                                        rcclUseCeReduceScatter(comm, recvcount, datatype, op) && (force || symReg);
     if (!symEligible && ceReduceScatterAllowed && comm->ceColl.ceARTmpBuf != NULL) {
       decision->algo = RCCL_CE_2SHOT;
       decision->nMaxChannels = ncclCeLocalReduceBlocks(datatype, recvcount);
@@ -1862,11 +1854,12 @@ ncclResult_t rcclSelectReduceScatter(struct ncclComm* comm, const void* sendbuff
       return ncclSuccess;
     }
 
-    // (2) DDA fast paths. Symmetric wins when buffers are registered (-R 2); DDA
-    // enters only when symk is unavailable. Non-gfx1250 yields when CE will run.
+    // (2) DDA fast paths. Symmetric wins when buffers are registered (-R 2).
+    // The two CE returns above cover both staging states, so reaching this point
+    // with !symEligible means CE did not claim the call.
     const bool ddaFabricArch = IsArchMatch(comm->archName, "gfx1250");
     const size_t rsDdaVmmMax   = rcclDdaVmmThresholdCtxTab(archTable, ncclFuncReduceScatter, rsWinRegType, /*graphMode=*/false);
-    if (!symEligible && (ddaFabricArch || !ceReduceScatterAllowed) &&
+    if (!symEligible &&
         rcclDdaEnabled(comm, totalBytes, rcclDdaEntryThresholdTab(archTable, ncclFuncReduceScatter), query, "RS")) {
       if (ddaFabricArch) {
         const size_t rsDdaLLMax    = rcclDdaLLThresholdTab(archTable, ncclFuncReduceScatter);
@@ -1927,8 +1920,11 @@ ncclResult_t rcclSelectReduceScatter(struct ncclComm* comm, const void* sendbuff
     bool ceAvailable = ceArGraphAllowed && !hasSysmemSegment && symReg;
     const bool ceReduceScatterOpSupported =
       (op == ncclSum || op == ncclProd || op == ncclMin || op == ncclMax);
-    if (!ceReduceScatterOpSupported || !rcclParamCeReduceScatter()) ceAvailable = false;
-    if (ceAvailable && ((comm->config.CTAPolicy & NCCL_CTA_POLICY_ZERO) || force)) {
+    const bool ceReduceScatterTypeSupported =
+      datatype != ncclFloat8e4m3 && datatype != ncclFloat8e5m2;
+    if (!ceReduceScatterOpSupported || !ceReduceScatterTypeSupported || !rcclParamCeReduceScatter())
+      ceAvailable = false;
+    if (!symEligible && ceAvailable && ((comm->config.CTAPolicy & NCCL_CTA_POLICY_ZERO) || force)) {
       decision->algo = RCCL_CE_REGISTERED;
       decision->nMaxChannels = ncclCeLocalReduceBlocks(datatype, recvcount);
       return ncclSuccess;

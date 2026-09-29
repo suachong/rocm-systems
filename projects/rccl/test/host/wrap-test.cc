@@ -5234,6 +5234,92 @@ TEST(WrapMicrotestIsolated, SelectReduceScatter_CeOptInSelectsRegisteredThenTwoS
       });
 }
 
+// CE must not preempt a symmetric-kernel decision. This arms the registered CE
+// branch as well as symk so the priority ordering itself is covered.
+TEST(WrapMicrotestIsolated, SelectReduceScatter_SymmetricPreemptsCeRegistered) {
+  RUN_ISOLATED_TEST(
+      "Wrap_SelectReduceScatter_SymmetricPreemptsCeRegistered",
+      []() {
+        g_loadParam = [](const char* env, int64_t defaultValue) {
+          if (std::strcmp(env, "RCCL_CE_REDUCESCATTER") == 0) return (int64_t)1;
+          if (std::strcmp(env, "RCCL_FORCE_CE_REDUCESCATTER") == 0) return (int64_t)1;
+          if (std::strcmp(env, "RCCL_CE_AR_MAX_MSG_BYTES") == 0) return (int64_t)268435456;
+          return defaultValue;
+        };
+        ScopedHook symRequested(g_isSymmetricKernelRequested, [](struct ncclComm*, ncclFunc_t, int, ncclDataType_t,
+                                                                  size_t, const void*, void*, bool) { return true; });
+        ScopedHook ceAvailable(
+            g_ceAvailable,
+            [](struct ncclComm*, ncclFunc_t, int, ncclDataType_t, ncclSymRegType_t,
+               struct ncclDevrWindow*, struct ncclDevrWindow*) { return true; });
+        ncclComm* comm = MakeCommWithArch("gfx942");
+        comm->nRanks = 1;
+        comm->nNodes = 1;
+        comm->symmetricSupport = true;
+        comm->config.CTAPolicy = NCCL_CTA_POLICY_ZERO;
+        rcclCollDecision decision{};
+        EXPECT_EQ(ncclSuccess, rcclSelectReduceScatter(comm, nullptr, nullptr, /*recvcount=*/8, ncclFloat32,
+                                                        ncclSum, /*query=*/false, &decision));
+        EXPECT_EQ((int)rcclAddonAlgos_t::RCCL_SYMMETRIC, decision.algo);
+        DeleteCommWithArch(comm);
+      });
+}
+
+// ncclCeAvailable does not filter datatypes, so the registered-window branch
+// must reject Float8 itself instead of dispatching to an unsupported CE kernel.
+TEST(WrapMicrotestIsolated, SelectReduceScatter_Float8FallsBackWhenCeRegistered) {
+  RUN_ISOLATED_TEST(
+      "Wrap_SelectReduceScatter_Float8FallsBackWhenCeRegistered",
+      []() {
+        g_loadParam = ForceParam("RCCL_CE_REDUCESCATTER", int64_t(1));
+        ScopedHook ceAvailable(
+            g_ceAvailable,
+            [](struct ncclComm*, ncclFunc_t, int, ncclDataType_t, ncclSymRegType_t,
+               struct ncclDevrWindow*, struct ncclDevrWindow*) { return true; });
+        ncclComm* comm = MakeSelectComm();
+        comm->nRanks = 1;
+        comm->nNodes = 1;
+        comm->symmetricSupport = true;
+        comm->config.CTAPolicy = NCCL_CTA_POLICY_ZERO;
+        rcclCollDecision decision{};
+        EXPECT_EQ(ncclSuccess, rcclSelectReduceScatter(comm, nullptr, nullptr, /*recvcount=*/8, ncclFloat8e4m3,
+                                                        ncclSum, /*query=*/false, &decision));
+        EXPECT_NE((int)rcclAddonAlgos_t::RCCL_CE_REGISTERED, decision.algo);
+        EXPECT_NE((int)rcclAddonAlgos_t::RCCL_CE_2SHOT, decision.algo);
+        DeleteCommWithArch(comm);
+      });
+}
+
+TEST(WrapMicrotestIsolated, SelectReduceScatter_QueryCaptureHintBlocksCe) {
+  RUN_ISOLATED_TEST(
+      "Wrap_SelectReduceScatter_QueryCaptureHintBlocksCe",
+      []() {
+        g_loadParam = [](const char* env, int64_t defaultValue) {
+          if (std::strcmp(env, "RCCL_CE_REDUCESCATTER") == 0) return (int64_t)1;
+          if (std::strcmp(env, "RCCL_FORCE_CE_REDUCESCATTER") == 0) return (int64_t)1;
+          if (std::strcmp(env, "RCCL_CE_AR_MAX_MSG_BYTES") == 0) return (int64_t)268435456;
+          return defaultValue;
+        };
+        ScopedHook ceAvailable(
+            g_ceAvailable,
+            [](struct ncclComm*, ncclFunc_t, int, ncclDataType_t, ncclSymRegType_t,
+               struct ncclDevrWindow*, struct ncclDevrWindow*) { return true; });
+        ncclComm* comm = MakeSelectComm();
+        comm->nRanks = 1;
+        comm->nNodes = 1;
+        comm->symmetricSupport = true;
+        comm->config.CTAPolicy = NCCL_CTA_POLICY_ZERO;
+        rcclCollDecision decision{};
+        EXPECT_EQ(ncclSuccess,
+                  rcclSelectReduceScatter(comm, nullptr, nullptr, /*recvcount=*/8, ncclFloat32, ncclSum,
+                                          /*query=*/true, &decision, /*graphCapturingHint=*/true));
+        EXPECT_FALSE(decision.ceArGraphAllowed);
+        EXPECT_NE((int)rcclAddonAlgos_t::RCCL_CE_REGISTERED, decision.algo);
+        EXPECT_NE((int)rcclAddonAlgos_t::RCCL_CE_2SHOT, decision.algo);
+        DeleteCommWithArch(comm);
+      });
+}
+
 // symEligible's own query-mode reporting block (`if (query) { ... }` inside
 // `if (symEligible)`) had never been entered for ReduceScatter -- only
 // AllReduce/AllGather had a symmetric-reported query test. rcclSymkQuery
