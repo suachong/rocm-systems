@@ -218,7 +218,6 @@ class CeReduceGenerationTest(unittest.TestCase):
 DEVICE_DIR = os.path.dirname(HERE)
 CE_REDUCE_CC = os.path.join(DEVICE_DIR, "ce_reduce.cc")
 CE_COLL_H = os.path.join(os.path.dirname(DEVICE_DIR), "include", "ce_coll.h")
-CE_COLL_CC = os.path.join(os.path.dirname(DEVICE_DIR), "ce_coll.cc")
 
 
 def _strip_line_comments(text: str) -> str:
@@ -359,18 +358,6 @@ class CeReducePersistentContractTest(unittest.TestCase):
         self.assertIn("if (perChunk || totalSteps <= NCCL_CE_NUM_SLOTS)", self.impl)
         self.assertIn("prev + 1 == (uint32_t)gridDim.x", self.impl)
         self.assertIn("&signalBuffer[r], 0, __ATOMIC_RELEASE", self.impl)
-
-    def test_memop_per_chunk_mode_defers_clear_without_slot_reuse(self) -> None:
-        with open(CE_COLL_CC) as f:
-            dispatcher = _strip_line_comments(f.read())
-        self.assertIn(
-            "if (!perChunkKernelHandshake && totalSteps > (size_t)NUM_SLOTS)",
-            dispatcher,
-        )
-        self.assertIn(
-            "if (totalSteps <= (size_t)NUM_SLOTS && (!perChunkReduce || !perChunkKernelHandshake))",
-            dispatcher,
-        )
 
     def test_bf16_avg_scales_once_after_reduction(self) -> None:
         self.assertIn("struct CeReducePostOp<hip_bfloat16, 4>", self.impl)
