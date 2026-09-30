@@ -2474,6 +2474,8 @@ ncclResult_t ncclCeReduceScatter(struct ncclComm* comm, const void* sendbuff, vo
        comm->rank, totalBytes, chunkBytes, baseChunkElems, tailChunkElems, chunksPerShard);
   std::vector<hipStreamBatchMemOpParams> waits(comm->nRanks);
   std::vector<hipStreamBatchMemOpParams> writes(comm->nRanks);
+  std::vector<hipStreamBatchMemOpParams> readyWaits(comm->nRanks);
+  std::vector<hipStreamBatchMemOpParams> clears(comm->nRanks);
   for (int r = 0; r < comm->nRanks; r++) {
     waits[r] = {};
     waits[r].operation = CU_STREAM_MEM_OP_WAIT_VALUE_32;
@@ -2484,6 +2486,16 @@ ncclResult_t ncclCeReduceScatter(struct ncclComm* comm, const void* sendbuff, vo
     writes[r].operation = CU_STREAM_MEM_OP_WRITE_VALUE_32;
     writes[r].writeValue.value = 1;
     writes[r].writeValue.flags = CU_STREAM_WRITE_VALUE_DEFAULT;
+
+    readyWaits[r] = {};
+    readyWaits[r].operation = CU_STREAM_MEM_OP_WAIT_VALUE_32;
+    readyWaits[r].waitValue.value = 1;
+    readyWaits[r].waitValue.flags = CU_STREAM_WAIT_VALUE_EQ;
+
+    clears[r] = {};
+    clears[r].operation = CU_STREAM_MEM_OP_WRITE_VALUE_32;
+    clears[r].writeValue.value = 0;
+    clears[r].writeValue.flags = CU_STREAM_WRITE_VALUE_DEFAULT;
   }
 
   struct ncclCeColl* ceColl = &comm->ceColl;
@@ -2515,11 +2527,15 @@ ncclResult_t ncclCeReduceScatter(struct ncclComm* comm, const void* sendbuff, vo
     ceStream = stream;
   }
   const bool useNormalPriorityReduceStream = totalSteps > 1 && rcclParamCeReduceNormalPriority();
-  const bool perChunkReduce = totalSteps > 1 && rcclParamCeReducePerChunk();
+  const int64_t perChunkMode = rcclParamCeReducePerChunk();
+  const bool perChunkReduce = totalSteps > 1 && perChunkMode > 0;
+  const bool perChunkKernelHandshake = perChunkReduce && perChunkMode > 1;
   cudaStream_t reduceStream = useNormalPriorityReduceStream ? ceColl->reduceStream : stream;
 
   INFO(NCCL_COLL, "CE ReduceScatter: rank %d reducer=%s priority=%s", comm->rank,
-       perChunkReduce ? "per-chunk" : "persistent", useNormalPriorityReduceStream ? "normal" : "caller");
+       perChunkKernelHandshake ? "per-chunk-kernel-handshake"
+                               : (perChunkReduce ? "per-chunk-memop-handshake" : "persistent"),
+       useNormalPriorityReduceStream ? "normal" : "caller");
 
   NCCLCHECKGOTO(ncclCeInitBatchOpsParams(&batchOpsParams, comm->nRanks), ret, fail);
 
@@ -2601,18 +2617,30 @@ ncclResult_t ncclCeReduceScatter(struct ncclComm* comm, const void* sendbuff, vo
       CUCHECKGOTO(hipStreamBatchMemOp(ceStream, comm->nRanks, writes.data(), 0), ret, fail);
     }
     if (perChunkReduce) {
-      // Launch one finite reducer per chunk. It polls the local readiness
-      // doorbells, reduces this slot, and releases the slot before retiring.
-      // Keeping the handshake in the finite kernel avoids two extra runtime
-      // batch-memory-op kernels per chunk while still returning all reducer CUs
-      // between chunks.
+      // Mode 1 gates the finite reducer with stream memory operations. Mode 2
+      // moves the handshake into the reducer for comparison. The mode-1 gate
+      // has the smallest observed compute interference because reducer blocks
+      // are not resident while SDMA is still staging the chunk.
+      if (!perChunkKernelHandshake) {
+        for (int r = 0; r < comm->nRanks; r++) {
+          uint32_t* localSignal = &signalBuffer[slot * comm->nRanks + r];
+          readyWaits[r].waitValue.address = localSignal;
+          clears[r].writeValue.address = localSignal;
+        }
+        CUCHECKGOTO(hipStreamBatchMemOp(reduceStream, comm->nRanks, readyWaits.data(), 0), ret, fail);
+      }
+
       const size_t currentChunkElems = currentChunkBytes / eltSize;
       const void* chunkIn = tmpBuf + (size_t)slot * slotStrideBytes;
       void* chunkOut = outShard + srcChunkOffsetBytes;
       NCCLCHECKGOTO(ncclCeLaunchPersistentReduce(chunkIn, chunkOut, comm->nRanks, currentChunkElems, 0, 1,
                                                  slotChunkElems, signalBuffer + slot * comm->nRanks, 1,
-                                                 ceColl->d_barrierSync, datatype, op, reduceStream, 0, 1),
+                                                 ceColl->d_barrierSync, datatype, op, reduceStream, 0,
+                                                 perChunkKernelHandshake ? 1 : 0),
                     ret, fail);
+      if (!perChunkKernelHandshake) {
+        CUCHECKGOTO(hipStreamBatchMemOp(reduceStream, comm->nRanks, clears.data(), 0), ret, fail);
+      }
     }
     if (totalSteps == 1) {
       NCCLCHECKGOTO(ncclMemOpSync(comm, ceStream, &collArgs), ret, fail);
