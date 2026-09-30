@@ -291,7 +291,7 @@ __global__ __launch_bounds__(256) void ncclCeLocalReduceKernelVec(
   const T* __restrict__ in,
   T* __restrict__ out, // recvbuff + rank*shardBytes (final AllReduce shard region)
   int nRanks, size_t baseChunkElems, size_t tailChunkElems, size_t chunksPerShard, size_t slotChunkElems,
-  volatile uint32_t* signalBuffer, size_t totalSteps, uint32_t* d_barrierSync, bool coopLaunch) {
+  volatile uint32_t* signalBuffer, size_t totalSteps, uint32_t* d_barrierSync, bool coopLaunch, bool perChunk) {
   if (blockIdx.x >= NCCL_CE_REDUCE_MAX_BLOCKS) { 
     return;
   }
@@ -321,12 +321,12 @@ __global__ __launch_bounds__(256) void ncclCeLocalReduceKernelVec(
     const bool isTailChunk = (chunkInShard == chunksPerShard - 1) && (tailChunkElems > 0);
     const size_t currentChunkElems = isTailChunk ? tailChunkElems : baseChunkElems;
     const size_t nVec = currentChunkElems / W;
-    if (totalSteps > 1) {
+    if (totalSteps > 1 || perChunk) {
       // With one slot per step, blocks are independent: each block can wait
       // for this slot locally and advance without a grid-wide rendezvous.
       // The grid barrier remains necessary when slots are reused, because the
       // producer must not overwrite a slot until every block has consumed it.
-      if ((totalSteps <= NCCL_CE_NUM_SLOTS && threadIdx.x == 0) ||
+      if (((perChunk || totalSteps <= NCCL_CE_NUM_SLOTS) && threadIdx.x == 0) ||
           (totalSteps > NCCL_CE_NUM_SLOTS && blockIdx.x == 0 && threadIdx.x == 0)) {
         while (true) {
           int ready = 0;
@@ -343,7 +343,7 @@ __global__ __launch_bounds__(256) void ncclCeLocalReduceKernelVec(
           __builtin_amdgcn_s_sleep(1);
         }
       }
-      if (totalSteps <= NCCL_CE_NUM_SLOTS) {
+      if (perChunk || totalSteps <= NCCL_CE_NUM_SLOTS) {
         __syncthreads();
       } else if (!coopLaunch) {
         ncclCeBlockBarrier(blockIdx.x, &s_gen, d_barrierSync);
@@ -440,7 +440,23 @@ __global__ __launch_bounds__(256) void ncclCeLocalReduceKernelVec(
         chunkOut[globalIdx] = CeReducePostOp<T, RedOp>::apply(a, nRanks);
       }
     }
-    if (totalSteps > NCCL_CE_NUM_SLOTS) {
+    if (perChunk) {
+      // Every block has finished reading this slot before its thread 0 joins
+      // the arrival counter. The last block releases the slot for all
+      // producers. No block needs to wait here: stream ordering prevents the
+      // next finite reducer from launching until this kernel has retired.
+      __syncthreads();
+      if (threadIdx.x == 0) {
+        uint32_t* arrival = d_barrierSync;
+        uint32_t prev = __scoped_atomic_fetch_add(arrival, 1, __ATOMIC_ACQ_REL, __MEMORY_SCOPE_DEVICE);
+        if (prev + 1 == (uint32_t)gridDim.x) {
+          __scoped_atomic_store_n(arrival, 0, __ATOMIC_RELAXED, __MEMORY_SCOPE_DEVICE);
+          for (int r = 0; r < nRanks; r++) {
+            __scoped_atomic_store_n((uint32_t*)&signalBuffer[r], 0, __ATOMIC_RELEASE, __MEMORY_SCOPE_SYSTEM);
+          }
+        }
+      }
+    } else if (totalSteps > NCCL_CE_NUM_SLOTS) {
       if (!coopLaunch) {
         ncclCeBlockBarrier(blockIdx.x, &s_gen, d_barrierSync);
       } else {

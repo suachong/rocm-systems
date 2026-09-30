@@ -353,6 +353,12 @@ class CeReducePersistentContractTest(unittest.TestCase):
         self.assertIn("int ncclCeLocalReduceMaxBlocks()", dispatcher)
         self.assertIn("(size_t)ncclCeLocalReduceMaxBlocks()", self.impl)
 
+    def test_per_chunk_mode_waits_and_releases_in_the_reduce_kernel(self) -> None:
+        self.assertIn("if (totalSteps > 1 || perChunk)", self.impl)
+        self.assertIn("if (perChunk || totalSteps <= NCCL_CE_NUM_SLOTS)", self.impl)
+        self.assertIn("prev + 1 == (uint32_t)gridDim.x", self.impl)
+        self.assertIn("&signalBuffer[r], 0, __ATOMIC_RELEASE", self.impl)
+
     def test_bf16_avg_scales_once_after_reduction(self) -> None:
         self.assertIn("struct CeReducePostOp<hip_bfloat16, 4>", self.impl)
         self.assertNotIn("CeReducePreOp", self.impl)

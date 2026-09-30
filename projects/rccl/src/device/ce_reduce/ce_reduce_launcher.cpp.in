@@ -18,7 +18,8 @@ ${vec_define}#include "ce_reduce_impl.h"
 ncclResult_t ncclCeLocalReduceLaunch_${tag}_${redname}(const void* in, void* out, int nRanks, size_t baseChunkElems,
                                                      size_t tailChunkElems, size_t chunksPerShard,
                                                      size_t slotChunkElems, uint32_t* signalBuffer, size_t totalSteps,
-                                                     uint32_t* d_barrierSync, hipStream_t stream, int coopLaunch) {
+                                                     uint32_t* d_barrierSync, hipStream_t stream, int coopLaunch,
+                                                     int perChunk) {
   using T = $ctype;
   constexpr int UnrollFactor = VecTrait<T>::GpuUnroll;
   const int threads = 256;
@@ -31,20 +32,21 @@ ncclResult_t ncclCeLocalReduceLaunch_${tag}_${redname}(const void* in, void* out
   const T* inT = static_cast<const T*>(in);
   T* outT = static_cast<T*>(out);
   bool useCoopLaunch = (coopLaunch != 0);
+  bool usePerChunk = (perChunk != 0);
 
   (void)hipGetLastError();
   hipError_t e;
   if (useCoopLaunch) {
     void* kernelArgs[] = {
       &inT,          &outT,       &nRanks,        &baseChunkElems, &tailChunkElems, &chunksPerShard, &slotChunkElems,
-      &signalBuffer, &totalSteps, &d_barrierSync, &useCoopLaunch,
+      &signalBuffer, &totalSteps, &d_barrierSync, &useCoopLaunch,  &usePerChunk,
     };
     e = hipLaunchCooperativeKernel(reinterpret_cast<const void*>(&ncclCeLocalReduceKernelVec<T, $redval, UnrollFactor>),
                                    dim3(blocks), dim3(threads), kernelArgs, 0, stream);
   } else {
     hipLaunchKernelGGL((ncclCeLocalReduceKernelVec<T, $redval, UnrollFactor>), dim3(blocks), dim3(threads), 0, stream,
                        inT, outT, nRanks, baseChunkElems, tailChunkElems, chunksPerShard, slotChunkElems, signalBuffer,
-                       totalSteps, d_barrierSync, useCoopLaunch);
+                       totalSteps, d_barrierSync, useCoopLaunch, usePerChunk);
     e = hipGetLastError();
   }
   if (e != hipSuccess) {
