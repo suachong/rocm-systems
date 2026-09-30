@@ -311,10 +311,19 @@ class CeReducePersistentContractTest(unittest.TestCase):
         assert m is not None
         return [a.strip().lstrip("&").strip() for a in m.group(1).split(",") if a.strip()]
 
+    def _extended_launch_arguments(self) -> list[str]:
+        m = re.search(r"hipLaunchKernelEx\(&config,.*?UnrollFactor>,\s*(.*?)\);", self.launcher, re.S)
+        self.assertIsNotNone(m, "hipLaunchKernelEx call not found in the generated launcher")
+        assert m is not None
+        return [a.strip() for a in m.group(1).split(",") if a.strip()]
+
     def test_cooperative_and_ggl_paths_pass_identical_arguments(self) -> None:
         # Nothing in the compiler makes these two agree: the GGL call is type
         # checked against the kernel, the cooperative array is not.
         self.assertEqual(self._cooperative_arguments(), self._ggl_arguments())
+
+    def test_priority_and_ggl_paths_pass_identical_arguments(self) -> None:
+        self.assertEqual(self._extended_launch_arguments(), self._ggl_arguments())
 
     def test_cooperative_argument_count_matches_kernel_parameters(self) -> None:
         self.assertEqual(len(self._cooperative_arguments()), len(self._kernel_parameters()))

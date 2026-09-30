@@ -110,11 +110,12 @@ struct ncclCeColl {
   // Global counter barrier for regular launch: [0]=arrival, [1]=completed generation.
   uint32_t* d_barrierSync;
   cudaStream_t scatterStream;
-  // Optional normal-priority stream for the ReduceScatter reduction kernel.
-  // Keeping this separate from the caller stream lets applications retain a
-  // high-priority ProcessGroupNCCL stream for latency-sensitive collectives
-  // while preventing the CE helper kernel from preempting model compute.
+  // Optional dedicated stream for the ReduceScatter reduction kernel. It is
+  // used either at normal priority or with a CU mask plus a per-launch high
+  // priority, leaving the caller's ProcessGroupNCCL stream unchanged.
   cudaStream_t reduceStream;
+  int reduceCuCount;         // >0 when reduceStream is restricted to a CU mask
+  int reduceLaunchPriority;  // INT_MAX means inherit the stream priority
   cudaEvent_t reduceDoneEvent;
   cudaEvent_t synceEvent;  // join scatterStream back onto the caller's stream
   // Latched while this comm has live graph-captured plans. CE 2-shot AllReduce
