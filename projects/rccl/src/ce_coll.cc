@@ -2552,7 +2552,9 @@ ncclResult_t ncclCeReduceScatter(struct ncclComm* comm, const void* sendbuff, vo
   NCCLCHECKGOTO(ncclMemOpSync(comm, ceStream, &collArgs), ret, fail);
 
   if (totalSteps > 1) {
-    CUDACHECKGOTO(cudaMemsetAsync(ceColl->d_barrierSync, 0, 2 * sizeof(uint32_t), reduceStream), ret, fail);
+    if (!perChunkReduce || perChunkKernelHandshake) {
+      CUDACHECKGOTO(cudaMemsetAsync(ceColl->d_barrierSync, 0, 2 * sizeof(uint32_t), reduceStream), ret, fail);
+    }
     if (!perChunkReduce) {
       NCCLCHECKGOTO(ncclCeLaunchPersistentReduce(tmpBuf, outShard, comm->nRanks, baseChunkElems, tailChunkElems,
                                                  chunksPerShard, slotChunkElems, signalBuffer, totalSteps,
@@ -2638,7 +2640,7 @@ ncclResult_t ncclCeReduceScatter(struct ncclComm* comm, const void* sendbuff, vo
                                                  ceColl->d_barrierSync, datatype, op, reduceStream, 0,
                                                  perChunkKernelHandshake ? 1 : 0),
                     ret, fail);
-      if (!perChunkKernelHandshake) {
+      if (!perChunkKernelHandshake && totalSteps > (size_t)NUM_SLOTS) {
         CUCHECKGOTO(hipStreamBatchMemOp(reduceStream, comm->nRanks, clears.data(), 0), ret, fail);
       }
     }
@@ -2684,11 +2686,10 @@ ncclResult_t ncclCeReduceScatter(struct ncclComm* comm, const void* sendbuff, vo
     }
     CUDACHECKGOTO(cudaEventRecord(ceColl->synceEvent, ceStream), ret, fail);
     CUDACHECKGOTO(cudaStreamWaitEvent(stream, ceColl->synceEvent, 0), ret, fail);
-    if (!perChunkReduce && totalSteps <= (size_t)NUM_SLOTS) {
-      // No-reuse kernels deliberately leave readiness at 1 so every block can
-      // advance independently. Reset only after both the reduction kernel and
-      // scatter stream have completed; the next collective is ordered behind
-      // this memset on the caller stream.
+    if (totalSteps <= (size_t)NUM_SLOTS && (!perChunkReduce || !perChunkKernelHandshake)) {
+      // No-reuse persistent kernels and mode-1 finite reducers deliberately
+      // leave readiness at 1. Reset all slots once after reduction and scatter
+      // complete instead of launching a clear memory operation per chunk.
       CUDACHECKGOTO(cudaMemsetAsync(signalBuffer, 0,
                                     NUM_SLOTS * (size_t)comm->nRanks * sizeof(uint32_t), stream),
                     ret, fail);
