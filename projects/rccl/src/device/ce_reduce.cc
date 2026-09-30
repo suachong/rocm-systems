@@ -50,11 +50,11 @@ int ncclCeLocalReduceMaxBlocks() {
 #define NCCL_CE_LAUNCH_PARAMS \
   const void *in, void *out, int nRanks, size_t baseChunkElems, size_t tailChunkElems, size_t chunksPerShard, \
     size_t slotChunkElems, uint32_t *signalBuffer, size_t totalSteps, uint32_t *d_barrierSync, hipStream_t stream, \
-    int coopLaunch, int launchPriority
+    int coopLaunch
 
 #define NCCL_CE_LAUNCH_ARGS \
   in, out, nRanks, baseChunkElems, tailChunkElems, chunksPerShard, slotChunkElems, signalBuffer, totalSteps, \
-    d_barrierSync, stream, coopLaunch, launchPriority
+    d_barrierSync, stream, coopLaunch
 
 #define NCCL_CE_DECLARE_TYPE(Type) \
   extern ncclResult_t ncclCeLocalReduceLaunch_##Type##_Sum(NCCL_CE_LAUNCH_PARAMS); \
@@ -85,8 +85,7 @@ extern ncclResult_t ncclCeLocalReduceLaunch_bf16_Avg(NCCL_CE_LAUNCH_PARAMS);
 ncclResult_t ncclCeLaunchPersistentReduce(const void* in, void* out, int nRanks, size_t baseChunkElems,
                                           size_t tailChunkElems, size_t chunksPerShard, size_t slotChunkElems,
                                           uint32_t* signalBuffer, size_t totalSteps, uint32_t* d_barrierSync,
-                                          ncclDataType_t datatype, ncclRedOp_t op, hipStream_t stream, int coopLaunch,
-                                          int launchPriority) {
+                                          ncclDataType_t datatype, ncclRedOp_t op, hipStream_t stream, int coopLaunch) {
 #define NCCL_CE_DISPATCH_REDOP(Type) \
   do { \
     switch (op) { \
