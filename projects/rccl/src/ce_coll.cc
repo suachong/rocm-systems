@@ -43,6 +43,7 @@ RCCL_PARAM(CeMultiStreams, "CE_MULTI_STREAMS", 0);
 RCCL_PARAM(CeBatchAsyncEnable, "CE_BATCH_ASYNC_ENABLE", -2);
 RCCL_PARAM(CeCoopLaunch, "CE_COOP_LAUNCH", 0);
 RCCL_PARAM(CeReduceNormalPriority, "CE_REDUCE_NORMAL_PRIORITY", 0);
+RCCL_PARAM(CeReducePerChunk, "CE_REDUCE_PER_CHUNK", 0);
 RCCL_PARAM_DECLARE(CeReduceScatter);
 
 #ifdef CE_BATCH_ASYNC_SUPPORTED
@@ -2472,6 +2473,8 @@ ncclResult_t ncclCeReduceScatter(struct ncclComm* comm, const void* sendbuff, vo
        comm->rank, totalBytes, chunkBytes, baseChunkElems, tailChunkElems, chunksPerShard);
   std::vector<hipStreamBatchMemOpParams> waits(comm->nRanks);
   std::vector<hipStreamBatchMemOpParams> writes(comm->nRanks);
+  std::vector<hipStreamBatchMemOpParams> readyWaits(comm->nRanks);
+  std::vector<hipStreamBatchMemOpParams> clears(comm->nRanks);
   for (int r = 0; r < comm->nRanks; r++) {
     waits[r] = {};
     waits[r].operation = CU_STREAM_MEM_OP_WAIT_VALUE_32;
@@ -2482,6 +2485,16 @@ ncclResult_t ncclCeReduceScatter(struct ncclComm* comm, const void* sendbuff, vo
     writes[r].operation = CU_STREAM_MEM_OP_WRITE_VALUE_32;
     writes[r].writeValue.value = 1;
     writes[r].writeValue.flags = CU_STREAM_WRITE_VALUE_DEFAULT;
+
+    readyWaits[r] = {};
+    readyWaits[r].operation = CU_STREAM_MEM_OP_WAIT_VALUE_32;
+    readyWaits[r].waitValue.value = 1;
+    readyWaits[r].waitValue.flags = CU_STREAM_WAIT_VALUE_EQ;
+
+    clears[r] = {};
+    clears[r].operation = CU_STREAM_MEM_OP_WRITE_VALUE_32;
+    clears[r].writeValue.value = 0;
+    clears[r].writeValue.flags = CU_STREAM_WRITE_VALUE_DEFAULT;
   }
 
   struct ncclCeColl* ceColl = &comm->ceColl;
@@ -2513,7 +2526,11 @@ ncclResult_t ncclCeReduceScatter(struct ncclComm* comm, const void* sendbuff, vo
     ceStream = stream;
   }
   const bool useNormalPriorityReduceStream = totalSteps > 1 && rcclParamCeReduceNormalPriority();
+  const bool perChunkReduce = totalSteps > 1 && rcclParamCeReducePerChunk();
   cudaStream_t reduceStream = useNormalPriorityReduceStream ? ceColl->reduceStream : stream;
+
+  INFO(NCCL_COLL, "CE ReduceScatter: rank %d reducer=%s priority=%s", comm->rank,
+       perChunkReduce ? "per-chunk" : "persistent", useNormalPriorityReduceStream ? "normal" : "caller");
 
   NCCLCHECKGOTO(ncclCeInitBatchOpsParams(&batchOpsParams, comm->nRanks), ret, fail);
 
@@ -2529,7 +2546,7 @@ ncclResult_t ncclCeReduceScatter(struct ncclComm* comm, const void* sendbuff, vo
   }
   NCCLCHECKGOTO(ncclMemOpSync(comm, ceStream, &collArgs), ret, fail);
 
-  if (totalSteps > 1) {
+  if (totalSteps > 1 && !perChunkReduce) {
     CUDACHECKGOTO(cudaMemsetAsync(ceColl->d_barrierSync, 0, 2 * sizeof(uint32_t), reduceStream), ret, fail);
     NCCLCHECKGOTO(ncclCeLaunchPersistentReduce(tmpBuf, outShard, comm->nRanks, baseChunkElems, tailChunkElems,
                                                chunksPerShard, slotChunkElems, signalBuffer, totalSteps,
@@ -2592,6 +2609,27 @@ ncclResult_t ncclCeReduceScatter(struct ncclComm* comm, const void* sendbuff, vo
       }
       CUCHECKGOTO(hipStreamBatchMemOp(ceStream, comm->nRanks, writes.data(), 0), ret, fail);
     }
+    if (perChunkReduce) {
+      // Wait packets consume no CUs. Once every rank has staged this chunk and
+      // rung its local doorbell, launch one finite reduction kernel and release
+      // the CUs immediately. Clearing the local doorbells after the kernel lets
+      // each producer safely reuse this slot on all target ranks.
+      for (int r = 0; r < comm->nRanks; r++) {
+        uint32_t* localSignal = &signalBuffer[slot * comm->nRanks + r];
+        readyWaits[r].waitValue.address = localSignal;
+        clears[r].writeValue.address = localSignal;
+      }
+      CUCHECKGOTO(hipStreamBatchMemOp(reduceStream, comm->nRanks, readyWaits.data(), 0), ret, fail);
+
+      const size_t currentChunkElems = currentChunkBytes / eltSize;
+      const void* chunkIn = tmpBuf + (size_t)slot * slotStrideBytes;
+      void* chunkOut = outShard + srcChunkOffsetBytes;
+      NCCLCHECKGOTO(ncclCeLaunchPersistentReduce(chunkIn, chunkOut, comm->nRanks, currentChunkElems, 0, 1,
+                                                 slotChunkElems, signalBuffer + slot * comm->nRanks, 1,
+                                                 ceColl->d_barrierSync, datatype, op, reduceStream, 0),
+                    ret, fail);
+      CUCHECKGOTO(hipStreamBatchMemOp(reduceStream, comm->nRanks, clears.data(), 0), ret, fail);
+    }
     if (totalSteps == 1) {
       NCCLCHECKGOTO(ncclMemOpSync(comm, ceStream, &collArgs), ret, fail);
       NCCLCHECKGOTO(ncclCeLaunchPersistentReduce(tmpBuf, outShard, comm->nRanks, baseChunkElems, tailChunkElems,
@@ -2618,6 +2656,9 @@ ncclResult_t ncclCeReduceScatter(struct ncclComm* comm, const void* sendbuff, vo
       CUCHECKGOTO(hipStreamBatchMemOp(ceStream, comm->nRanks, waits.data(), 0), ret, fail);
     }
   }
+  if (perChunkReduce && useNormalPriorityReduceStream) {
+    CUDACHECKGOTO(cudaEventRecord(ceColl->reduceDoneEvent, reduceStream), ret, fail);
+  }
   if (totalSteps > 1) {
     NCCLCHECKGOTO(ncclMemOpSync(comm, ceStream, &collArgs), ret, fail);
   }
@@ -2631,7 +2672,7 @@ ncclResult_t ncclCeReduceScatter(struct ncclComm* comm, const void* sendbuff, vo
     }
     CUDACHECKGOTO(cudaEventRecord(ceColl->synceEvent, ceStream), ret, fail);
     CUDACHECKGOTO(cudaStreamWaitEvent(stream, ceColl->synceEvent, 0), ret, fail);
-    if (totalSteps <= (size_t)NUM_SLOTS) {
+    if (!perChunkReduce && totalSteps <= (size_t)NUM_SLOTS) {
       // No-reuse kernels deliberately leave readiness at 1 so every block can
       // advance independently. Reset only after both the reduction kernel and
       // scatter stream have completed; the next collective is ordered behind
