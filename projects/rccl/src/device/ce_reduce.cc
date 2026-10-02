@@ -35,9 +35,39 @@ THE SOFTWARE.
 #include <stdint.h>
 #include <algorithm>
 
+// MUST come before nccl.h/ce_coll.h's transitive include of device.h. device.h
+// typedefs `hip_bfloat16` to `__hip_bfloat16` ONLY if neither
+// _HIP_INCLUDE_HIP_AMD_DETAIL_HIP_BFLOAT16_H_ nor _HIP_BFLOAT16_H_ is already
+// defined when it runs; otherwise it leaves `hip_bfloat16` as whatever
+// <hip/hip_bfloat16.h> (included below, and transitively by
+// ce_reduce_impl.h) already defined -- the real, non-typedef'd struct. Every
+// generated gensrc/ce_reduce/*.cpp launcher TU includes ce_reduce_impl.h (and
+// therefore <hip/hip_bfloat16.h>) BEFORE nccl.h, so `hip_bfloat16` resolves
+// to that real struct there. Getting the same resolution in THIS TU is not
+// cosmetic: the extern template declaration below has to name the exact
+// mangled symbol the device-linker emitted for that other TU, and the two
+// `hip_bfloat16` spellings mangle differently
+// (_Z...I12hip_bfloat16... vs _Z...I14__hip_bfloat16...). Confirmed by a
+// failed first attempt: candidate built and linked clean, then
+// reduce_scatter_perf failed at dynamic-symbol-resolution time with
+// "undefined symbol: ...I14__hip_bfloat16..." because this TU's include
+// order (nccl.h before any hip_bfloat16 header) had locked in the typedef
+// path instead.
+#include <hip/hip_bfloat16.h>
+
 #include "nccl.h"
 #include "param.h"
 #include "ce_coll.h"
+
+// Brings in VecTrait<T> (including the per-type ::Threads launch width) and
+// the ncclCeLocalReduceKernelVec<T, RedOp, U> template declaration/definition
+// itself. This is the SAME generated header every gensrc/ce_reduce/*.cpp
+// launcher TU includes (generate.py copies ce_reduce_impl.h.in verbatim into
+// it), reachable here because src/CMakeLists.txt already puts
+// ${HIPIFY_DIR}/gensrc on the rccl target's include path. Including it does
+// NOT, by itself, instantiate or compile any device code in this TU -- see
+// the "wide launch" block below for why that matters.
+#include "ce_reduce/ce_reduce_impl.h"
 
 RCCL_PARAM(CeReduceMaxBlocks, "CE_REDUCE_MAX_BLOCKS", NCCL_CE_REDUCE_DEFAULT_BLOCKS);
 
@@ -80,6 +110,85 @@ extern ncclResult_t ncclCeLocalReduceLaunch_bf16_Avg(NCCL_CE_LAUNCH_PARAMS);
 #undef NCCL_CE_DECLARE_TYPE
 
 // *********************************************************************************
+// Wide-launch path: same kernel, same device code, more threads per block.
+//
+// src/include/ce_coll.h carries a comment (left by an earlier round) that
+// ce_reduce_launcher.cpp.in's `const int threads = 256;` is a plain literal
+// with no indirection -- that file is outside this task's editable set, so
+// that literal genuinely cannot be repointed at VecTrait<T>::Threads. But
+// ncclCeLocalReduceKernelVec<T,RedOp,U> (ce_reduce_impl.h.in) reads
+// blockDim.x at runtime; it has no codegen dependency on how many threads a
+// given *caller* launches it with, beyond the __launch_bounds__ upper bound.
+// So a second host-side launcher, defined in this file (which IS editable),
+// can legally request more threads/block for the exact same, already
+// device-compiled kernel instantiation -- up to VecTrait<T>::Threads, which
+// is exactly the bound ce_reduce_impl.h.in's kernel template now declares.
+//
+// `extern template` (not a fresh instantiation) tells the compiler this
+// specific <T, RedOp, U> is defined elsewhere, so this --offload-host-only
+// TU (src/CMakeLists.txt's ENABLE_DEVICE_LINKER block: "ce_coll.cc, the main
+// target, has no __global__ call sites and stays --offload-host-only" --
+// ce_reduce.cc is compiled the same way) emits only a host-side reference,
+// never a second, deviceless copy of the kernel that could race the real one
+// for the weak symbol. The linker resolves it to the one real definition in
+// gensrc/ce_reduce/ce_reduce_bf16_Avg.cpp's fat object, which
+// cmake/DeviceLinker.cmake compiles with full HIP support specifically so
+// "each fat binary is self-contained."
+//
+// `blocks` deliberately still comes from ncclCeLocalReduceBlocksT<T>, whose
+// internal formula is pinned at 256 (see that function's comment) -- for
+// every production chunk size the pre-clamp value vastly exceeds
+// ncclCeLocalReduceMaxBlocks() at either 256 or 1024, so the clamped grid
+// size this path actually launches is identical to what the unmodified
+// generated launcher would have reported.
+//
+// Scope for now: bf16 Avg only, the one (type, redop) this campaign's ruler
+// exercises. NCCL_CE_WIDE_LAUNCH_IMPL is written so extending to the other
+// seven non-int8/uint8 types (already confirmed zero-spill at 1024 in the
+// per-instantiation resource sweep) is a mechanical, one-line-per-redop
+// addition once this is measured correct and fast.
+// *********************************************************************************
+extern template __global__ void ncclCeLocalReduceKernelVec<hip_bfloat16, 4, VecTrait<hip_bfloat16>::GpuUnroll>(
+    const hip_bfloat16* __restrict__ in, hip_bfloat16* __restrict__ out, int nRanks, size_t baseChunkElems,
+    size_t tailChunkElems, size_t chunksPerShard, size_t slotChunkElems, volatile uint32_t* signalBuffer,
+    size_t totalSteps, uint32_t* d_barrierSync, bool coopLaunch);
+
+#define NCCL_CE_WIDE_LAUNCH_IMPL(Tag, Type, RedName, RedVal) \
+  static ncclResult_t ncclCeLocalReduceLaunchWide_##Tag##_##RedName(NCCL_CE_LAUNCH_PARAMS) { \
+    using T = Type; \
+    constexpr int UnrollFactor = VecTrait<T>::GpuUnroll; \
+    constexpr int threads = VecTrait<T>::Threads; \
+    const int blocks = ncclCeLocalReduceBlocksT<T>(baseChunkElems); \
+    const T* inT = static_cast<const T*>(in); \
+    T* outT = static_cast<T*>(out); \
+    bool useCoopLaunch = (coopLaunch != 0); \
+    (void)hipGetLastError(); \
+    hipError_t e; \
+    if (useCoopLaunch) { \
+      void* kernelArgs[] = { \
+        &inT,          &outT,       &nRanks,        &baseChunkElems, &tailChunkElems, &chunksPerShard, &slotChunkElems, \
+        &signalBuffer, &totalSteps, &d_barrierSync, &useCoopLaunch, \
+      }; \
+      e = hipLaunchCooperativeKernel(reinterpret_cast<const void*>(&ncclCeLocalReduceKernelVec<T, RedVal, UnrollFactor>), \
+                                     dim3(blocks), dim3(threads), kernelArgs, 0, stream); \
+    } else { \
+      hipLaunchKernelGGL((ncclCeLocalReduceKernelVec<T, RedVal, UnrollFactor>), dim3(blocks), dim3(threads), 0, stream, \
+                         inT, outT, nRanks, baseChunkElems, tailChunkElems, chunksPerShard, slotChunkElems, signalBuffer, \
+                         totalSteps, d_barrierSync, useCoopLaunch); \
+      e = hipGetLastError(); \
+    } \
+    if (e != hipSuccess) { \
+      printf("[CE reduce] wide launch failed: %d (%s)\n", (int)e, hipGetErrorString(e)); \
+      return ncclUnhandledCudaError; \
+    } \
+    return ncclSuccess; \
+  }
+
+NCCL_CE_WIDE_LAUNCH_IMPL(bf16, hip_bfloat16, Avg, 4)
+
+#undef NCCL_CE_WIDE_LAUNCH_IMPL
+
+// *********************************************************************************
 // ncclCeLaunchPersistentReduce -- host launcher
 // *********************************************************************************
 ncclResult_t ncclCeLaunchPersistentReduce(const void* in, void* out, int nRanks, size_t baseChunkElems,
@@ -110,7 +219,7 @@ ncclResult_t ncclCeLaunchPersistentReduce(const void* in, void* out, int nRanks,
   case ncclFloat16:
     NCCL_CE_DISPATCH_REDOP(f16);
   case ncclBfloat16:
-    if (op == ncclAvg) return ncclCeLocalReduceLaunch_bf16_Avg(NCCL_CE_LAUNCH_ARGS);
+    if (op == ncclAvg) return ncclCeLocalReduceLaunchWide_bf16_Avg(NCCL_CE_LAUNCH_ARGS);
     NCCL_CE_DISPATCH_REDOP(bf16);
   case ncclInt32:
     NCCL_CE_DISPATCH_REDOP(i32);

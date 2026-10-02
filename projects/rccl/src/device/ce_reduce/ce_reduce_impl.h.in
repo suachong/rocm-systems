@@ -78,12 +78,24 @@ __device__ __forceinline__ void ncclCeBlockBarrier(int blockId, uint64_t* s_gen,
 //   LoadT     : 16-byte HIP vector used for a single memory transaction
 //   W         : number of T elements packed into one 16-byte load/store
 //   GpuUnroll : compile-time unroll factor (U) to balance ILP vs VGPRs
+//   Threads   : __launch_bounds__ / block width this type's kernel is built
+//               for. Measured (gfx950, cold, 64 blocks): going 256->1024
+//               is 1.94x on the reducer (5.92->3.07 us/MiB) at IDENTICAL
+//               VGPR/SGPR/occupancy/scratch for every type except
+//               int8_t/uint8_t, five of whose (type,redop) instantiations
+//               already spill registers at 256 and degrade further above
+//               it (see src/device/ce_reduce/generate.py's VECTORIZE_OK
+//               comment for the same int8/uint8 codegen pathology measured
+//               a different way). Keep those two at 256; every other type
+//               here is confirmed zero-spill at 1024 across all four
+//               redops (Sum/Prod/Min/Max) plus bf16's Avg.
 // *********************************************************************************
 template <typename T>
 struct VecTrait {
   using LoadT = uint4;
   static constexpr int W = (int)(16 / sizeof(T));
   static constexpr int GpuUnroll = 4;
+  static constexpr int Threads = 256;
 };
 
 template <>
@@ -91,18 +103,21 @@ struct VecTrait<float> {
   using LoadT = float4;
   static constexpr int W = 4;
   static constexpr int GpuUnroll = 4;
+  static constexpr int Threads = 1024;
 };
 template <>
 struct VecTrait<int32_t> {
   using LoadT = int4;
   static constexpr int W = 4;
   static constexpr int GpuUnroll = 4;
+  static constexpr int Threads = 1024;
 };
 template <>
 struct VecTrait<uint32_t> {
   using LoadT = uint4;
   static constexpr int W = 4;
   static constexpr int GpuUnroll = 4;
+  static constexpr int Threads = 1024;
 };
 
 template <>
@@ -110,18 +125,21 @@ struct VecTrait<double> {
   using LoadT = double2;
   static constexpr int W = 2;
   static constexpr int GpuUnroll = 2;
+  static constexpr int Threads = 1024;
 };
 template <>
 struct VecTrait<int64_t> {
   using LoadT = longlong2;
   static constexpr int W = 2;
   static constexpr int GpuUnroll = 2;
+  static constexpr int Threads = 1024;
 };
 template <>
 struct VecTrait<uint64_t> {
   using LoadT = ulonglong2;
   static constexpr int W = 2;
   static constexpr int GpuUnroll = 2;
+  static constexpr int Threads = 1024;
 };
 
 template <>
@@ -129,12 +147,14 @@ struct VecTrait<__half> {
   using LoadT = uint4;
   static constexpr int W = 8;
   static constexpr int GpuUnroll = 4;
+  static constexpr int Threads = 1024;
 };
 template <>
 struct VecTrait<hip_bfloat16> {
   using LoadT = uint4;
   static constexpr int W = 8;
   static constexpr int GpuUnroll = 4;
+  static constexpr int Threads = 1024;
 };
 
 template <>
@@ -142,12 +162,14 @@ struct VecTrait<int8_t> {
   using LoadT = uint4;
   static constexpr int W = 16;
   static constexpr int GpuUnroll = 4;
+  static constexpr int Threads = 256;
 };
 template <>
 struct VecTrait<uint8_t> {
   using LoadT = uint4;
   static constexpr int W = 16;
   static constexpr int GpuUnroll = 4;
+  static constexpr int Threads = 256;
 };
 
 // *********************************************************************************
@@ -157,7 +179,20 @@ struct VecTrait<uint8_t> {
 // (depends only on the per-type VecTrait W/GpuUnroll). Used by both the generated
 // launcher and the host-side reporting wrapper so live dispatch and reporting
 // never drift.
-// *********************************************************************************
+//
+// `threads` here is pinned at 256, independent of VecTrait<T>::Threads, on
+// purpose: this formula's job is to report/reproduce the block count the
+// generated launcher (src/device/ce_reduce/ce_reduce_launcher.cpp.in, which
+// is outside this task's editable file set and launches every type at a
+// fixed 256) actually uses. ce_reduce.cc's wide-launch path -- the one that
+// actually issues VecTrait<T>::Threads threads/block for the types where
+// that's >256 -- deliberately reuses this same 256-based block count rather
+// than a width-corrected one: for every production chunk size the raw
+// (pre-clamp) value is already far beyond ncclCeLocalReduceMaxBlocks() at
+// EITHER width, so the clamped output (and therefore reported nMaxChannels)
+// is identical either way, and leaving this formula untouched keeps every
+// non-wide-launch caller (int8_t/uint8_t, and rccl_wrap.cc's channel-count
+// reporting for every type) byte-for-byte unchanged.
 template <typename T>
 static inline int ncclCeLocalReduceBlocksT(size_t chunkElems) {
   constexpr int threads = 256;
@@ -291,7 +326,7 @@ struct CeReducePackPostOp<hip_bfloat16, 4> {
 // compile-time constant, and pragmas there regress runtime performance.
 // *********************************************************************************
 template <typename T, int RedOp, int U>
-__global__ __launch_bounds__(256) void ncclCeLocalReduceKernelVec(
+__global__ __launch_bounds__(VecTrait<T>::Threads) void ncclCeLocalReduceKernelVec(
   const T* __restrict__ in,
   T* __restrict__ out, // recvbuff + rank*shardBytes (final AllReduce shard region)
   int nRanks, size_t baseChunkElems, size_t tailChunkElems, size_t chunksPerShard, size_t slotChunkElems,
