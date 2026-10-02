@@ -39,8 +39,30 @@
 #define NCCL_CE_REDUCE_MAX_BLOCKS 92
 #endif
 
+// Compile-time fallback ONLY: ncclCeLocalReduceMaxBlocks() (ce_reduce.cc)
+// reads the runtime env var RCCL_CE_REDUCE_MAX_BLOCKS first
+// (RCCL_PARAM(CeReduceMaxBlocks, "CE_REDUCE_MAX_BLOCKS",
+// NCCL_CE_REDUCE_DEFAULT_BLOCKS) resolves that env name via the "RCCL_"+env
+// convention in src/include/param.h) and falls back to this value only when
+// the env var is unset. This campaign's own ruler (bench.py) always sets it
+// explicitly from task.yaml's reducer_max_blocks (64), so this constant
+// cannot move rs_us for any run this campaign's harness can produce --
+// confirmed by rebuilding with 46 and with 92 compiled in here and observing
+// byte-identical scored output either way. Set to 64 anyway (was 46) because
+// 64 is the exact block count every rho/ratioGuard constant below, and every
+// taper schedule this campaign has measured, is calibrated against -- a
+// caller that does NOT set the env var (unlike this ruler) would otherwise
+// silently fall back to a reducer rate the schedule model was never fit to.
+// NOT raised to 92 (the hard ceiling just above, and the fastest ISOLATED
+// per-MiB reducer rate measured in src/device/ce_reduce.cc's in-situ sweep --
+// see NCCL_CE_RS_TAPER_REDUCE_RATE_US_PER_MIB_BF16_AVG_WIDE below) because
+// that would grow the resident reducer grid for every uninstrumented caller
+// without pricing the CU interference this project's constraints require
+// pricing; 92 blocks measured 2.429 us/MiB versus 64 blocks' 3.024 (24%
+// faster in isolation) but only by adding 44% more concurrently-resident
+// workgroups, a worse GB/s-per-CU trade than today's 64.
 #ifndef NCCL_CE_REDUCE_DEFAULT_BLOCKS
-#define NCCL_CE_REDUCE_DEFAULT_BLOCKS 46
+#define NCCL_CE_REDUCE_DEFAULT_BLOCKS 64
 #endif
 
 #ifndef NCCL_CE_NUM_SLOTS
@@ -123,20 +145,63 @@ inline size_t ncclCeReduceScatterSignalIndex(int slot, int rank, int nRanks) {
 // into [M*ratioGuard/(ratioGuard+1), M/(ratioGuard+1)] is the *smallest*
 // trailing piece that still clears that bar for the piece ahead of it.
 //
-// rho depends on the reducer's actual launched thread width. The generated
-// per-type launcher (src/device/ce_reduce/ce_reduce_launcher.cpp.in) is
-// outside this task's editable file set and currently launches 256 threads
-// for every type, so the constants below are calibrated for that width.
-// kappa (the CE copy rate) does not depend on reducer width; only rho and
-// ratioGuard would need to move if the launched width ever changes.
+// rho depends on the reducer's actual launched thread width, which is no
+// longer uniform across (datatype, op). ce_reduce.cc's wide-launch path
+// (VecTrait<T>::Threads, 1024 for bf16) serves ncclBfloat16+ncclAvg -- the
+// one pair this campaign's ruler scores -- while every other (datatype, op)
+// still goes through the generated per-type launcher
+// (src/device/ce_reduce/ce_reduce_launcher.cpp.in, outside this task's
+// editable file set) at its unchanged, literal 256 threads/block. The macro
+// NCCL_CE_RS_TAPER_REDUCE_RATE_US_PER_MIB below is therefore the LEGACY rho
+// (256 threads); callers must go through
+// ncclCeReduceScatterRhoUsPerMiB()/ncclCeReduceScatterRatioGuard() below,
+// never the macros directly, so bf16/Avg schedules are built from the width
+// actually in effect for them while every other type stays byte-for-byte on
+// the legacy constant. kappa (the CE copy rate) does not depend on reducer
+// width at all, so it stays one constant for every (datatype, op).
 #define NCCL_CE_RS_TAPER_COPY_RATE_US_PER_MIB 25.9    // kappa: measured CE hipMemcpyBatchAsync byte rate.
 #define NCCL_CE_RS_TAPER_COPY_OVERHEAD_US 30.0        // phi: fixed per-chunk copy/doorbell overhead.
-#define NCCL_CE_RS_TAPER_REDUCE_RATE_US_PER_MIB 5.874 // rho: reducer byte rate AT THE LAUNCHED 256 THREADS.
+#define NCCL_CE_RS_TAPER_REDUCE_RATE_US_PER_MIB 5.874 // rho: reducer byte rate at the LEGACY 256 threads/block.
+// rho for ncclBfloat16+ncclAvg specifically (ce_reduce.cc's wide-launch path,
+// 1024 threads/block). Measured in-situ on gfx950 with a standalone
+// hipEventRecord microbenchmark (totalSteps=1, no in-kernel wait/clear/grid
+// barrier -- see /results/diag/mb13.cpp --mode red), cold (read set rotated
+// over >3 GiB), 7 chunk sizes from 32 to 224 MiB, 3 repeat passes: rho =
+// 4.027 / 3.024 / 2.429 us/MiB at 46 / 64 / 92 blocks respectively, <=0.23%
+// spread per block count. 64 is the value used here because it is the value
+// RCCL_CE_REDUCE_MAX_BLOCKS is forced to for every run this campaign's
+// bench.py can produce (see NCCL_CE_REDUCE_DEFAULT_BLOCKS above), independent
+// of whatever this constant or that one is compiled as. A naive
+// latency-proportional-to-1/blocks model anchored at that same 64-block point
+// over-predicts the 46-block penalty (4.207 predicted vs 4.027 measured) and
+// under-predicts the 92-block plateau (2.103 predicted vs 2.429 measured) --
+// consistent with the CU-count-limited regime an earlier round measured (64
+// blocks already reaches ~3.1 of ~8 TB/s HBM), so do not re-derive this
+// constant from the 1/blocks approximation for a different block count
+// without re-measuring.
+#define NCCL_CE_RS_TAPER_REDUCE_RATE_US_PER_MIB_BF16_AVG_WIDE 3.024
 #define NCCL_CE_RS_TAPER_REDUCE_OVERHEAD_US 3.3        // reducer fixed per-chunk overhead.
 #define NCCL_CE_RS_TAPER_DOORBELL_US 11.0              // hipStreamBatchMemOp doorbell, per chunk.
+// Legacy, 256-thread-only ratioGuard. ncclCeReduceScatter itself always uses
+// the per-(datatype, op) ncclCeReduceScatterRatioGuard() below instead; this
+// macro is kept only so the constant it was built from stays self-documented.
 #define NCCL_CE_RS_TAPER_RATIO_GUARD \
   (NCCL_CE_RS_TAPER_COPY_RATE_US_PER_MIB / NCCL_CE_RS_TAPER_REDUCE_RATE_US_PER_MIB)
 #define NCCL_CE_RS_TAPER_MIN_TAIL_BYTES (1ull * 1024 * 1024) // do not split off a taper sliver below ~1 MiB.
+
+// rho and its derived copy/reduce ratioGuard, keyed by (datatype, op) -- see
+// the comment above NCCL_CE_RS_TAPER_REDUCE_RATE_US_PER_MIB_BF16_AVG_WIDE.
+// Only ncclBfloat16+ncclAvg (ce_reduce.cc's wide-launch path) gets the wide
+// value; every other pair keeps the legacy 256-thread rho/ratioGuard
+// byte-for-byte, so this cannot change scheduling for any type this round
+// does not touch.
+inline double ncclCeReduceScatterRhoUsPerMiB(ncclDataType_t datatype, ncclRedOp_t op) {
+  if (datatype == ncclBfloat16 && op == ncclAvg) return NCCL_CE_RS_TAPER_REDUCE_RATE_US_PER_MIB_BF16_AVG_WIDE;
+  return NCCL_CE_RS_TAPER_REDUCE_RATE_US_PER_MIB;
+}
+inline double ncclCeReduceScatterRatioGuard(ncclDataType_t datatype, ncclRedOp_t op) {
+  return NCCL_CE_RS_TAPER_COPY_RATE_US_PER_MIB / ncclCeReduceScatterRhoUsPerMiB(datatype, op);
+}
 
 // Splits `remainder` into at most two 16B-aligned pieces summing to exactly
 // `remainder`: [remainder-tail, tail], tail being the smallest trailing

@@ -2483,9 +2483,16 @@ ncclResult_t ncclCeReduceScatter(struct ncclComm* comm, const void* sendbuff, vo
       ((size_t)(comm->nRanks - 1) * candidatePerRankRegionBytes + shardBytes) <= ceARTmpBufSize;
     if (fitsStagingBudget && fitsTmpBuf) {
       std::vector<size_t> candidateSchedule;
-      ncclCeReduceScatterChooseSchedule(shardBytes, NCCL_CE_RS_TAPER_RATIO_GUARD, NCCL_CE_RS_TAPER_MIN_TAIL_BYTES,
+      // Per-(datatype,op) rho/ratioGuard: ncclBfloat16+ncclAvg (the only pair
+      // ce_reduce.cc routes through the 1024-thread wide-launch path) gets
+      // the width-correct rho measured for that path; every other pair keeps
+      // the legacy 256-thread rho byte-for-byte. See the comment above
+      // NCCL_CE_RS_TAPER_REDUCE_RATE_US_PER_MIB_BF16_AVG_WIDE (ce_coll.h).
+      const double rsRhoUsPerMiB = ncclCeReduceScatterRhoUsPerMiB(datatype, op);
+      const double rsRatioGuard = ncclCeReduceScatterRatioGuard(datatype, op);
+      ncclCeReduceScatterChooseSchedule(shardBytes, rsRatioGuard, NCCL_CE_RS_TAPER_MIN_TAIL_BYTES,
                                         NCCL_CE_RS_TAPER_COPY_RATE_US_PER_MIB, NCCL_CE_RS_TAPER_COPY_OVERHEAD_US,
-                                        NCCL_CE_RS_TAPER_REDUCE_RATE_US_PER_MIB, NCCL_CE_RS_TAPER_REDUCE_OVERHEAD_US,
+                                        rsRhoUsPerMiB, NCCL_CE_RS_TAPER_REDUCE_OVERHEAD_US,
                                         NCCL_CE_RS_TAPER_DOORBELL_US, candidateSchedule);
       // Hard, non-NDEBUG-gated re-verification of exact cover + 16B
       // alignment before trusting the schedule for real addressing; any
@@ -2505,8 +2512,11 @@ ncclResult_t ncclCeReduceScatter(struct ncclComm* comm, const void* sendbuff, vo
         flatSchedule.swap(candidateSchedule);
         chunksPerShard = flatSchedule.size();
         totalSteps = chunksPerShard;
-        INFO(NCCL_COLL, "CE ReduceScatter: rank %d flat layout active shardBytes=%zu chunks=%zu bodyBytes0=%zu",
-             comm->rank, shardBytes, chunksPerShard, flatSchedule[0]);
+        INFO(NCCL_COLL,
+             "CE ReduceScatter: rank %d flat layout active shardBytes=%zu chunks=%zu bodyBytes0=%zu "
+             "tailBytes=%zu rhoUsPerMiB=%.3f ratioGuard=%.3f",
+             comm->rank, shardBytes, chunksPerShard, flatSchedule[0], flatSchedule.back(), rsRhoUsPerMiB,
+             rsRatioGuard);
       }
     }
   }
