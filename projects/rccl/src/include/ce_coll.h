@@ -12,6 +12,9 @@
 #include "nccl_common.h"
 #include "bitops.h"
 #include "sym_kernels.h"
+#include <algorithm>
+#include <cassert>
+#include <vector>
 
 // Memory operations per rank for different synchronization protocols
 #define NCCL_CE_SYNC_OPS_PER_RANK_MC 2
@@ -92,6 +95,153 @@ inline size_t ncclCeReduceScatterSrcOffsetBytes(int dstRank, size_t shardBytes, 
 // [slot][rank] doorbell index; must match between the local array-index view and the peer byte-offset view.
 inline size_t ncclCeReduceScatterSignalIndex(int slot, int rank, int nRanks) {
   return (size_t)slot * (size_t)nRanks + (size_t)rank;
+}
+
+// ---------------------------------------------------------------------------
+// Flat [sender][chunkOffset] ReduceScatter staging + ratio-guarded taper.
+//
+// The slotted layout above assumes every staged chunk is the same size
+// (stride == slotChunkBytes, wrapping every NUM_SLOTS chunks). When a
+// shard's full per-rank staging budget (numStagingSlots * ceArStagingBytes /
+// nRanks) covers the shard with room to spare, each sender can instead own
+// one contiguous per-rank region and address chunks by a running byte
+// offset -- chunk COUNT and chunk SIZE become free parameters, with no slot
+// reuse and no fixed stride (see ncclCeReduceScatter's three eligibility
+// checks for the exact budget guards that gate this).
+//
+// That freedom unlocks a tapered schedule: large "body" chunks (each one's
+// copy fully overlaps the *previous* chunk's reduce -- true for any
+// uniform body size here, since the measured CE-copy byte rate kappa is
+// several times the reducer's byte rate rho), then the shard's remainder
+// split so the second-to-last piece's copy still hides the *last* piece's
+// reduce. Only that final (small) reduce is ever exposed on the critical
+// path, instead of a full body-sized one.
+//
+// ratioGuard = kappa/rho is the break-even point: a chunk's reduce is
+// hidden behind the next chunk's copy iff the next chunk's bytes are at
+// least 1/ratioGuard of the current chunk's bytes. Splitting a remainder M
+// into [M*ratioGuard/(ratioGuard+1), M/(ratioGuard+1)] is the *smallest*
+// trailing piece that still clears that bar for the piece ahead of it.
+//
+// rho depends on the reducer's actual launched thread width. The generated
+// per-type launcher (src/device/ce_reduce/ce_reduce_launcher.cpp.in) is
+// outside this task's editable file set and currently launches 256 threads
+// for every type, so the constants below are calibrated for that width.
+// kappa (the CE copy rate) does not depend on reducer width; only rho and
+// ratioGuard would need to move if the launched width ever changes.
+#define NCCL_CE_RS_TAPER_COPY_RATE_US_PER_MIB 25.9    // kappa: measured CE hipMemcpyBatchAsync byte rate.
+#define NCCL_CE_RS_TAPER_COPY_OVERHEAD_US 30.0        // phi: fixed per-chunk copy/doorbell overhead.
+#define NCCL_CE_RS_TAPER_REDUCE_RATE_US_PER_MIB 5.874 // rho: reducer byte rate AT THE LAUNCHED 256 THREADS.
+#define NCCL_CE_RS_TAPER_REDUCE_OVERHEAD_US 3.3        // reducer fixed per-chunk overhead.
+#define NCCL_CE_RS_TAPER_DOORBELL_US 11.0              // hipStreamBatchMemOp doorbell, per chunk.
+#define NCCL_CE_RS_TAPER_RATIO_GUARD \
+  (NCCL_CE_RS_TAPER_COPY_RATE_US_PER_MIB / NCCL_CE_RS_TAPER_REDUCE_RATE_US_PER_MIB)
+#define NCCL_CE_RS_TAPER_MIN_TAIL_BYTES (1ull * 1024 * 1024) // do not split off a taper sliver below ~1 MiB.
+
+// Splits `remainder` into at most two 16B-aligned pieces summing to exactly
+// `remainder`: [remainder-tail, tail], tail being the smallest trailing
+// piece whose predecessor's reduce is still hidden behind tail's own copy
+// time (see ratioGuard above). Falls back to one piece when the computed
+// tail would be smaller than minTailBytes (not worth a second doorbell) or
+// when remainder itself is already that small. Pure/host-testable.
+inline void ncclCeReduceScatterTaperRemainder(size_t remainder, double ratioGuard, size_t minTailBytes,
+                                               std::vector<size_t>& outPieces) {
+  if (remainder == 0) return;
+  const size_t tail = alignDown((size_t)((double)remainder / (ratioGuard + 1.0)), (size_t)16);
+  if (tail > 0 && tail >= minTailBytes && tail < remainder) {
+    outPieces.push_back(remainder - tail);
+    outPieces.push_back(tail);
+  } else {
+    outPieces.push_back(remainder);
+  }
+}
+
+// Builds the full per-shard schedule: floor(shardBytes/bodyBytes) chunks of
+// bodyBytes, then the tapered remainder. If shardBytes is an exact multiple
+// of bodyBytes, one body chunk is folded back into the remainder so the
+// taper still has a predecessor to protect -- otherwise the very last body
+// chunk's reduce would be fully exposed with nothing after it to hide it
+// behind. By construction (bodyBytes and shardBytes both 16B-aligned, tail
+// always aligned down to 16) this is an exact, 16B-aligned cover of
+// shardBytes; asserted here as a cheap, self-documenting invariant and
+// re-verified with a plain runtime check at the call site in
+// ncclCeReduceScatter (which does not rely on NDEBUG for its safety).
+inline void ncclCeReduceScatterBuildTaperSchedule(size_t shardBytes, size_t bodyBytes, double ratioGuard,
+                                                   size_t minTailBytes, std::vector<size_t>& schedule) {
+  schedule.clear();
+  if (shardBytes == 0) return;
+  if (bodyBytes == 0 || bodyBytes >= shardBytes) {
+    ncclCeReduceScatterTaperRemainder(shardBytes, ratioGuard, minTailBytes, schedule);
+  } else {
+    size_t nBody = shardBytes / bodyBytes;
+    size_t remainder = shardBytes - nBody * bodyBytes;
+    if (remainder == 0) {
+      nBody--;
+      remainder = bodyBytes;
+    }
+    for (size_t i = 0; i < nBody; i++) schedule.push_back(bodyBytes);
+    ncclCeReduceScatterTaperRemainder(remainder, ratioGuard, minTailBytes, schedule);
+  }
+#ifndef NDEBUG
+  size_t cover = 0;
+  for (size_t s : schedule) {
+    assert(s % 16 == 0 && "taper schedule piece is not 16B-aligned");
+    cover += s;
+  }
+  assert(cover == shardBytes && "taper schedule does not exactly cover shardBytes");
+#endif
+}
+
+// Predicts total pipeline latency (us) for `schedule` via the critical-path
+// recurrence C[k]=C[k-1]+copy(s_k), R[k]=max(C[k],R[k-1])+reduce(s_k),
+// total=R[last]+doorbellUs*chunkCount, with copy(s)=kappa*MiB(s)+copyOverhead
+// and reduce(s)=rho*MiB(s)+reduceOverhead. Pure/host-testable. Used only to
+// RANK candidate body sizes in ncclCeReduceScatterChooseSchedule below --
+// never consulted for correctness, so an imprecise constant only costs a
+// fraction of a percent of ranking quality, never a wrong result.
+inline double ncclCeReduceScatterPredictUs(const std::vector<size_t>& schedule, double kappaUsPerMiB,
+                                            double copyOverheadUs, double rhoUsPerMiB, double reduceOverheadUs,
+                                            double doorbellUs) {
+  const double MiB = 1024.0 * 1024.0;
+  double cPrev = 0.0, rPrev = 0.0;
+  for (size_t s : schedule) {
+    const double mib = (double)s / MiB;
+    const double c = cPrev + kappaUsPerMiB * mib + copyOverheadUs;
+    const double r = std::max(c, rPrev) + rhoUsPerMiB * mib + reduceOverheadUs;
+    cPrev = c;
+    rPrev = r;
+  }
+  return rPrev + doorbellUs * (double)schedule.size();
+}
+
+// Picks the body size, from a small fixed candidate list, that minimizes
+// ncclCeReduceScatterPredictUs for this exact shardBytes, and returns its
+// schedule. This keeps the body size a *measured* choice -- goal.md's own
+// finding is that it is shape-dependent ("search B instead of hard-coding
+// one constant") -- rather than freezing a single value that was
+// calibrated for a different reducer thread width than the one actually in
+// effect. Bounded to a handful of candidates, so this stays O(1) and
+// allocation-light per call.
+inline void ncclCeReduceScatterChooseSchedule(size_t shardBytes, double ratioGuard, size_t minTailBytes,
+                                               double kappaUsPerMiB, double copyOverheadUs, double rhoUsPerMiB,
+                                               double reduceOverheadUs, double doorbellUs,
+                                               std::vector<size_t>& schedule) {
+  static const size_t kBodyCandidatesBytes[] = {
+    64ull * 1024 * 1024,  96ull * 1024 * 1024,  128ull * 1024 * 1024,
+    160ull * 1024 * 1024, 192ull * 1024 * 1024, 224ull * 1024 * 1024,
+  };
+  schedule.clear();
+  double bestUs = -1.0;
+  std::vector<size_t> candidate;
+  for (size_t bodyBytes : kBodyCandidatesBytes) {
+    ncclCeReduceScatterBuildTaperSchedule(shardBytes, bodyBytes, ratioGuard, minTailBytes, candidate);
+    const double us = ncclCeReduceScatterPredictUs(candidate, kappaUsPerMiB, copyOverheadUs, rhoUsPerMiB,
+                                                   reduceOverheadUs, doorbellUs);
+    if (bestUs < 0.0 || us < bestUs) {
+      bestUs = us;
+      schedule = candidate;
+    }
+  }
 }
 
 enum ncclCeMethodId {

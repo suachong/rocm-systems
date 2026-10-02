@@ -2453,6 +2453,64 @@ ncclResult_t ncclCeReduceScatter(struct ncclComm* comm, const void* sendbuff, vo
     chunksPerShard++;
   }
   size_t totalSteps = chunksPerShard;
+
+  // ---- P2+P3: flat [sender][chunkOffset] staging + ratio-guarded taper ----
+  // See the comment above ncclCeReduceScatterTaperRemainder (ce_coll.h) for
+  // the mechanism. Eligible only when the per-chunk reducer is in play (its
+  // addressing is what gets replaced below; the persistent/pipelined
+  // reducer's in-kernel wait/clear/barrier logic assumes the slotted
+  // layout's compile-time NCCL_CE_NUM_SLOTS wraparound and is not touched
+  // here) and all three runtime budget checks hold. Any failed check falls
+  // straight back to the untouched uniform/slotted computation above, with
+  // zero behavior change to that path -- this is strictly additive.
+  bool useFlatLayout = false;
+  std::vector<size_t> flatSchedule;
+  size_t perRankRegionBytes = 0;
+  size_t runningFlatOffsetBytes = 0;
+  if (rcclParamCeReducePerChunk() > 0 && shardBytes > slotChunkBytes && (shardBytes % 16) == 0) {
+    const size_t ceArStagingPerRank = ceColl->ceArStagingBytes / (size_t)comm->nRanks;
+    const size_t flatNumSlots = ceColl->numStagingSlots;
+    const size_t candidatePerRankRegionBytes = flatNumSlots * slotChunkBytes;
+    // Mirrors ncclCeEnsureAllReduceStaging's own sizing formula exactly.
+    const size_t ceARTmpBufSize = alignUp(flatNumSlots * (size_t)comm->nRanks * ceArStagingPerRank, (size_t)16);
+    // Guard 1, checked directly against the real (16B-rounded-down) region
+    // size rather than the raw unrounded ratio: slotChunkBytes can round
+    // below ceArStagingPerRank when the latter isn't already a multiple of
+    // 16, which would otherwise let a shard pass a looser "budget" check
+    // and still overrun the region actually used for addressing below.
+    const bool fitsStagingBudget = shardBytes <= candidatePerRankRegionBytes;                   // guard 1
+    const bool fitsTmpBuf =                                                                     // guard 2
+      ((size_t)(comm->nRanks - 1) * candidatePerRankRegionBytes + shardBytes) <= ceARTmpBufSize;
+    if (fitsStagingBudget && fitsTmpBuf) {
+      std::vector<size_t> candidateSchedule;
+      ncclCeReduceScatterChooseSchedule(shardBytes, NCCL_CE_RS_TAPER_RATIO_GUARD, NCCL_CE_RS_TAPER_MIN_TAIL_BYTES,
+                                        NCCL_CE_RS_TAPER_COPY_RATE_US_PER_MIB, NCCL_CE_RS_TAPER_COPY_OVERHEAD_US,
+                                        NCCL_CE_RS_TAPER_REDUCE_RATE_US_PER_MIB, NCCL_CE_RS_TAPER_REDUCE_OVERHEAD_US,
+                                        NCCL_CE_RS_TAPER_DOORBELL_US, candidateSchedule);
+      // Hard, non-NDEBUG-gated re-verification of exact cover + 16B
+      // alignment before trusting the schedule for real addressing; any
+      // violation (should be unreachable given the builder's own asserted
+      // invariant) safely falls back to the untouched slotted path instead
+      // of risking a wrong-element or out-of-bounds result.
+      size_t coverCheck = 0;
+      bool aligned16 = true;
+      for (size_t s : candidateSchedule) {
+        coverCheck += s;
+        if ((s % 16) != 0) aligned16 = false;
+      }
+      const bool chunksFitSlots = candidateSchedule.size() > 1 && candidateSchedule.size() <= flatNumSlots; // guard 3
+      if (chunksFitSlots && aligned16 && coverCheck == shardBytes) {
+        useFlatLayout = true;
+        perRankRegionBytes = candidatePerRankRegionBytes;
+        flatSchedule.swap(candidateSchedule);
+        chunksPerShard = flatSchedule.size();
+        totalSteps = chunksPerShard;
+        INFO(NCCL_COLL, "CE ReduceScatter: rank %d flat layout active shardBytes=%zu chunks=%zu bodyBytes0=%zu",
+             comm->rank, shardBytes, chunksPerShard, flatSchedule[0]);
+      }
+    }
+  }
+
   const bool perChunkReduce = totalSteps > 1 && rcclParamCeReducePerChunk() > 0;
   const size_t NUM_SLOTS = perChunkReduce ? ceColl->numStagingSlots : (size_t)NCCL_CE_NUM_SLOTS;
   // ceARTmpBuf slots are spaced by slotChunkBytes (<= maxChunkBytes at init);
@@ -2548,7 +2606,8 @@ ncclResult_t ncclCeReduceScatter(struct ncclComm* comm, const void* sendbuff, vo
          chunkBytes, ch);
     const int slot = (int)(ch % NUM_SLOTS);
     const bool isTail = (ch == chunksPerShard - 1) && (tailChunkElems > 0);
-    const size_t currentChunkBytes = isTail ? tailChunkElems * eltSize : chunkBytes;
+    const size_t currentChunkBytes =
+      useFlatLayout ? flatSchedule[ch] : (isTail ? tailChunkElems * eltSize : chunkBytes);
     const size_t mySignalIndex = ncclCeReduceScatterSignalIndex(slot, comm->rank, comm->nRanks);
     if (totalSteps > 1) {
       mySlotOffset = mySignalIndex * sizeof(uint32_t);
@@ -2569,14 +2628,18 @@ ncclResult_t ncclCeReduceScatter(struct ncclComm* comm, const void* sendbuff, vo
       }
       CUCHECKGOTO(hipStreamBatchMemOp(ceStream, comm->nRanks, waits.data(), 0), ret, fail);
     }
+    const size_t chunkOffsetBytes = useFlatLayout ? runningFlatOffsetBytes : (size_t)ch * chunkBytes;
     const size_t dstSlotOffsetBytes =
-      ncclCeReduceScatterDstSlotOffsetBytes(slot, comm->rank, comm->nRanks, slotChunkBytes);
-    const size_t chunkOffsetBytes = (size_t)ch * chunkBytes;
+      useFlatLayout
+        ? (ncclCeReduceScatterDstSlotOffsetBytes(0, comm->rank, comm->nRanks, perRankRegionBytes) + chunkOffsetBytes)
+        : ncclCeReduceScatterDstSlotOffsetBytes(slot, comm->rank, comm->nRanks, slotChunkBytes);
     batchOpsParams.numOps = 0;
     for (int r = 0; r < comm->nRanks; r++) {
       void* dstPtr;
       const uint8_t* srcShard =
-        (const uint8_t*)sendbuff + ncclCeReduceScatterSrcOffsetBytes(r, shardBytes, ch, chunkBytes);
+        (const uint8_t*)sendbuff +
+        (useFlatLayout ? (ncclCeReduceScatterSrcOffsetBytes(r, shardBytes, 0, 0) + chunkOffsetBytes)
+                       : ncclCeReduceScatterSrcOffsetBytes(r, shardBytes, ch, chunkBytes));
       if (r == comm->rank) {
         dstPtr = tmpBuf + dstSlotOffsetBytes;
       } else {
@@ -2609,10 +2672,17 @@ ncclResult_t ncclCeReduceScatter(struct ncclComm* comm, const void* sendbuff, vo
       CUCHECKGOTO(hipStreamBatchMemOp(reduceStream, comm->nRanks, readyWaits.data(), 0), ret, fail);
 
       const size_t currentChunkElems = currentChunkBytes / eltSize;
-      const void* chunkIn = tmpBuf + (size_t)slot * slotStrideBytes;
+      // Flat: base is this chunk's running byte offset into the contiguous
+      // per-sender region, and the kernel's inter-sender stride is the
+      // whole region (perRankRegionBytes), not a fixed slot. Slotted:
+      // unchanged (base = this slot's row, stride = slotChunkElems, exactly
+      // as before this change).
+      const void* chunkIn =
+        useFlatLayout ? (tmpBuf + chunkOffsetBytes) : (tmpBuf + (size_t)slot * slotStrideBytes);
+      const size_t reduceStrideElems = useFlatLayout ? (perRankRegionBytes / eltSize) : slotChunkElems;
       void* chunkOut = outShard + chunkOffsetBytes;
       NCCLCHECKGOTO(ncclCeLaunchPersistentReduce(chunkIn, chunkOut, comm->nRanks, currentChunkElems, 0, 1,
-                                                 slotChunkElems, signalBuffer + slot * comm->nRanks, 1,
+                                                 reduceStrideElems, signalBuffer + slot * comm->nRanks, 1,
                                                  ceColl->d_barrierSync, datatype, op, reduceStream, 0),
                     ret, fail);
       CUCHECKGOTO(hipStreamBatchMemOp(reduceStream, comm->nRanks, clears.data(), 0), ret, fail);
@@ -2624,6 +2694,7 @@ ncclResult_t ncclCeReduceScatter(struct ncclComm* comm, const void* sendbuff, vo
                                                  ceColl->d_barrierSync, datatype, op, ceStream, coopLaunch),
                     ret, fail);
     }
+    if (useFlatLayout) runningFlatOffsetBytes += currentChunkBytes;
   }
   if (totalSteps > (size_t)NUM_SLOTS) {
     if (startCh < 0) {
