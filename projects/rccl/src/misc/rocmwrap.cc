@@ -194,7 +194,13 @@ int ncclCuMemEnable() {
   // Force-on (param>0) still requires a usable VMM/dma-buf stack. Returning 1
   // here on a kernel without DMA-BUF (e.g. 5.15) made P2P/CUMEM paths
   // dereference uninitialized state and SIGSEGV.
-  if (param > 0) return ncclCuMemRuntimeSupported();
+  // The runtime check runs a cuMem map/unmap probe. hipMemUnmap waits on in-flight device work, so
+  // re-probing from every ncclMemAlloc can deadlock against a cross-node collective that is waiting on
+  // a peer blocked in the same allocation's rendezvous. The answer cannot change within a process.
+  if (param > 0) {
+    static const int runtimeSupported = ncclCuMemRuntimeSupported();
+    return runtimeSupported;
+  }
   return param == -2 && ncclCuMemSupported;
 #else
   if (ncclParamCuMemEnable() > 0)

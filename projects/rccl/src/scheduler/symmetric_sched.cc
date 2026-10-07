@@ -131,7 +131,10 @@ ncclResult_t ncclMakeSymmetricTaskList(struct ncclComm* comm, struct ncclTaskCol
     }
     // Local windows can disagree across ranks (NCCL_CHECK_MODE default does not
     // reject that). Mixing SYM and RING hangs; fall back unless every rank wants SYM.
-    if (comm->nRanks >= 2 && comm->bootstrap != nullptr) {
+    // symAvailable and cfgAllowsSymk depend only on comm topology and the call's
+    // (fn, op, type, count, algMask), so every rank skips this host round-trip together
+    // when no symmetric kernel is a candidate.
+    if (symAvailable && cfgAllowsSymk && comm->nRanks >= 2 && comm->bootstrap != nullptr) {
       std::vector<uint8_t> flags((size_t)comm->nRanks, 0);
       flags[(size_t)comm->rank] = wantSym ? 1 : 0;
       NCCLCHECK(bootstrapAllGather(comm->bootstrap, flags.data(), sizeof(uint8_t)));
