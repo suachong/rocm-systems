@@ -48,6 +48,7 @@ RCCL_PARAM(CeHierReduceScatter, "CE_HIER_REDUCESCATTER", 0);
 RCCL_PARAM(CeHierRsStagingBytes, "CE_HIER_RS_STAGING_BYTES", 256 * 1024 * 1024);
 RCCL_PARAM(CeHierRsChunkBytes, "CE_HIER_RS_CHUNK_BYTES", 4 * 1024 * 1024);
 RCCL_PARAM(CeHierRsPipeline, "CE_HIER_RS_PIPELINE", 1);
+RCCL_PARAM(CeHierRsCompactTail, "CE_HIER_RS_COMPACT_TAIL", 0);
 
 #ifdef CE_BATCH_ASYNC_SUPPORTED
 // Runtime detection: does the running driver actually implement hipMemcpyBatchAsync?
@@ -1651,6 +1652,7 @@ static ncclResult_t ncclHierCeReduceScatter(struct ncclComm* comm, struct ncclKe
   auto* pc = (struct ncclRmaProxyCtx*)comm->rmaState.rmaProxyState.rmaProxyCtxs[ctx];
   const size_t shardBytes = args->nElts * args->eltSize;
   const int depth = (int)std::max<int64_t>(1, std::min<int64_t>(4, rcclParamCeHierRsPipeline()));
+  const bool compactTail = rcclParamCeHierRsCompactTail() != 0;
   const int doneOps = ncclRmaProxyPutGroupDoneNumOps(plan->persistent);
   const size_t slotsPerChunk = (size_t)locals * nodes + 2 * nodes;
   const size_t slots = depth * slotsPerChunk + 1;
@@ -1669,8 +1671,8 @@ static ncclResult_t ncclHierCeReduceScatter(struct ncclComm* comm, struct ncclKe
   const int lsaBase = comm->rank - comm->devrState.lsaSelf;
   NCCLCHECKGOTO(ncclCeInitBatchOpsParams(&copies, locals * nodes), ret, fail);
   NCCLCHECKGOTO(ncclCalloc(&doneParams, depth * doneOps), ret, fail);
-  INFO(NCCL_COLL, "[Hierarchical CE RS] rank=%d nodes=%d locals=%d shard=%zu chunk=%zu pipeline=%d finite=1 rma=1",
-       comm->rank, nodes, locals, shardBytes, chunkBytes, depth);
+  INFO(NCCL_COLL, "[Hierarchical CE RS] rank=%d nodes=%d locals=%d shard=%zu chunk=%zu pipeline=%d compact_tail=%d finite=1 rma=1",
+       comm->rank, nodes, locals, shardBytes, chunkBytes, depth, (int)compactTail);
   for (size_t batchOffset = 0; batchOffset < shardBytes; batchOffset += depth * chunkBytes) {
     const int active = (int)std::min((size_t)depth, DIVUP(shardBytes - batchOffset, chunkBytes));
     // Entry credit protects every slot from the preceding batch/call. All
@@ -1680,15 +1682,18 @@ static ncclResult_t ncclHierCeReduceScatter(struct ncclComm* comm, struct ncclKe
     for (int slot = 0; slot < active; slot++) {
       const size_t offset = batchOffset + slot * chunkBytes;
       const size_t bytes = std::min(chunkBytes, shardBytes - offset);
+      // Retain fixed pipeline slot spacing, but reduce only the aligned tail
+      // inside that slot. Every node derives the same compact layout.
+      const size_t strideBytes = compactTail ? alignUp(bytes, (size_t)16) : chunkBytes;
       const size_t inputOffset = slot * chunkStride;
-      const size_t partialOffset = inputOffset + (size_t)locals * nodes * chunkBytes;
-      const size_t railOffset = partialOffset + nodes * chunkBytes;
+      const size_t partialOffset = inputOffset + (size_t)locals * nodes * strideBytes;
+      const size_t railOffset = partialOffset + nodes * strideBytes;
       copies.numOps = 0;
       for (int l = 0; l < locals; l++) {
         int lsaRank = comm->nodeRanks[comm->node].localRankToRank[l] - lsaBase;
         for (int n = 0; n < nodes; n++) {
           void* dst = nullptr;
-          const size_t dstOff = inputOffset + ((size_t)comm->localRank * nodes + n) * chunkBytes;
+          const size_t dstOff = inputOffset + ((size_t)comm->localRank * nodes + n) * strideBytes;
           const int target = comm->nodeRanks[n].localRankToRank[l];
           NCCLCHECKGOTO(ncclDevrGetLsaRankPtr(comm, ce->ceRSTmpWin, dstOff, lsaRank, &dst), ret, fail);
           copies.srcs[copies.numOps] = args->sendBuff + (size_t)target * shardBytes + offset;
@@ -1700,17 +1705,18 @@ static ncclResult_t ncclHierCeReduceScatter(struct ncclComm* comm, struct ncclKe
       NCCLCHECKGOTO(ncclMemOpSync(comm, stream, args), ret, fail);
       // totalSteps=1 disables polling and cross-block barriers (PR #12545).
       NCCLCHECKGOTO(ncclCeLaunchPersistentReduce(ce->ceRSTmpBuf + inputOffset, ce->ceRSTmpBuf + partialOffset,
-        locals, nodes * chunkBytes / args->eltSize, 0, 1, nodes * chunkBytes / args->eltSize,
+        locals, nodes * strideBytes / args->eltSize, 0, 1, nodes * strideBytes / args->eltSize,
         nullptr, 1, nullptr, args->datatype, ncclSum, stream, 0), ret, fail);
-      CUDACHECKGOTO(cudaMemcpyAsync(ce->ceRSTmpBuf + railOffset + comm->node * chunkBytes,
-        ce->ceRSTmpBuf + partialOffset + comm->node * chunkBytes, bytes, cudaMemcpyDeviceToDevice, stream), ret, fail);
-      NCCLCHECKGOTO(ncclHierRsSubmit(comm, plan, stream, partialOffset, railOffset, chunkBytes, bytes,
+      CUDACHECKGOTO(cudaMemcpyAsync(ce->ceRSTmpBuf + railOffset + comm->node * strideBytes,
+        ce->ceRSTmpBuf + partialOffset + comm->node * strideBytes, bytes, cudaMemcpyDeviceToDevice, stream), ret, fail);
+      NCCLCHECKGOTO(ncclHierRsSubmit(comm, plan, stream, partialOffset, railOffset, strideBytes, bytes,
         doneParams + slot * doneOps, depth == 1), ret, fail);
     }
     for (int slot = 0; slot < active; slot++) {
       const size_t offset = batchOffset + slot * chunkBytes;
       const size_t bytes = std::min(chunkBytes, shardBytes - offset);
-      const size_t railOffset = slot * chunkStride + ((size_t)locals * nodes + nodes) * chunkBytes;
+      const size_t strideBytes = compactTail ? alignUp(bytes, (size_t)16) : chunkBytes;
+      const size_t railOffset = slot * chunkStride + ((size_t)locals * nodes + nodes) * strideBytes;
       if (depth > 1) {
         NCCLCHECKGOTO(ncclCuStreamBatchMemOp(stream, doneOps, doneParams + slot * doneOps), ret, fail);
       }
@@ -1720,7 +1726,7 @@ static ncclResult_t ncclHierCeReduceScatter(struct ncclComm* comm, struct ncclKe
         NCCLCHECKGOTO(ncclProxyWaitOnePeer(comm, pc, plan, ctx, stream, peer, 1), ret, fail);
       }
       NCCLCHECKGOTO(ncclCeLaunchPersistentReduce(ce->ceRSTmpBuf + railOffset, ce->ceRSTmpBuf + resultOffset,
-        nodes, bytes / args->eltSize, 0, 1, chunkBytes / args->eltSize,
+        nodes, bytes / args->eltSize, 0, 1, strideBytes / args->eltSize,
         nullptr, 1, nullptr, args->datatype, ncclSum, stream, 0), ret, fail);
       // Aligned scratch supports odd shard lengths and unaligned outputs.
       CUDACHECKGOTO(cudaMemcpyAsync(args->recvBuff + offset, ce->ceRSTmpBuf + resultOffset,
