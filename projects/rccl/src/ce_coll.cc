@@ -49,6 +49,7 @@ RCCL_PARAM(CeHierRsStagingBytes, "CE_HIER_RS_STAGING_BYTES", 256 * 1024 * 1024);
 RCCL_PARAM(CeHierRsChunkBytes, "CE_HIER_RS_CHUNK_BYTES", 4 * 1024 * 1024);
 RCCL_PARAM(CeHierRsPipeline, "CE_HIER_RS_PIPELINE", 1);
 RCCL_PARAM(CeHierRsCompactTail, "CE_HIER_RS_COMPACT_TAIL", 0);
+RCCL_PARAM(CeHierRsCombinedWait, "CE_HIER_RS_COMBINED_WAIT", 0);
 
 #ifdef CE_BATCH_ASYNC_SUPPORTED
 // Runtime detection: does the running driver actually implement hipMemcpyBatchAsync?
@@ -1554,10 +1555,11 @@ fail:
   goto exit;
 }
 
-// Helper function to wait for a single peer's signals.
-static ncclResult_t ncclProxyWaitOnePeer(struct ncclComm* comm, struct ncclRmaProxyCtx* rmaProxyCtx,
-                                         struct ncclKernelPlan* plan, int ctx, cudaStream_t stream, int peer,
-                                         int nsignals) {
+// One descriptor can wait for all rail peers, avoiding a separate stream
+// memory-operation kernel for each peer when the consumer needs all of them.
+static ncclResult_t ncclProxyWaitPeers(struct ncclComm* comm, struct ncclRmaProxyCtx* rmaProxyCtx,
+                                      struct ncclKernelPlan* plan, int ctx, cudaStream_t stream,
+                                      int nPeers, const int* peers, int nsignals) {
   ncclResult_t ret = ncclSuccess;
 
   int* waitPeers = nullptr;
@@ -1566,14 +1568,16 @@ static ncclResult_t ncclProxyWaitOnePeer(struct ncclComm* comm, struct ncclRmaPr
   struct ncclRmaProxyDesc* waitDesc = nullptr;
   CUstreamBatchMemOpParams* waitBatch = nullptr;
 
-  NCCLCHECKGOTO(ncclCalloc(&waitPeers, 1), ret, fail);
-  NCCLCHECKGOTO(ncclCalloc(&waitSigCounts, 1), ret, fail);
-  NCCLCHECKGOTO(ncclCalloc(&waitSignalIdxs, 1), ret, fail);
-  waitPeers[0] = peer;
-  waitSigCounts[0] = nsignals;
+  NCCLCHECKGOTO(ncclCalloc(&waitPeers, nPeers), ret, fail);
+  NCCLCHECKGOTO(ncclCalloc(&waitSigCounts, nPeers), ret, fail);
+  NCCLCHECKGOTO(ncclCalloc(&waitSignalIdxs, nPeers), ret, fail);
+  for (int i = 0; i < nPeers; i++) {
+    waitPeers[i] = peers[i];
+    waitSigCounts[i] = nsignals;
+  }
 
   NCCLCHECKGOTO(ncclCalloc(&waitDesc, 1), ret, fail);
-  NCCLCHECKGOTO(ncclRmaProxyWaitBuildDesc(comm, rmaProxyCtx, plan, 1, &waitPeers, &waitSigCounts, &waitSignalIdxs,
+  NCCLCHECKGOTO(ncclRmaProxyWaitBuildDesc(comm, rmaProxyCtx, plan, nPeers, &waitPeers, &waitSigCounts, &waitSignalIdxs,
                                           waitDesc),
                 ret, fail);
 
@@ -1594,6 +1598,12 @@ exit:
   return ret;
 fail:
   goto exit;
+}
+
+static ncclResult_t ncclProxyWaitOnePeer(struct ncclComm* comm, struct ncclRmaProxyCtx* rmaProxyCtx,
+                                         struct ncclKernelPlan* plan, int ctx, cudaStream_t stream,
+                                         int peer, int nsignals) {
+  return ncclProxyWaitPeers(comm, rmaProxyCtx, plan, ctx, stream, 1, &peer, nsignals);
 }
 
 // Submit one reduced chunk to matching local ranks. Return the completion
@@ -1720,10 +1730,18 @@ static ncclResult_t ncclHierCeReduceScatter(struct ncclComm* comm, struct ncclKe
       if (depth > 1) {
         NCCLCHECKGOTO(ncclCuStreamBatchMemOp(stream, doneOps, doneParams + slot * doneOps), ret, fail);
       }
-      for (int n = 0; n < nodes; n++) {
-        if (n == comm->node) continue;
-        int peer = comm->nodeRanks[n].localRankToRank[comm->localRank];
-        NCCLCHECKGOTO(ncclProxyWaitOnePeer(comm, pc, plan, ctx, stream, peer, 1), ret, fail);
+      if (rcclParamCeHierRsCombinedWait()) {
+        std::vector<int> peers;
+        for (int n = 0; n < nodes; n++) {
+          if (n != comm->node) peers.push_back(comm->nodeRanks[n].localRankToRank[comm->localRank]);
+        }
+        NCCLCHECKGOTO(ncclProxyWaitPeers(comm, pc, plan, ctx, stream, peers.size(), peers.data(), 1), ret, fail);
+      } else {
+        for (int n = 0; n < nodes; n++) {
+          if (n == comm->node) continue;
+          int peer = comm->nodeRanks[n].localRankToRank[comm->localRank];
+          NCCLCHECKGOTO(ncclProxyWaitOnePeer(comm, pc, plan, ctx, stream, peer, 1), ret, fail);
+        }
       }
       NCCLCHECKGOTO(ncclCeLaunchPersistentReduce(ce->ceRSTmpBuf + railOffset, ce->ceRSTmpBuf + resultOffset,
         nodes, bytes / args->eltSize, 0, 1, strideBytes / args->eltSize,
