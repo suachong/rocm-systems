@@ -2586,6 +2586,10 @@ ncclResult_t ncclLaunchCeColl(struct ncclComm* comm, struct ncclKernelPlan* plan
   // single-node ncclCe* paths treat every global rank as an LSA rank and fail
   // ncclDevrGetLsaRankPtr once nRanks > lsaSize.
   if (ncclHierCeDispatch(comm)) {
+    if (comm->rank == 0) {
+      INFO(NCCL_COLL, "%s " RCCL_CE_HIER_SELECTED_TAG ": %zu Bytes -> RMA proxy + CE",
+           ncclFuncToString(args->func), args->nElts * args->eltSize);
+    }
     switch (args->func) {
     case ncclFuncAllGather:
       NCCLCHECKGOTO(ncclHierCeAllGather(comm, plan, stream), ret, fail);
