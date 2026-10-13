@@ -17,6 +17,7 @@
 #define NCCL_CE_SYNC_OPS_PER_RANK_MC 2
 #define NCCL_CE_SYNC_OPS_PER_RANK_UC 3
 #define RCCL_CE_NUM_COPY_STREAMS 8
+#define RCCL_CE_HIER_RS_MAX_PIPELINE 4
 
 // Selection marker for the hierarchical CE path. Defined once because the
 // scale-out MPI tests assert on this exact text.
@@ -104,6 +105,8 @@ struct ncclCeColl {
   uint8_t* ceRSTmpBuf;
   struct ncclDevrWindow* ceRSTmpWin;
   size_t ceRSTmpBytes;
+  cudaEvent_t ceRSReady[RCCL_CE_HIER_RS_MAX_PIPELINE];
+  cudaEvent_t ceRSDone;
   uint8_t* ceARTmpBuf;
   struct ncclDevrWindow* ceARTmpWin;
   uint32_t* signalBuffer;
