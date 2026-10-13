@@ -47,6 +47,7 @@ RCCL_PARAM_DECLARE(CeAllReduce);
 RCCL_PARAM(CeHierReduceScatter, "CE_HIER_REDUCESCATTER", 0);
 RCCL_PARAM(CeHierRsStagingBytes, "CE_HIER_RS_STAGING_BYTES", 256 * 1024 * 1024);
 RCCL_PARAM(CeHierRsChunkBytes, "CE_HIER_RS_CHUNK_BYTES", 4 * 1024 * 1024);
+RCCL_PARAM(CeHierRsPipeline, "CE_HIER_RS_PIPELINE", 1);
 
 #ifdef CE_BATCH_ASYNC_SUPPORTED
 // Runtime detection: does the running driver actually implement hipMemcpyBatchAsync?
@@ -1594,11 +1595,12 @@ fail:
   goto exit;
 }
 
-// Exchange one reduced chunk with the matching local rank on every node.
-// The proxy completes puts before the stream consumes peer contributions.
-static ncclResult_t ncclHierRsExchange(struct ncclComm* comm, struct ncclKernelPlan* plan,
+// Submit one reduced chunk to matching local ranks. Return the completion
+// fence so subsequent local chunks can execute while these puts are in flight.
+static ncclResult_t ncclHierRsSubmit(struct ncclComm* comm, struct ncclKernelPlan* plan,
                                       cudaStream_t stream, size_t partialOffset,
-                                      size_t railOffset, size_t chunkBytes, size_t bytes) {
+                                      size_t railOffset, size_t chunkBytes, size_t bytes,
+                                      CUstreamBatchMemOpParams* doneParams) {
   ncclResult_t ret = ncclSuccess;
   const int ctx = comm->config.numRmaCtx;
   auto* pc = (struct ncclRmaProxyCtx*)comm->rmaState.rmaProxyState.rmaProxyCtxs[ctx];
@@ -1607,11 +1609,10 @@ static ncclResult_t ncclHierRsExchange(struct ncclComm* comm, struct ncclKernelP
   struct ncclRmaProxyDesc* desc = nullptr;
   CUstreamBatchMemOpParams* batch = nullptr;
   const int startOps = ncclRmaProxyPutGroupStartNumOps(plan->persistent);
-  const int doneOps = ncclRmaProxyPutGroupDoneNumOps(plan->persistent);
   int idx = 0;
   NCCLCHECKGOTO(ncclCalloc(&ops, comm->nNodes - 1), ret, fail);
   NCCLCHECKGOTO(ncclCalloc(&desc, 1), ret, fail);
-  NCCLCHECKGOTO(ncclCalloc(&batch, startOps + doneOps), ret, fail);
+  NCCLCHECKGOTO(ncclCalloc(&batch, startOps), ret, fail);
   for (int n = 0; n < comm->nNodes; n++) {
     if (n == comm->node) continue;
     int peer = comm->nodeRanks[n].localRankToRank[comm->localRank];
@@ -1621,14 +1622,9 @@ static ncclResult_t ncclHierRsExchange(struct ncclComm* comm, struct ncclKernelP
   }
   NCCLCHECKGOTO(ncclRmaProxyPutGroupBuildDesc(comm, pc, plan, idx, &ops, ctx, desc), ret, fail);
   NCCLCHECKGOTO(ncclRmaProxyPutGroupStartParams(desc, batch), ret, fail);
-  NCCLCHECKGOTO(ncclRmaProxyPutGroupDoneParams(desc, batch + startOps), ret, fail);
+  NCCLCHECKGOTO(ncclRmaProxyPutGroupDoneParams(desc, doneParams), ret, fail);
   NCCLCHECKGOTO(ncclRmaProxyEnqueueDesc(pc, &desc), ret, fail);
-  NCCLCHECKGOTO(ncclCuStreamBatchMemOp(stream, startOps + doneOps, batch), ret, fail);
-  for (int n = 0; n < comm->nNodes; n++) {
-    if (n == comm->node) continue;
-    int peer = comm->nodeRanks[n].localRankToRank[comm->localRank];
-    NCCLCHECKGOTO(ncclProxyWaitOnePeer(comm, pc, plan, ctx, stream, peer, 1), ret, fail);
-  }
+  NCCLCHECKGOTO(ncclCuStreamBatchMemOp(stream, startOps, batch), ret, fail);
 exit:
   if (desc != nullptr) (void)ncclRmaProxyDestroyDesc(comm, &desc);
   free(ops);
@@ -1652,12 +1648,15 @@ static ncclResult_t ncclHierCeReduceScatter(struct ncclComm* comm, struct ncclKe
   const int ctx = comm->config.numRmaCtx;
   auto* pc = (struct ncclRmaProxyCtx*)comm->rmaState.rmaProxyState.rmaProxyCtxs[ctx];
   const size_t shardBytes = args->nElts * args->eltSize;
-  const size_t slots = (size_t)locals * nodes + 2 * nodes + 1;
+  const int depth = (int)std::max<int64_t>(1, std::min<int64_t>(4, rcclParamCeHierRsPipeline()));
+  const int doneOps = ncclRmaProxyPutGroupDoneNumOps(plan->persistent);
+  const size_t slotsPerChunk = (size_t)locals * nodes + 2 * nodes;
+  const size_t slots = depth * slotsPerChunk + 1;
   const size_t chunkBytes = alignDown(std::min((size_t)rcclParamCeHierRsChunkBytes(),
                                              ce->ceRSTmpBytes / slots), (size_t)16);
-  const size_t partialOffset = (size_t)locals * nodes * chunkBytes;
-  const size_t railOffset = partialOffset + nodes * chunkBytes;
-  const size_t resultOffset = railOffset + nodes * chunkBytes;
+  const size_t chunkStride = slotsPerChunk * chunkBytes;
+  const size_t resultOffset = depth * chunkStride;
+  CUstreamBatchMemOpParams* doneParams = nullptr;
   struct ncclCeBatchOpsParams copies = {};
   if (!ce->ceRSTmpBuf || chunkBytes == 0 || args->redOp != ncclSum || plan->persistent) {
     WARN("Hierarchical CE ReduceScatter: invalid staging, operation, or captured plan");
@@ -1667,45 +1666,66 @@ static ncclResult_t ncclHierCeReduceScatter(struct ncclComm* comm, struct ncclKe
   // the local rank table rather than assuming local rank order equals LSA order.
   const int lsaBase = comm->rank - comm->devrState.lsaSelf;
   NCCLCHECKGOTO(ncclCeInitBatchOpsParams(&copies, locals * nodes), ret, fail);
-  INFO(NCCL_COLL, "[Hierarchical CE RS] rank=%d nodes=%d locals=%d shard=%zu chunk=%zu finite=1 rma=1",
-       comm->rank, nodes, locals, shardBytes, chunkBytes);
-  for (size_t offset = 0; offset < shardBytes; offset += chunkBytes) {
-    const size_t bytes = std::min(chunkBytes, shardBytes - offset);
-    // Credit for reusing each rail input; all peers have finished prior reduce.
+  NCCLCHECKGOTO(ncclCalloc(&doneParams, depth * doneOps), ret, fail);
+  INFO(NCCL_COLL, "[Hierarchical CE RS] rank=%d nodes=%d locals=%d shard=%zu chunk=%zu pipeline=%d finite=1 rma=1",
+       comm->rank, nodes, locals, shardBytes, chunkBytes, depth);
+  for (size_t batchOffset = 0; batchOffset < shardBytes; batchOffset += depth * chunkBytes) {
+    const int active = (int)std::min((size_t)depth, DIVUP(shardBytes - batchOffset, chunkBytes));
+    // Entry credit protects every slot from the preceding batch/call. All
+    // local barriers stay on one stream and use the existing sequence counter.
     NCCLCHECKGOTO(ncclRailSync(comm, pc, plan, ctx, stream), ret, fail);
     NCCLCHECKGOTO(ncclMemOpSync(comm, stream, args), ret, fail);
-    copies.numOps = 0;
-    for (int l = 0; l < locals; l++) {
-      int lsaRank = comm->nodeRanks[comm->node].localRankToRank[l] - lsaBase;
-      for (int n = 0; n < nodes; n++) {
-        void* dst = nullptr;
-        const size_t dstOff = ((size_t)comm->localRank * nodes + n) * chunkBytes;
-        const int target = comm->nodeRanks[n].localRankToRank[l];
-        NCCLCHECKGOTO(ncclDevrGetLsaRankPtr(comm, ce->ceRSTmpWin, dstOff, lsaRank, &dst), ret, fail);
-        copies.srcs[copies.numOps] = args->sendBuff + (size_t)target * shardBytes + offset;
-        copies.dsts[copies.numOps] = dst;
-        copies.sizes[copies.numOps++] = bytes;
+    for (int slot = 0; slot < active; slot++) {
+      const size_t offset = batchOffset + slot * chunkBytes;
+      const size_t bytes = std::min(chunkBytes, shardBytes - offset);
+      const size_t inputOffset = slot * chunkStride;
+      const size_t partialOffset = inputOffset + (size_t)locals * nodes * chunkBytes;
+      const size_t railOffset = partialOffset + nodes * chunkBytes;
+      copies.numOps = 0;
+      for (int l = 0; l < locals; l++) {
+        int lsaRank = comm->nodeRanks[comm->node].localRankToRank[l] - lsaBase;
+        for (int n = 0; n < nodes; n++) {
+          void* dst = nullptr;
+          const size_t dstOff = inputOffset + ((size_t)comm->localRank * nodes + n) * chunkBytes;
+          const int target = comm->nodeRanks[n].localRankToRank[l];
+          NCCLCHECKGOTO(ncclDevrGetLsaRankPtr(comm, ce->ceRSTmpWin, dstOff, lsaRank, &dst), ret, fail);
+          copies.srcs[copies.numOps] = args->sendBuff + (size_t)target * shardBytes + offset;
+          copies.dsts[copies.numOps] = dst;
+          copies.sizes[copies.numOps++] = bytes;
+        }
       }
+      NCCLCHECKGOTO(ncclCeLaunchBatchOps(comm, &copies, stream, args), ret, fail);
+      NCCLCHECKGOTO(ncclMemOpSync(comm, stream, args), ret, fail);
+      // totalSteps=1 disables polling and cross-block barriers (PR #12545).
+      NCCLCHECKGOTO(ncclCeLaunchPersistentReduce(ce->ceRSTmpBuf + inputOffset, ce->ceRSTmpBuf + partialOffset,
+        locals, nodes * chunkBytes / args->eltSize, 0, 1, nodes * chunkBytes / args->eltSize,
+        nullptr, 1, nullptr, args->datatype, ncclSum, stream, 0), ret, fail);
+      CUDACHECKGOTO(cudaMemcpyAsync(ce->ceRSTmpBuf + railOffset + comm->node * chunkBytes,
+        ce->ceRSTmpBuf + partialOffset + comm->node * chunkBytes, bytes, cudaMemcpyDeviceToDevice, stream), ret, fail);
+      NCCLCHECKGOTO(ncclHierRsSubmit(comm, plan, stream, partialOffset, railOffset, chunkBytes, bytes,
+        doneParams + slot * doneOps), ret, fail);
     }
-    NCCLCHECKGOTO(ncclCeLaunchBatchOps(comm, &copies, stream, args), ret, fail);
-    NCCLCHECKGOTO(ncclMemOpSync(comm, stream, args), ret, fail);
-    // totalSteps=1 disables all signal polling and cross-block barriers in the
-    // reducer, following the finite per-chunk approach in PR #12545.
-    NCCLCHECKGOTO(ncclCeLaunchPersistentReduce(ce->ceRSTmpBuf, ce->ceRSTmpBuf + partialOffset,
-      locals, nodes * chunkBytes / args->eltSize, 0, 1, nodes * chunkBytes / args->eltSize,
-      nullptr, 1, nullptr, args->datatype, ncclSum, stream, 0), ret, fail);
-    CUDACHECKGOTO(cudaMemcpyAsync(ce->ceRSTmpBuf + railOffset + comm->node * chunkBytes,
-      ce->ceRSTmpBuf + partialOffset + comm->node * chunkBytes, bytes, cudaMemcpyDeviceToDevice, stream), ret, fail);
-    NCCLCHECKGOTO(ncclHierRsExchange(comm, plan, stream, partialOffset, railOffset, chunkBytes, bytes), ret, fail);
-    NCCLCHECKGOTO(ncclCeLaunchPersistentReduce(ce->ceRSTmpBuf + railOffset, ce->ceRSTmpBuf + resultOffset,
-      nodes, bytes / args->eltSize, 0, 1, chunkBytes / args->eltSize,
-      nullptr, 1, nullptr, args->datatype, ncclSum, stream, 0), ret, fail);
-    // Aligned scratch also supports odd shard lengths and unaligned user outputs.
-    CUDACHECKGOTO(cudaMemcpyAsync(args->recvBuff + offset, ce->ceRSTmpBuf + resultOffset,
-      bytes, cudaMemcpyDeviceToDevice, stream), ret, fail);
+    for (int slot = 0; slot < active; slot++) {
+      const size_t offset = batchOffset + slot * chunkBytes;
+      const size_t bytes = std::min(chunkBytes, shardBytes - offset);
+      const size_t railOffset = slot * chunkStride + ((size_t)locals * nodes + nodes) * chunkBytes;
+      NCCLCHECKGOTO(ncclCuStreamBatchMemOp(stream, doneOps, doneParams + slot * doneOps), ret, fail);
+      for (int n = 0; n < nodes; n++) {
+        if (n == comm->node) continue;
+        int peer = comm->nodeRanks[n].localRankToRank[comm->localRank];
+        NCCLCHECKGOTO(ncclProxyWaitOnePeer(comm, pc, plan, ctx, stream, peer, 1), ret, fail);
+      }
+      NCCLCHECKGOTO(ncclCeLaunchPersistentReduce(ce->ceRSTmpBuf + railOffset, ce->ceRSTmpBuf + resultOffset,
+        nodes, bytes / args->eltSize, 0, 1, chunkBytes / args->eltSize,
+        nullptr, 1, nullptr, args->datatype, ncclSum, stream, 0), ret, fail);
+      // Aligned scratch supports odd shard lengths and unaligned outputs.
+      CUDACHECKGOTO(cudaMemcpyAsync(args->recvBuff + offset, ce->ceRSTmpBuf + resultOffset,
+        bytes, cudaMemcpyDeviceToDevice, stream), ret, fail);
+    }
   }
   NCCLCHECKGOTO(ncclMemOpSync(comm, stream, args), ret, fail);
 exit:
+  free(doneParams);
   ncclCeFreeBatchOpsParams(&copies);
   return ret;
 fail:
