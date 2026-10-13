@@ -1600,7 +1600,7 @@ fail:
 static ncclResult_t ncclHierRsSubmit(struct ncclComm* comm, struct ncclKernelPlan* plan,
                                       cudaStream_t stream, size_t partialOffset,
                                       size_t railOffset, size_t chunkBytes, size_t bytes,
-                                      CUstreamBatchMemOpParams* doneParams) {
+                                      CUstreamBatchMemOpParams* doneParams, bool completeNow) {
   ncclResult_t ret = ncclSuccess;
   const int ctx = comm->config.numRmaCtx;
   auto* pc = (struct ncclRmaProxyCtx*)comm->rmaState.rmaProxyState.rmaProxyCtxs[ctx];
@@ -1609,10 +1609,11 @@ static ncclResult_t ncclHierRsSubmit(struct ncclComm* comm, struct ncclKernelPla
   struct ncclRmaProxyDesc* desc = nullptr;
   CUstreamBatchMemOpParams* batch = nullptr;
   const int startOps = ncclRmaProxyPutGroupStartNumOps(plan->persistent);
+  const int doneOps = completeNow ? ncclRmaProxyPutGroupDoneNumOps(plan->persistent) : 0;
   int idx = 0;
   NCCLCHECKGOTO(ncclCalloc(&ops, comm->nNodes - 1), ret, fail);
   NCCLCHECKGOTO(ncclCalloc(&desc, 1), ret, fail);
-  NCCLCHECKGOTO(ncclCalloc(&batch, startOps), ret, fail);
+  NCCLCHECKGOTO(ncclCalloc(&batch, startOps + doneOps), ret, fail);
   for (int n = 0; n < comm->nNodes; n++) {
     if (n == comm->node) continue;
     int peer = comm->nodeRanks[n].localRankToRank[comm->localRank];
@@ -1623,8 +1624,9 @@ static ncclResult_t ncclHierRsSubmit(struct ncclComm* comm, struct ncclKernelPla
   NCCLCHECKGOTO(ncclRmaProxyPutGroupBuildDesc(comm, pc, plan, idx, &ops, ctx, desc), ret, fail);
   NCCLCHECKGOTO(ncclRmaProxyPutGroupStartParams(desc, batch), ret, fail);
   NCCLCHECKGOTO(ncclRmaProxyPutGroupDoneParams(desc, doneParams), ret, fail);
+  if (completeNow) memcpy(batch + startOps, doneParams, doneOps * sizeof(*batch));
   NCCLCHECKGOTO(ncclRmaProxyEnqueueDesc(pc, &desc), ret, fail);
-  NCCLCHECKGOTO(ncclCuStreamBatchMemOp(stream, startOps, batch), ret, fail);
+  NCCLCHECKGOTO(ncclCuStreamBatchMemOp(stream, startOps + doneOps, batch), ret, fail);
 exit:
   if (desc != nullptr) (void)ncclRmaProxyDestroyDesc(comm, &desc);
   free(ops);
@@ -1703,13 +1705,15 @@ static ncclResult_t ncclHierCeReduceScatter(struct ncclComm* comm, struct ncclKe
       CUDACHECKGOTO(cudaMemcpyAsync(ce->ceRSTmpBuf + railOffset + comm->node * chunkBytes,
         ce->ceRSTmpBuf + partialOffset + comm->node * chunkBytes, bytes, cudaMemcpyDeviceToDevice, stream), ret, fail);
       NCCLCHECKGOTO(ncclHierRsSubmit(comm, plan, stream, partialOffset, railOffset, chunkBytes, bytes,
-        doneParams + slot * doneOps), ret, fail);
+        doneParams + slot * doneOps, depth == 1), ret, fail);
     }
     for (int slot = 0; slot < active; slot++) {
       const size_t offset = batchOffset + slot * chunkBytes;
       const size_t bytes = std::min(chunkBytes, shardBytes - offset);
       const size_t railOffset = slot * chunkStride + ((size_t)locals * nodes + nodes) * chunkBytes;
-      NCCLCHECKGOTO(ncclCuStreamBatchMemOp(stream, doneOps, doneParams + slot * doneOps), ret, fail);
+      if (depth > 1) {
+        NCCLCHECKGOTO(ncclCuStreamBatchMemOp(stream, doneOps, doneParams + slot * doneOps), ret, fail);
+      }
       for (int n = 0; n < nodes; n++) {
         if (n == comm->node) continue;
         int peer = comm->nodeRanks[n].localRankToRank[comm->localRank];
