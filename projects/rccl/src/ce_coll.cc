@@ -51,6 +51,7 @@ RCCL_PARAM(CeHierRsPipeline, "CE_HIER_RS_PIPELINE", 1);
 RCCL_PARAM(CeHierRsCompactTail, "CE_HIER_RS_COMPACT_TAIL", 0);
 RCCL_PARAM(CeHierRsCombinedWait, "CE_HIER_RS_COMBINED_WAIT", 0);
 RCCL_PARAM(CeHierRsNumCtx, "CE_HIER_RS_NUM_CTX", 1);
+RCCL_PARAM(CeHierRsDirectOutput, "CE_HIER_RS_DIRECT_OUTPUT", 0);
 
 #ifdef CE_BATCH_ASYNC_SUPPORTED
 // Runtime detection: does the running driver actually implement hipMemcpyBatchAsync?
@@ -1751,12 +1752,21 @@ static ncclResult_t ncclHierCeReduceScatter(struct ncclComm* comm, struct ncclKe
           NCCLCHECKGOTO(ncclProxyWaitOnePeer(comm, chunkPc, plan, chunkCtx, stream, peer, 1), ret, fail);
         }
       }
-      NCCLCHECKGOTO(ncclCeLaunchPersistentReduce(ce->ceRSTmpBuf + railOffset, ce->ceRSTmpBuf + resultOffset,
+      // Full vectors require aligned stores; odd element counts are handled
+      // by the reducer's scalar tail. Retain scratch for unaligned user views.
+      // All inputs for this chunk have already been scattered, so the output
+      // may also be the corresponding shard inside the original send buffer.
+      const bool directOutput = rcclParamCeHierRsDirectOutput() &&
+          reinterpret_cast<uintptr_t>(args->recvBuff + offset) % 16 == 0;
+      void* reduceOutput = directOutput ? (void*)(args->recvBuff + offset) :
+                                         (void*)(ce->ceRSTmpBuf + resultOffset);
+      NCCLCHECKGOTO(ncclCeLaunchPersistentReduce(ce->ceRSTmpBuf + railOffset, reduceOutput,
         nodes, bytes / args->eltSize, 0, 1, strideBytes / args->eltSize,
         nullptr, 1, nullptr, args->datatype, ncclSum, stream, 0), ret, fail);
-      // Aligned scratch supports odd shard lengths and unaligned outputs.
-      CUDACHECKGOTO(cudaMemcpyAsync(args->recvBuff + offset, ce->ceRSTmpBuf + resultOffset,
-        bytes, cudaMemcpyDeviceToDevice, stream), ret, fail);
+      if (!directOutput) {
+        CUDACHECKGOTO(cudaMemcpyAsync(args->recvBuff + offset, ce->ceRSTmpBuf + resultOffset,
+          bytes, cudaMemcpyDeviceToDevice, stream), ret, fail);
+      }
     }
   }
   NCCLCHECKGOTO(ncclMemOpSync(comm, stream, args), ret, fail);
