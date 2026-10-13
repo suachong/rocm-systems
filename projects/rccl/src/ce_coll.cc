@@ -42,6 +42,7 @@ ncclResult_t ncclCeLaunchPersistentReduce(const void* in, void* out, int nRanks,
 RCCL_PARAM(CeMultiStreams, "CE_MULTI_STREAMS", 0);
 RCCL_PARAM(CeBatchAsyncEnable, "CE_BATCH_ASYNC_ENABLE", -2);
 RCCL_PARAM(CeCoopLaunch, "CE_COOP_LAUNCH", 0);
+RCCL_PARAM(CePreferSdma, "CE_PREFER_SDMA", 0);
 RCCL_PARAM_DECLARE(CeAllReduce);
 RCCL_PARAM(CeHierReduceScatter, "CE_HIER_REDUCESCATTER", 0);
 RCCL_PARAM(CeHierRsStagingBytes, "CE_HIER_RS_STAGING_BYTES", 256 * 1024 * 1024);
@@ -821,6 +822,17 @@ ncclResult_t ncclCeLaunchBatchOps(struct ncclComm* comm, struct ncclCeBatchOpsPa
 #if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
       params->attrs[0].srcAccessOrder = hipMemcpySrcAccessOrderStream;
       params->attrs[0].flags = hipMemcpyFlagPreferOverlapWithCompute;
+#if HIP_VERSION_MAJOR > 7 || (HIP_VERSION_MAJOR == 7 && HIP_VERSION_MINOR >= 15)
+      // The generic overlap hint alone does not select SDMA in CLR. Keep this
+      // opt-in so the existing AG baseline retains its runtime copy heuristic.
+      if (rcclParamCePreferSdma()) params->attrs[0].flags |= hipMemcpyFlagExtPreferCE;
+#else
+      if (rcclParamCePreferSdma()) {
+        WARN("RCCL_CE_PREFER_SDMA requires HIP SDK 7.15 or newer");
+        ret = ncclInvalidUsage;
+        goto fail;
+      }
+#endif
 #else
       params->attrs[0].srcAccessOrder = cudaMemcpySrcAccessOrderStream;
       params->attrs[0].flags = cudaMemcpyFlagPreferOverlapWithCompute;
