@@ -1690,7 +1690,8 @@ static ncclResult_t ncclHierCeReduceScatter(struct ncclComm* comm, struct ncclKe
   const bool overlapLocal = depth > 1 && (rcclParamCeHierRsOverlapLocal() || rolling);
   const cudaStream_t reduceStream = overlapLocal ? ce->scatterStream : stream;
   const int numCtx = (int)std::max<int64_t>(1, std::min<int64_t>(rcclParamCeHierRsNumCtx(),
-      std::min(depth, comm->rmaState.rmaProxyState.numIntCtx)));
+      std::min(depth, comm->rmaState.rmaProxyState.numIntCtx - (rolling ? 1 : 0))));
+  const int creditCtx = ctx + comm->rmaState.rmaProxyState.numIntCtx - 1;
   const bool compactTail = rcclParamCeHierRsCompactTail() != 0;
   const int doneOps = ncclRmaProxyPutGroupDoneNumOps(plan->persistent);
   const size_t slotsPerChunk = (size_t)locals * nodes + 2 * nodes;
@@ -1701,7 +1702,8 @@ static ncclResult_t ncclHierCeReduceScatter(struct ncclComm* comm, struct ncclKe
   const size_t resultOffset = depth * chunkStride;
   CUstreamBatchMemOpParams* doneParams = nullptr;
   struct ncclCeBatchOpsParams copies = {};
-  if (!ce->ceRSTmpBuf || chunkBytes == 0 || args->redOp != ncclSum || plan->persistent) {
+  if (!ce->ceRSTmpBuf || chunkBytes == 0 || args->redOp != ncclSum || plan->persistent ||
+      (rolling && comm->rmaState.rmaProxyState.numIntCtx < 2)) {
     WARN("Hierarchical CE ReduceScatter: invalid staging, operation, or captured plan");
     return ncclInvalidUsage;
   }
@@ -1812,7 +1814,10 @@ static ncclResult_t ncclHierCeReduceScatter(struct ncclComm* comm, struct ncclKe
           // Retirement credit: every rail peer has consumed this slot before
           // anyone overwrites it. This is deliberately conservative (one rail
           // credit per recycled slot), not an unsafe deletion of batch barriers.
-          NCCLCHECKGOTO(ncclRailSync(comm, pc, plan, ctx, reduceStream), ret, fail);
+          // A dedicated context prevents later data signals from satisfying
+          // retirement waits while earlier chunks remain unconsumed.
+          auto* creditPc = (struct ncclRmaProxyCtx*)comm->rmaState.rmaProxyState.rmaProxyCtxs[creditCtx];
+          NCCLCHECKGOTO(ncclRailSync(comm, creditPc, plan, creditCtx, reduceStream), ret, fail);
           CUDACHECKGOTO(cudaEventRecord(ce->ceRSDone, reduceStream), ret, fail);
           CUDACHECKGOTO(cudaStreamWaitEvent(stream, ce->ceRSDone, 0), ret, fail);
           // All local readers must retire before CE writers reuse local input
