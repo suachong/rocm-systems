@@ -24,7 +24,7 @@ ncclResult_t ncclCeLocalReduceLaunch_${tag}_${redname}(const void* in, void* out
   const int threads = 256;
   // Single source of the block geometry, shared with the host-side reporting
   // wrapper (ncclCeLocalReduceBlocks_${tag}) so live dispatch and rcclGetCollImplInfo never drift.
-  const int blocks = ncclCeLocalReduceBlocksT<T>(baseChunkElems);
+  const int blocks = ncclCeLocalReduceBlocksT<T>(baseChunkElems, totalSteps == 1);
 
   // hipLaunchCooperativeKernel takes an array of pointers to the arguments,
   // so every kernel argument needs a stable host lvalue to point at.

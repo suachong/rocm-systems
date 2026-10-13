@@ -19,7 +19,7 @@
 // uses to size the signal buffer and slot strides. The guards let a build
 // override both consistently from the command line.
 #ifndef NCCL_CE_REDUCE_MAX_BLOCKS
-#define NCCL_CE_REDUCE_MAX_BLOCKS 46
+#define NCCL_CE_REDUCE_MAX_BLOCKS 92
 #endif
 
 #ifndef NCCL_CE_NUM_SLOTS
@@ -147,13 +147,14 @@ struct VecTrait<uint8_t> {
 // launcher and the host-side reporting wrapper so live dispatch and reporting
 // never drift.
 // *********************************************************************************
+int ncclCeFiniteReduceMaxBlocks();
 template <typename T>
-static inline int ncclCeLocalReduceBlocksT(size_t chunkElems) {
+static inline int ncclCeLocalReduceBlocksT(size_t chunkElems, bool finite = false) {
   constexpr int threads = 256;
   constexpr int UnrollFactor = VecTrait<T>::GpuUnroll;
   return (int)std::clamp<size_t>((chunkElems / VecTrait<T>::W + (size_t)threads * UnrollFactor - 1) /
                                    ((size_t)threads * UnrollFactor),
-                                 (size_t)1, (size_t)NCCL_CE_REDUCE_MAX_BLOCKS);
+                                 (size_t)1, (size_t)(finite ? ncclCeFiniteReduceMaxBlocks() : 46));
 }
 
 // *********************************************************************************

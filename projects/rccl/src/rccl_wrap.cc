@@ -1266,6 +1266,21 @@ ncclResult_t rcclSelectReduceScatter(struct ncclComm* comm, const void* sendbuff
   const size_t totalBytes = (size_t)comm->nRanks * recvcount * typeSize;
   const size_t rsShardBytes = recvcount * typeSize;
 
+  // Prefer registered hierarchical CE on the explicitly opted-in communicator.
+  // taskAppend rechecks capture and window eligibility before live dispatch.
+  if (op == ncclSum && (comm->config.CTAPolicy & NCCL_CTA_POLICY_ZERO)) {
+    struct ncclDevrWindow* sendWin = nullptr;
+    struct ncclDevrWindow* recvWin = nullptr;
+    ncclDevrFindWindow(comm, sendbuff, &sendWin);
+    ncclDevrFindWindow(comm, recvbuff, &recvWin);
+    ncclSymRegType_t winRegType;
+    NCCLCHECK(ncclGetSymRegType(sendWin, recvWin, &winRegType));
+    if (ncclHierCeAvailable(comm, ncclFuncReduceScatter, ncclDevSum, datatype, winRegType, sendWin, recvWin)) {
+      decision->algo = RCCL_CE_REGISTERED;
+      return ncclSuccess;
+    }
+  }
+
   // (1) Symmetric eligibility (sum/avg). Reported last but gates DDA IPC / Direct here.
   const bool symEligible =
     (op == ncclSum || op == ncclAvg) &&

@@ -33,6 +33,8 @@ THE SOFTWARE.
 // enough that they used to dominate the entire build's wall-clock time).
 #include <hip/hip_runtime.h>
 #include <stdint.h>
+#include <cstdlib>
+#include <algorithm>
 
 #include "nccl.h"
 
@@ -150,4 +152,13 @@ int ncclCeLocalReduceBlocks(ncclDataType_t datatype, size_t chunkElems) {
   default:
     return 0;
   }
+}
+
+// User's measured finite-reducer baseline; persistent kernels retain 46 CTAs.
+int ncclCeFiniteReduceMaxBlocks() {
+  static const int blocks = [] {
+    const char* value = std::getenv("RCCL_CE_REDUCE_MAX_BLOCKS");
+    return value ? std::clamp(std::atoi(value), 1, 92) : 64;
+  }();
+  return blocks;
 }

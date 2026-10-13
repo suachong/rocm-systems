@@ -31,7 +31,7 @@
 #define NCCL_CE_AR_STAGING_BYTES (16ull * 1024 * 1024)
 
 #ifndef NCCL_CE_REDUCE_MAX_BLOCKS
-#define NCCL_CE_REDUCE_MAX_BLOCKS 46
+#define NCCL_CE_REDUCE_MAX_BLOCKS 92
 #endif
 
 #ifndef NCCL_CE_NUM_SLOTS
@@ -99,6 +99,11 @@ struct ncclCeColl {
   // CE AllReduce staging buffer (symmetric), double-buffered scatter staging:
   // Layout: [slot 0: nRanks chunks][slot 1: nRanks chunks], slot stride = nRanks*chunkBytes.
   // The reduced result is written straight into the user recvbuff (no scratch).
+  // Hierarchical ReduceScatter: local inputs, local partials, rail inputs,
+  // and aligned result scratch. Registered during CE init, never at launch.
+  uint8_t* ceRSTmpBuf;
+  struct ncclDevrWindow* ceRSTmpWin;
+  size_t ceRSTmpBytes;
   uint8_t* ceARTmpBuf;
   struct ncclDevrWindow* ceARTmpWin;
   uint32_t* signalBuffer;
