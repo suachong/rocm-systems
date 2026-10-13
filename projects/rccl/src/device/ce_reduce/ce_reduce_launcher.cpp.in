@@ -34,6 +34,21 @@ ncclResult_t ncclCeLocalReduceLaunch_${tag}_${redname}(const void* in, void* out
 
   (void)hipGetLastError();
   hipError_t e;
+  if constexpr (std::is_same<T, hip_bfloat16>::value && $redval == 0) {
+    if (ncclCeFiniteFp32AccumEnable() && totalSteps == 1 && chunksPerShard == 1 && tailChunkElems == 0 &&
+        signalBuffer == nullptr && d_barrierSync == nullptr && !useCoopLaunch &&
+        (nRanks == 4 || nRanks == 8) && slotChunkElems % 8 == 0 &&
+        reinterpret_cast<uintptr_t>(inT) % 16 == 0 && reinterpret_cast<uintptr_t>(outT) % 16 == 0) {
+      if (nRanks == 8) {
+        hipLaunchKernelGGL((ncclCeFiniteSumFp32Accum<T, 8>), dim3(blocks), dim3(threads), 0, stream,
+                          inT, outT, baseChunkElems, slotChunkElems);
+      } else {
+        hipLaunchKernelGGL((ncclCeFiniteSumFp32Accum<T, 4>), dim3(blocks), dim3(threads), 0, stream,
+                          inT, outT, baseChunkElems, slotChunkElems);
+      }
+      return hipGetLastError() == hipSuccess ? ncclSuccess : ncclUnhandledCudaError;
+    }
+  }
   if (useCoopLaunch) {
     void* kernelArgs[] = {
       &inT,          &outT,       &nRanks,        &baseChunkElems, &tailChunkElems, &chunksPerShard, &slotChunkElems,

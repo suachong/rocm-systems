@@ -14,6 +14,7 @@
 #include <hip/hip_cooperative_groups.h>
 #include <stdint.h>
 #include <algorithm>
+#include <type_traits>
 
 // Kept in sync with src/include/ce_coll.h, which the host side (ce_coll.cc)
 // uses to size the signal buffer and slot strides. The guards let a build
@@ -148,6 +149,7 @@ struct VecTrait<uint8_t> {
 // never drift.
 // *********************************************************************************
 int ncclCeFiniteReduceMaxBlocks();
+int ncclCeFiniteFp32AccumEnable();
 template <typename T>
 static inline int ncclCeLocalReduceBlocksT(size_t chunkElems, bool finite = false) {
   constexpr int threads = 256;
@@ -189,6 +191,45 @@ struct ReduceOp<T, 3> {
     return a > b ? a : b;
   }
 };
+
+// Optional finite BF16 SUM: FP32 accumulation rounds once per local/rail
+// reduction instead of after every addition. This changes intermediate
+// rounding and must be validated separately in training. Compile-time peer
+// counts eliminate the persistent kernel's polling/barrier/step machinery.
+template <typename T, int Ranks>
+__global__ __launch_bounds__(256) void ncclCeFiniteSumFp32Accum(
+    const T* __restrict__ in, T* __restrict__ out, size_t count, size_t rankStride) {
+  union alignas(16) Pack {
+    uint4 vec;
+    T values[8];
+  };
+  const size_t tid = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  const size_t step = (size_t)blockDim.x * gridDim.x;
+  const size_t vectors = count / 8;
+  for (size_t index = tid; index < vectors; index += step) {
+    Pack value;
+    value.vec = *reinterpret_cast<const uint4*>(in + index * 8);
+    float accum[8];
+#pragma unroll
+    for (int k = 0; k < 8; k++) accum[k] = float(value.values[k]);
+#pragma unroll
+    for (int rank = 1; rank < Ranks; rank++) {
+      value.vec = *reinterpret_cast<const uint4*>(in + rank * rankStride + index * 8);
+#pragma unroll
+      for (int k = 0; k < 8; k++) accum[k] += float(value.values[k]);
+    }
+#pragma unroll
+    for (int k = 0; k < 8; k++) value.values[k] = T(accum[k]);
+    *reinterpret_cast<uint4*>(out + index * 8) = value.vec;
+  }
+  const size_t tail = vectors * 8 + tid;
+  if (tail < count) {
+    float accum = float(in[tail]);
+#pragma unroll
+    for (int rank = 1; rank < Ranks; rank++) accum += float(in[rank * rankStride + tail]);
+    out[tail] = T(accum);
+  }
+}
 
 // *********************************************************************************
 // ncclCeLocalReduceKernelVec<T, RedOp, U>

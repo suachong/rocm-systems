@@ -162,3 +162,11 @@ int ncclCeFiniteReduceMaxBlocks() {
   }();
   return blocks;
 }
+
+int ncclCeFiniteFp32AccumEnable() {
+  static const int enabled = [] {
+    const char* value = std::getenv("RCCL_CE_HIER_RS_FP32_ACCUM");
+    return value && std::atoi(value) != 0;
+  }();
+  return enabled;
+}

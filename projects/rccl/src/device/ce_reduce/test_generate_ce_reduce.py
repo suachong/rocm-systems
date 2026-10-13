@@ -290,7 +290,7 @@ class CeReducePersistentContractTest(unittest.TestCase):
         return [_trailing_identifier(p) for p in _split_top_level(m.group(1))]
 
     def _ggl_arguments(self) -> list[str]:
-        m = re.search(r"hipLaunchKernelGGL\(.*?0,\s*stream,\s*(.*?)\);", self.launcher, re.S)
+        m = re.search(r"hipLaunchKernelGGL\(\(ncclCeLocalReduceKernelVec<.*?0,\s*stream,\s*(.*?)\);", self.launcher, re.S)
         self.assertIsNotNone(m, "hipLaunchKernelGGL call not found in the generated launcher")
         assert m is not None
         return [a.strip() for a in m.group(1).split(",") if a.strip()]
