@@ -152,9 +152,11 @@ template <typename T>
 static inline int ncclCeLocalReduceBlocksT(size_t chunkElems, bool finite = false) {
   constexpr int threads = 256;
   constexpr int UnrollFactor = VecTrait<T>::GpuUnroll;
+  // Honor a smaller build-time cap as well: the kernel's entry guard uses it.
+  const int cap = std::min((int)NCCL_CE_REDUCE_MAX_BLOCKS, finite ? ncclCeFiniteReduceMaxBlocks() : 46);
   return (int)std::clamp<size_t>((chunkElems / VecTrait<T>::W + (size_t)threads * UnrollFactor - 1) /
                                    ((size_t)threads * UnrollFactor),
-                                 (size_t)1, (size_t)(finite ? ncclCeFiniteReduceMaxBlocks() : 46));
+                                 (size_t)1, (size_t)cap);
 }
 
 // *********************************************************************************
