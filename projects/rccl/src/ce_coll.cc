@@ -53,6 +53,7 @@ RCCL_PARAM(CeHierRsCombinedWait, "CE_HIER_RS_COMBINED_WAIT", 0);
 RCCL_PARAM(CeHierRsNumCtx, "CE_HIER_RS_NUM_CTX", 1);
 RCCL_PARAM(CeHierRsDirectOutput, "CE_HIER_RS_DIRECT_OUTPUT", 0);
 RCCL_PARAM(CeHierRsOverlapLocal, "CE_HIER_RS_OVERLAP_LOCAL", 0);
+RCCL_PARAM(CeHierRsRolling, "CE_HIER_RS_ROLLING", 0);
 
 #ifdef CE_BATCH_ASYNC_SUPPORTED
 // Runtime detection: does the running driver actually implement hipMemcpyBatchAsync?
@@ -217,7 +218,7 @@ ncclResult_t ncclCeInit(struct ncclComm* comm) {
     comm->ceColl.ceRSTmpWin = (struct ncclDevrWindow*)rsWinHost->winHost;
     comm->ceColl.ceRSTmpBuf = (uint8_t*)comm->ceColl.ceRSTmpWin->userPtr;
     CUDACHECKGOTO(hipMemset(comm->ceColl.ceRSTmpBuf, 0, capacity), ret, fail);
-    if (rcclParamCeHierRsOverlapLocal()) {
+    if (rcclParamCeHierRsOverlapLocal() || rcclParamCeHierRsRolling()) {
       for (int slot = 0; slot < RCCL_CE_HIER_RS_MAX_PIPELINE; slot++) {
         CUDACHECKGOTO(cudaEventCreateWithFlags(&comm->ceColl.ceRSReady[slot], cudaEventDisableTiming), ret, fail);
       }
@@ -1685,7 +1686,8 @@ static ncclResult_t ncclHierCeReduceScatter(struct ncclComm* comm, struct ncclKe
   auto* pc = (struct ncclRmaProxyCtx*)comm->rmaState.rmaProxyState.rmaProxyCtxs[ctx];
   const size_t shardBytes = args->nElts * args->eltSize;
   const int depth = (int)std::max<int64_t>(1, std::min<int64_t>(RCCL_CE_HIER_RS_MAX_PIPELINE, rcclParamCeHierRsPipeline()));
-  const bool overlapLocal = depth > 1 && rcclParamCeHierRsOverlapLocal();
+  const bool rolling = depth > 1 && rcclParamCeHierRsRolling();
+  const bool overlapLocal = depth > 1 && (rcclParamCeHierRsOverlapLocal() || rolling);
   const cudaStream_t reduceStream = overlapLocal ? ce->scatterStream : stream;
   const int numCtx = (int)std::max<int64_t>(1, std::min<int64_t>(rcclParamCeHierRsNumCtx(),
       std::min(depth, comm->rmaState.rmaProxyState.numIntCtx)));
@@ -1708,16 +1710,14 @@ static ncclResult_t ncclHierCeReduceScatter(struct ncclComm* comm, struct ncclKe
   const int lsaBase = comm->rank - comm->devrState.lsaSelf;
   NCCLCHECKGOTO(ncclCeInitBatchOpsParams(&copies, locals * nodes), ret, fail);
   NCCLCHECKGOTO(ncclCalloc(&doneParams, depth * doneOps), ret, fail);
-  INFO(NCCL_COLL, "[Hierarchical CE RS] rank=%d nodes=%d locals=%d shard=%zu chunk=%zu pipeline=%d compact_tail=%d contexts=%d overlap_local=%d finite=1 rma=1",
-       comm->rank, nodes, locals, shardBytes, chunkBytes, depth, (int)compactTail, numCtx, (int)overlapLocal);
-  for (size_t batchOffset = 0; batchOffset < shardBytes; batchOffset += depth * chunkBytes) {
-    const int active = (int)std::min((size_t)depth, DIVUP(shardBytes - batchOffset, chunkBytes));
-    // Entry credit protects every slot from the preceding batch/call. All
-    // local barriers stay on one stream and use the existing sequence counter.
-    NCCLCHECKGOTO(ncclRailSync(comm, pc, plan, ctx, stream), ret, fail);
-    NCCLCHECKGOTO(ncclMemOpSync(comm, stream, args), ret, fail);
-    for (int slot = 0; slot < active; slot++) {
-      const size_t offset = batchOffset + slot * chunkBytes;
+  INFO(NCCL_COLL, "[Hierarchical CE RS] rank=%d nodes=%d locals=%d shard=%zu chunk=%zu pipeline=%d compact_tail=%d contexts=%d overlap_local=%d rolling=%d finite=1 rma=1",
+       comm->rank, nodes, locals, shardBytes, chunkBytes, depth, (int)compactTail, numCtx, (int)overlapLocal, (int)rolling);
+  {
+    // The same chunk operations serve both schedulers. Only their ordering
+    // changes; all completion fences still precede staging-slot reuse.
+    auto submit = [&](size_t chunk) -> ncclResult_t {
+      const int slot = chunk % depth;
+      const size_t offset = chunk * chunkBytes;
       const size_t bytes = std::min(chunkBytes, shardBytes - offset);
       // Retain fixed pipeline slot spacing, but reduce only the aligned tail
       // inside that slot. Every node derives the same compact layout.
@@ -1732,55 +1732,57 @@ static ncclResult_t ncclHierCeReduceScatter(struct ncclComm* comm, struct ncclKe
           void* dst = nullptr;
           const size_t dstOff = inputOffset + ((size_t)comm->localRank * nodes + n) * strideBytes;
           const int target = comm->nodeRanks[n].localRankToRank[l];
-          NCCLCHECKGOTO(ncclDevrGetLsaRankPtr(comm, ce->ceRSTmpWin, dstOff, lsaRank, &dst), ret, fail);
+          NCCLCHECK(ncclDevrGetLsaRankPtr(comm, ce->ceRSTmpWin, dstOff, lsaRank, &dst));
           copies.srcs[copies.numOps] = args->sendBuff + (size_t)target * shardBytes + offset;
           copies.dsts[copies.numOps] = dst;
           copies.sizes[copies.numOps++] = bytes;
         }
       }
-      NCCLCHECKGOTO(ncclCeLaunchBatchOps(comm, &copies, stream, args), ret, fail);
-      NCCLCHECKGOTO(ncclMemOpSync(comm, stream, args), ret, fail);
+      NCCLCHECK(ncclCeLaunchBatchOps(comm, &copies, stream, args));
+      NCCLCHECK(ncclMemOpSync(comm, stream, args));
       if (overlapLocal) {
         // The caller retains every local copy/barrier in sequence. A distinct
         // event per slot lets its next copy run while the previous slot is
         // reduced and submitted to RMA on the auxiliary stream.
-        CUDACHECKGOTO(cudaEventRecord(ce->ceRSReady[slot], stream), ret, fail);
-        CUDACHECKGOTO(cudaStreamWaitEvent(reduceStream, ce->ceRSReady[slot], 0), ret, fail);
+        CUDACHECK(cudaEventRecord(ce->ceRSReady[slot], stream));
+        CUDACHECK(cudaStreamWaitEvent(reduceStream, ce->ceRSReady[slot], 0));
       }
       // totalSteps=1 disables polling and cross-block barriers (PR #12545).
-      NCCLCHECKGOTO(ncclCeLaunchPersistentReduce(ce->ceRSTmpBuf + inputOffset, ce->ceRSTmpBuf + partialOffset,
+      NCCLCHECK(ncclCeLaunchPersistentReduce(ce->ceRSTmpBuf + inputOffset, ce->ceRSTmpBuf + partialOffset,
         locals, nodes * strideBytes / args->eltSize, 0, 1, nodes * strideBytes / args->eltSize,
-        nullptr, 1, nullptr, args->datatype, ncclSum, reduceStream, 0), ret, fail);
-      CUDACHECKGOTO(cudaMemcpyAsync(ce->ceRSTmpBuf + railOffset + comm->node * strideBytes,
-        ce->ceRSTmpBuf + partialOffset + comm->node * strideBytes, bytes, cudaMemcpyDeviceToDevice, reduceStream), ret, fail);
+        nullptr, 1, nullptr, args->datatype, ncclSum, reduceStream, 0));
+      CUDACHECK(cudaMemcpyAsync(ce->ceRSTmpBuf + railOffset + comm->node * strideBytes,
+        ce->ceRSTmpBuf + partialOffset + comm->node * strideBytes, bytes, cudaMemcpyDeviceToDevice, reduceStream));
       // Each chunk uses the same context on all nodes. Per-context signal
       // order is preserved; the base-context entry credit protects every
       // staging slot before reuse even when other contexts carried its data.
       const int chunkCtx = ctx + (int)((offset / chunkBytes) % numCtx);
-      NCCLCHECKGOTO(ncclHierRsSubmit(comm, plan, reduceStream, chunkCtx, partialOffset, railOffset, strideBytes, bytes,
-        doneParams + slot * doneOps, depth == 1), ret, fail);
-    }
-    for (int slot = 0; slot < active; slot++) {
-      const size_t offset = batchOffset + slot * chunkBytes;
+      NCCLCHECK(ncclHierRsSubmit(comm, plan, reduceStream, chunkCtx, partialOffset, railOffset, strideBytes, bytes,
+        doneParams + slot * doneOps, depth == 1));
+      return ncclSuccess;
+    };
+    auto finish = [&](size_t chunk) -> ncclResult_t {
+      const int slot = chunk % depth;
+      const size_t offset = chunk * chunkBytes;
       const size_t bytes = std::min(chunkBytes, shardBytes - offset);
       const size_t strideBytes = compactTail ? alignUp(bytes, (size_t)16) : chunkBytes;
       const size_t railOffset = slot * chunkStride + ((size_t)locals * nodes + nodes) * strideBytes;
       const int chunkCtx = ctx + (int)((offset / chunkBytes) % numCtx);
       auto* chunkPc = (struct ncclRmaProxyCtx*)comm->rmaState.rmaProxyState.rmaProxyCtxs[chunkCtx];
       if (depth > 1) {
-        NCCLCHECKGOTO(ncclCuStreamBatchMemOp(reduceStream, doneOps, doneParams + slot * doneOps), ret, fail);
+        NCCLCHECK(ncclCuStreamBatchMemOp(reduceStream, doneOps, doneParams + slot * doneOps));
       }
       if (rcclParamCeHierRsCombinedWait()) {
         std::vector<int> peers;
         for (int n = 0; n < nodes; n++) {
           if (n != comm->node) peers.push_back(comm->nodeRanks[n].localRankToRank[comm->localRank]);
         }
-        NCCLCHECKGOTO(ncclProxyWaitPeers(comm, chunkPc, plan, chunkCtx, reduceStream, peers.size(), peers.data(), 1), ret, fail);
+        NCCLCHECK(ncclProxyWaitPeers(comm, chunkPc, plan, chunkCtx, reduceStream, peers.size(), peers.data(), 1));
       } else {
         for (int n = 0; n < nodes; n++) {
           if (n == comm->node) continue;
           int peer = comm->nodeRanks[n].localRankToRank[comm->localRank];
-          NCCLCHECKGOTO(ncclProxyWaitOnePeer(comm, chunkPc, plan, chunkCtx, reduceStream, peer, 1), ret, fail);
+          NCCLCHECK(ncclProxyWaitOnePeer(comm, chunkPc, plan, chunkCtx, reduceStream, peer, 1));
         }
       }
       // Full vectors require aligned stores; odd element counts are handled
@@ -1791,19 +1793,51 @@ static ncclResult_t ncclHierCeReduceScatter(struct ncclComm* comm, struct ncclKe
           reinterpret_cast<uintptr_t>(args->recvBuff + offset) % 16 == 0;
       void* reduceOutput = directOutput ? (void*)(args->recvBuff + offset) :
                                          (void*)(ce->ceRSTmpBuf + resultOffset);
-      NCCLCHECKGOTO(ncclCeLaunchPersistentReduce(ce->ceRSTmpBuf + railOffset, reduceOutput,
+      NCCLCHECK(ncclCeLaunchPersistentReduce(ce->ceRSTmpBuf + railOffset, reduceOutput,
         nodes, bytes / args->eltSize, 0, 1, strideBytes / args->eltSize,
-        nullptr, 1, nullptr, args->datatype, ncclSum, reduceStream, 0), ret, fail);
+        nullptr, 1, nullptr, args->datatype, ncclSum, reduceStream, 0));
       if (!directOutput) {
-        CUDACHECKGOTO(cudaMemcpyAsync(args->recvBuff + offset, ce->ceRSTmpBuf + resultOffset,
-          bytes, cudaMemcpyDeviceToDevice, reduceStream), ret, fail);
+        CUDACHECK(cudaMemcpyAsync(args->recvBuff + offset, ce->ceRSTmpBuf + resultOffset,
+          bytes, cudaMemcpyDeviceToDevice, reduceStream));
       }
-    }
-    if (overlapLocal) {
-      // Rejoin before entry credit or staging/event reuse, and before reporting
-      // completion on the caller stream. No host/device-wide sync is needed.
+      return ncclSuccess;
+    };
+    const size_t chunks = DIVUP(shardBytes, chunkBytes);
+    if (rolling) {
+      NCCLCHECKGOTO(ncclRailSync(comm, pc, plan, ctx, stream), ret, fail);
+      NCCLCHECKGOTO(ncclMemOpSync(comm, stream, args), ret, fail);
+      for (size_t chunk = 0; chunk < chunks; chunk++) {
+        if (chunk >= (size_t)depth) {
+          NCCLCHECKGOTO(finish(chunk - depth), ret, fail);
+          // Retirement credit: every rail peer has consumed this slot before
+          // anyone overwrites it. This is deliberately conservative (one rail
+          // credit per recycled slot), not an unsafe deletion of batch barriers.
+          NCCLCHECKGOTO(ncclRailSync(comm, pc, plan, ctx, reduceStream), ret, fail);
+          CUDACHECKGOTO(cudaEventRecord(ce->ceRSDone, reduceStream), ret, fail);
+          CUDACHECKGOTO(cudaStreamWaitEvent(stream, ce->ceRSDone, 0), ret, fail);
+          // All local readers must retire before CE writers reuse local input
+          // staging. Keep every local barrier on the caller stream in order.
+          NCCLCHECKGOTO(ncclMemOpSync(comm, stream, args), ret, fail);
+        }
+        NCCLCHECKGOTO(submit(chunk), ret, fail);
+      }
+      for (size_t chunk = chunks > (size_t)depth ? chunks - depth : 0; chunk < chunks; chunk++) {
+        NCCLCHECKGOTO(finish(chunk), ret, fail);
+      }
       CUDACHECKGOTO(cudaEventRecord(ce->ceRSDone, reduceStream), ret, fail);
       CUDACHECKGOTO(cudaStreamWaitEvent(stream, ce->ceRSDone, 0), ret, fail);
+    } else {
+      for (size_t first = 0; first < chunks; first += depth) {
+        const size_t end = std::min(chunks, first + depth);
+        NCCLCHECKGOTO(ncclRailSync(comm, pc, plan, ctx, stream), ret, fail);
+        NCCLCHECKGOTO(ncclMemOpSync(comm, stream, args), ret, fail);
+        for (size_t chunk = first; chunk < end; chunk++) NCCLCHECKGOTO(submit(chunk), ret, fail);
+        for (size_t chunk = first; chunk < end; chunk++) NCCLCHECKGOTO(finish(chunk), ret, fail);
+        if (overlapLocal) {
+          CUDACHECKGOTO(cudaEventRecord(ce->ceRSDone, reduceStream), ret, fail);
+          CUDACHECKGOTO(cudaStreamWaitEvent(stream, ce->ceRSDone, 0), ret, fail);
+        }
+      }
     }
   }
   NCCLCHECKGOTO(ncclMemOpSync(comm, stream, args), ret, fail);
