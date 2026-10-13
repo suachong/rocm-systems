@@ -1,0 +1,50 @@
+
+#include "ce_rs_peer.h"
+
+// Read each source GPU directly, write only the four reduced rail partials.
+// Unaligned user views and the last vector use scalar loads/stores.
+template <typename T, int W>
+__global__ __launch_bounds__(256) void ncclCeRsPeerSum(ncclCeRsPeerArgs a, T* out, bool aligned) {
+  union alignas(16) Pack { uint4 vec; T values[W]; };
+  const size_t vectors = a.stride / W;
+  for (size_t v = (size_t)blockIdx.x * blockDim.x + threadIdx.x; v < 4 * vectors;
+       v += (size_t)gridDim.x * blockDim.x) {
+    const int node = v / vectors;
+    const size_t i = (v % vectors) * W;
+    float sums[W] = {};
+#pragma unroll
+    for (int rank = 0; rank < 8; rank++) {
+      const T* src = static_cast<const T*>(a.peers[rank]) + a.targetOffsets[node] + i;
+      Pack value;
+      if (aligned && i + W <= a.count) {
+        value.vec = *reinterpret_cast<const uint4*>(src);
+      } else {
+#pragma unroll
+        for (int k = 0; k < W; k++) value.values[k] = i + k < a.count ? src[k] : T(0.0f);
+      }
+#pragma unroll
+      for (int k = 0; k < W; k++) sums[k] += float(value.values[k]);
+    }
+    Pack result;
+#pragma unroll
+    for (int k = 0; k < W; k++) result.values[k] = T(sums[k]);
+    *reinterpret_cast<uint4*>(out + node * a.stride + i) = result.vec;
+  }
+}
+
+ncclResult_t ncclCeRsPeerLaunch_${tag}(ncclCeRsPeerArgs args, void* out, hipStream_t stream) {
+  using T = $ctype;
+  constexpr int width = 16 / sizeof(T);
+  if (args.stride % width || reinterpret_cast<uintptr_t>(out) % 16) return ncclInvalidArgument;
+  if (args.count == 0) return ncclSuccess;
+  bool aligned = true;
+  for (int r = 0; r < 8; r++) {
+    for (int n = 0; n < 4; n++) {
+      aligned &= (reinterpret_cast<uintptr_t>(args.peers[r]) + args.targetOffsets[n] * sizeof(T)) % 16 == 0;
+    }
+  }
+  int blocks = std::min(ncclCeFiniteReduceMaxBlocks(), (int)((4 * args.stride / width + 255) / 256));
+  hipLaunchKernelGGL((ncclCeRsPeerSum<T, width>), dim3(blocks), dim3(256), 0, stream,
+                    args, static_cast<T*>(out), aligned);
+  return hipGetLastError() == hipSuccess ? ncclSuccess : ncclUnhandledCudaError;
+}

@@ -12,6 +12,10 @@
 #include <cuda.h>
 #include "rocmwrap.h"
 #include "ce_coll.h"
+#include "ce_rs_peer.h"
+ncclResult_t ncclCeRsPeerLaunch_bf16(ncclCeRsPeerArgs, void*, hipStream_t);
+ncclResult_t ncclCeRsPeerLaunch_f32(ncclCeRsPeerArgs, void*, hipStream_t);
+int ncclCeFiniteFp32AccumEnable();
 #include "alltoallv_meta.h"
 #include "group.h"
 #include "alloc.h"
@@ -54,6 +58,7 @@ RCCL_PARAM(CeHierRsNumCtx, "CE_HIER_RS_NUM_CTX", 1);
 RCCL_PARAM(CeHierRsDirectOutput, "CE_HIER_RS_DIRECT_OUTPUT", 0);
 RCCL_PARAM(CeHierRsOverlapLocal, "CE_HIER_RS_OVERLAP_LOCAL", 0);
 RCCL_PARAM(CeHierRsRolling, "CE_HIER_RS_ROLLING", 0);
+RCCL_PARAM(CeHierRsPeerRead, "CE_HIER_RS_PEER_READ", 0);
 
 #ifdef CE_BATCH_ASYNC_SUPPORTED
 // Runtime detection: does the running driver actually implement hipMemcpyBatchAsync?
@@ -1687,6 +1692,8 @@ static ncclResult_t ncclHierCeReduceScatter(struct ncclComm* comm, struct ncclKe
   const size_t shardBytes = args->nElts * args->eltSize;
   const int depth = (int)std::max<int64_t>(1, std::min<int64_t>(RCCL_CE_HIER_RS_MAX_PIPELINE, rcclParamCeHierRsPipeline()));
   const bool rolling = depth > 1 && rcclParamCeHierRsRolling();
+  const bool peerRead = rcclParamCeHierRsPeerRead();
+  ncclCeRsPeerArgs peerArgs = {};
   const bool overlapLocal = depth > 1 && (rcclParamCeHierRsOverlapLocal() || rolling);
   const cudaStream_t reduceStream = overlapLocal ? ce->scatterStream : stream;
   const int numCtx = (int)std::max<int64_t>(1, std::min<int64_t>(rcclParamCeHierRsNumCtx(),
@@ -1707,13 +1714,28 @@ static ncclResult_t ncclHierCeReduceScatter(struct ncclComm* comm, struct ncclKe
     WARN("Hierarchical CE ReduceScatter: invalid staging, operation, or captured plan");
     return ncclInvalidUsage;
   }
+  if (peerRead && (locals != 8 || nodes != 4 ||
+      (args->datatype != ncclFloat32 && args->datatype != ncclBfloat16) ||
+      (args->datatype == ncclBfloat16 && !ncclCeFiniteFp32AccumEnable()))) {
+    WARN("CE RS peer reads require 4x8 topology, FP32/BF16 SUM and BF16 FP32 accumulation");
+    return ncclInvalidUsage;
+  }
   // LSA ranks are consecutive world ranks. Resolve every destination through
   // the local rank table rather than assuming local rank order equals LSA order.
   const int lsaBase = comm->rank - comm->devrState.lsaSelf;
+  if (peerRead) {
+    size_t sendOffset = args->sendBuff - (uint8_t*)args->sendWin->userPtr;
+    for (int l = 0; l < locals; l++) {
+      void* ptr = nullptr;
+      int lsaRank = comm->nodeRanks[comm->node].localRankToRank[l] - lsaBase;
+      NCCLCHECKGOTO(ncclDevrGetLsaRankPtr(comm, args->sendWin, sendOffset, lsaRank, &ptr), ret, fail);
+      peerArgs.peers[l] = ptr;
+    }
+  }
   NCCLCHECKGOTO(ncclCeInitBatchOpsParams(&copies, locals * nodes), ret, fail);
   NCCLCHECKGOTO(ncclCalloc(&doneParams, depth * doneOps), ret, fail);
-  INFO(NCCL_COLL, "[Hierarchical CE RS] rank=%d nodes=%d locals=%d shard=%zu chunk=%zu pipeline=%d compact_tail=%d contexts=%d overlap_local=%d rolling=%d finite=1 rma=1",
-       comm->rank, nodes, locals, shardBytes, chunkBytes, depth, (int)compactTail, numCtx, (int)overlapLocal, (int)rolling);
+  INFO(NCCL_COLL, "[Hierarchical CE RS] rank=%d nodes=%d locals=%d shard=%zu chunk=%zu pipeline=%d compact_tail=%d contexts=%d overlap_local=%d rolling=%d peer_read=%d finite=1 rma=1",
+       comm->rank, nodes, locals, shardBytes, chunkBytes, depth, (int)compactTail, numCtx, (int)overlapLocal, (int)rolling, (int)peerRead);
   {
     // The same chunk operations serve both schedulers. Only their ordering
     // changes; all completion fences still precede staging-slot reuse.
@@ -1727,21 +1749,23 @@ static ncclResult_t ncclHierCeReduceScatter(struct ncclComm* comm, struct ncclKe
       const size_t inputOffset = slot * chunkStride;
       const size_t partialOffset = inputOffset + (size_t)locals * nodes * strideBytes;
       const size_t railOffset = partialOffset + nodes * strideBytes;
-      copies.numOps = 0;
-      for (int l = 0; l < locals; l++) {
-        int lsaRank = comm->nodeRanks[comm->node].localRankToRank[l] - lsaBase;
-        for (int n = 0; n < nodes; n++) {
-          void* dst = nullptr;
-          const size_t dstOff = inputOffset + ((size_t)comm->localRank * nodes + n) * strideBytes;
-          const int target = comm->nodeRanks[n].localRankToRank[l];
-          NCCLCHECK(ncclDevrGetLsaRankPtr(comm, ce->ceRSTmpWin, dstOff, lsaRank, &dst));
-          copies.srcs[copies.numOps] = args->sendBuff + (size_t)target * shardBytes + offset;
-          copies.dsts[copies.numOps] = dst;
-          copies.sizes[copies.numOps++] = bytes;
+      if (!peerRead) {
+        copies.numOps = 0;
+        for (int l = 0; l < locals; l++) {
+          int lsaRank = comm->nodeRanks[comm->node].localRankToRank[l] - lsaBase;
+          for (int n = 0; n < nodes; n++) {
+            void* dst = nullptr;
+            const size_t dstOff = inputOffset + ((size_t)comm->localRank * nodes + n) * strideBytes;
+            const int target = comm->nodeRanks[n].localRankToRank[l];
+            NCCLCHECK(ncclDevrGetLsaRankPtr(comm, ce->ceRSTmpWin, dstOff, lsaRank, &dst));
+            copies.srcs[copies.numOps] = args->sendBuff + (size_t)target * shardBytes + offset;
+            copies.dsts[copies.numOps] = dst;
+            copies.sizes[copies.numOps++] = bytes;
+          }
         }
+        NCCLCHECK(ncclCeLaunchBatchOps(comm, &copies, stream, args));
+        NCCLCHECK(ncclMemOpSync(comm, stream, args));
       }
-      NCCLCHECK(ncclCeLaunchBatchOps(comm, &copies, stream, args));
-      NCCLCHECK(ncclMemOpSync(comm, stream, args));
       if (overlapLocal) {
         // The caller retains every local copy/barrier in sequence. A distinct
         // event per slot lets its next copy run while the previous slot is
@@ -1749,10 +1773,25 @@ static ncclResult_t ncclHierCeReduceScatter(struct ncclComm* comm, struct ncclKe
         CUDACHECK(cudaEventRecord(ce->ceRSReady[slot], stream));
         CUDACHECK(cudaStreamWaitEvent(reduceStream, ce->ceRSReady[slot], 0));
       }
-      // totalSteps=1 disables polling and cross-block barriers (PR #12545).
-      NCCLCHECK(ncclCeLaunchPersistentReduce(ce->ceRSTmpBuf + inputOffset, ce->ceRSTmpBuf + partialOffset,
-        locals, nodes * strideBytes / args->eltSize, 0, 1, nodes * strideBytes / args->eltSize,
-        nullptr, 1, nullptr, args->datatype, ncclSum, reduceStream, 0));
+      if (peerRead) {
+        peerArgs.count = bytes / args->eltSize;
+        peerArgs.stride = strideBytes / args->eltSize;
+        for (int n = 0; n < nodes; n++) {
+          int target = comm->nodeRanks[n].localRankToRank[comm->localRank];
+          peerArgs.targetOffsets[n] = (size_t)target * args->nElts + offset / args->eltSize;
+        }
+        void* partial = ce->ceRSTmpBuf + partialOffset;
+        if (args->datatype == ncclBfloat16) {
+          NCCLCHECK(ncclCeRsPeerLaunch_bf16(peerArgs, partial, reduceStream));
+        } else {
+          NCCLCHECK(ncclCeRsPeerLaunch_f32(peerArgs, partial, reduceStream));
+        }
+      } else {
+        // totalSteps=1 disables polling and cross-block barriers (PR #12545).
+        NCCLCHECK(ncclCeLaunchPersistentReduce(ce->ceRSTmpBuf + inputOffset, ce->ceRSTmpBuf + partialOffset,
+          locals, nodes * strideBytes / args->eltSize, 0, 1, nodes * strideBytes / args->eltSize,
+          nullptr, 1, nullptr, args->datatype, ncclSum, reduceStream, 0));
+      }
       CUDACHECK(cudaMemcpyAsync(ce->ceRSTmpBuf + railOffset + comm->node * strideBytes,
         ce->ceRSTmpBuf + partialOffset + comm->node * strideBytes, bytes, cudaMemcpyDeviceToDevice, reduceStream));
       // Each chunk uses the same context on all nodes. Per-context signal

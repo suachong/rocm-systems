@@ -129,5 +129,7 @@ for tag, ctype in TYPES:
         with open(os.path.join(out_dir, fname), "w") as f:
             f.write(LAUNCHER_TEMPLATE.substitute(tag=tag, ctype=ctype, redname=redname, redval=redval,
                                                   vec_define=vec_define, blocks_fn=blocks_fn))
+            if redname == "Sum" and tag in ("bf16", "f32"):
+                f.write(string.Template(read_template("ce_rs_peer.cpp.in")).substitute(tag=tag, ctype=ctype))
 
 print("-- Generated %d CE-reduce kernel TUs in %s" % (len(TYPES) * len(REDOPS), out_dir))
